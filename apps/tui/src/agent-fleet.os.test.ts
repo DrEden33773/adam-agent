@@ -247,9 +247,10 @@ test("Agents settings persist privately and Reset restores concrete defaults wit
     });
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     expect(h.presentation.getState().authoritative).toEqual(before);
-    await h.press("\u001b", "Fleet fixture");
-    await h.press("/agents settings\r", "Widget · off");
-    await h.press("\u001b[F\r", "Defaults restored");
+    await h.press("\u001b", "Fleet fixture", "Agent settings");
+    await h.press("/agents settings\r", "● Widget · off");
+    await h.press("\u001b[F", "● Reset defaults");
+    await h.press("\r", "Defaults restored");
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
       schemaVersion: 1,
       widgetMode: "background",

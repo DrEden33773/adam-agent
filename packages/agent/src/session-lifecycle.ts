@@ -4941,7 +4941,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               }),
           artifactStore,
           model: resolved.driver,
-          store: store as unknown as SessionStore,
+          store,
           ...(!isLongLivedManagedAgentTools(first.record.managedAgentTools)
             ? {}
             : {

@@ -3,22 +3,242 @@ import { writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-
 import {
   AgentSession,
   createCodingToolRegistry,
   createInMemorySessionStore,
   createJsonlSessionStore,
   createPermissionPolicy,
+  createPresentationSession,
 } from "@adam-agent/agent";
 import {
   createCodingToolRegistryForTesting,
   createRepositorySearchToolAdapterForTesting,
+  openJsonlSessionStore,
   repositorySearchBackendForTesting,
+  type SessionRecord,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
+import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
+import { requireSessionEvent } from "./session-event.test-support.js";
+import {
+  createSessionLifecycleForTests,
+  modelTargetsWithDriver,
+  sessionLifecycleTargetIdentity,
+} from "./session-lifecycle.test-support.js";
 
-import { FakeModelDriver } from "./index.js";
+test("wide search failure is durable model feedback and leaves Main ready after JSONL restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-search-failure-feedback-"));
+  const workspaceRoot = join(root, "workspace");
+  const stateRoot = join(root, "state");
+  await mkdir(workspaceRoot);
+  await Promise.all(
+    Array.from({ length: 300 }, (_, index) =>
+      writeFile(
+        join(workspaceRoot, `file-${String(index).padStart(3, "0")}.ts`),
+        `export const extension${index} = true;\n`,
+      ),
+    ),
+  );
+  let feedback: unknown;
+  const driver = new FakeModelDriver((request) => {
+    if (request.messages.at(-1)?.role === "user")
+      return [
+        { type: "tool_call_start", id: "wide-search", name: "search_repository" },
+        {
+          type: "tool_call_delta",
+          id: "wide-search",
+          json: JSON.stringify({
+            kind: "content",
+            query: "extension",
+            mode: "literal",
+            case: "insensitive",
+            include: ["*.ts"],
+            limit: 50,
+          }),
+        },
+        { type: "tool_call_end", id: "wide-search" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    const last = request.messages.at(-1);
+    if (last?.role === "tool") feedback = last.result;
+    return [
+      { type: "text_delta", text: "Search failure handled." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets = modelTargetsWithDriver(driver);
+  const options = {
+    workspaceRoot,
+    stateRoot,
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+  };
+  const lifecycle = createSessionLifecycleForTests(options);
+  let cold: ReturnType<typeof createSessionLifecycleForTests> | undefined;
+  try {
+    const created = await lifecycle.create({ targetIdentity: sessionLifecycleTargetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Find all extensions." },
+    });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      workspaceRoot,
+      stateRoot,
+      sessionId: created.sessionId,
+    });
+    const records = await store.read();
+    const presentation = await createPresentationSession({
+      ...options,
+      lifecycle,
+      sessionId: created.sessionId,
+      projectLabel: "workspace",
+    });
+    const phase = presentation.getState().authoritative.active?.parentRun?.phase;
+    await presentation.close();
+    const lastRecord = records.at(-1);
+    expect({
+      result: continued.result,
+      snapshotStatus: continued.snapshot.status,
+      phase,
+      lastRecord: lastRecord?.schemaVersion === 3 ? lastRecord.record : undefined,
+    }).toMatchObject({
+      result: { status: "completed", answer: "Search failure handled." },
+      snapshotStatus: "settled",
+      phase: "ready",
+      lastRecord: { type: "runtime_event", event: { type: "session_settled" } },
+    });
+    expect(feedback).toMatchObject({ status: "failed", error: { code: "search_quota_exceeded" } });
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "runtime_event",
+          event: expect.objectContaining({
+            type: "tool_failed",
+            callId: "wide-search",
+            error: expect.objectContaining({ code: "search_quota_exceeded" }),
+          }),
+        }),
+      }),
+    );
+    await lifecycle.close();
+    cold = createSessionLifecycleForTests(options);
+    await expect(cold.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "settled",
+    });
+  } finally {
+    await cold?.close();
+    await lifecycle.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("real invalid and restarted search cursors settle and reach the model through the current store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-search-cursor-feedback-"));
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "one.ts"), "needle one\nneedle two\n");
+  const harness = createInMemorySessionLifecycleHarness();
+  let cursor: string | undefined;
+  let restarted = false;
+  const feedback: unknown[] = [];
+  const driver = new FakeModelDriver((request) => {
+    const last = request.messages.at(-1);
+    let input: Record<string, unknown> | undefined;
+    if (last?.role === "user") {
+      input = { kind: "content", query: "needle", limit: 1, ...(restarted ? { cursor } : {}) };
+    } else if (last?.role === "tool") {
+      if (last.result.status === "completed") {
+        const output = last.result.output as { nextCursor?: string };
+        cursor = output.nextCursor;
+        expect(cursor).toEqual(expect.any(String));
+        input = { kind: "content", query: "changed", limit: 1, cursor };
+      } else feedback.push(last.result);
+    }
+    if (input !== undefined)
+      return [
+        {
+          type: "tool_call_start",
+          id: `cursor-${restarted ? "cold" : cursor === undefined ? "first" : "invalid"}`,
+          name: "search_repository",
+        },
+        {
+          type: "tool_call_delta",
+          id: `cursor-${restarted ? "cold" : cursor === undefined ? "first" : "invalid"}`,
+          json: JSON.stringify(input),
+        },
+        {
+          type: "tool_call_end",
+          id: `cursor-${restarted ? "cold" : cursor === undefined ? "first" : "invalid"}`,
+        },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    return [
+      { type: "text_delta", text: "Cursor failure handled." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const options = {
+    workspaceRoot,
+    stateRoot: join(root, "state"),
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+  };
+  let lifecycle = harness.createLifecycle(options);
+  try {
+    const created = await lifecycle.create({ targetIdentity: sessionLifecycleTargetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Try a changed request cursor." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Cursor failure handled." },
+      snapshot: { status: "settled" },
+    });
+    expect(feedback).toEqual([
+      expect.objectContaining({
+        status: "failed",
+        error: expect.objectContaining({ code: "search_cursor_invalid" }),
+      }),
+    ]);
+    await lifecycle.close();
+    restarted = true;
+    lifecycle = harness.createLifecycle(options);
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Try the cursor after runtime restart." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Cursor failure handled." },
+      snapshot: { status: "settled" },
+    });
+    expect(feedback[1]).toMatchObject({ status: "failed", error: { code: "search_cursor_stale" } });
+    const records = await (await harness.sessions.open(created.sessionId))?.read();
+    const events = records?.flatMap((entry) =>
+      entry.schemaVersion === 3 && entry.record.type === "runtime_event"
+        ? [entry.record.event]
+        : [],
+    );
+    expect(events?.filter((event) => event.type === "tool_failed")).toMatchObject([
+      { callId: "cursor-invalid", error: { code: "search_cursor_invalid" } },
+      { callId: "cursor-cold", error: { code: "search_cursor_stale" } },
+    ]);
+    expect(events?.filter((event) => event.type === "session_settled")).toMatchObject([
+      { result: { status: "completed" } },
+      { result: { status: "completed" } },
+    ]);
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle(options);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "settled",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("literal repository search keeps relevant files on the first grouped bounded page", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-repository-"));
@@ -577,7 +797,7 @@ test("large-tree search cancellation closes ripgrep before durable AgentSession 
     expect(closed).toBe(true);
     expect(providerCalls).toBe(1);
     const durable = await store.read();
-    expect(durable).toEqual(
+    expect(durable.map(requireSessionEvent)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           event: expect.objectContaining({ type: "tool_failed", name: "search_repository" }),

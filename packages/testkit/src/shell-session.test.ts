@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, stat, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import {
   AgentSession,
   createCodingToolRegistry,
@@ -13,8 +12,8 @@ import {
   type RuntimeEvent,
 } from "@adam-agent/agent";
 import { expect, test } from "vitest";
-
 import { FakeModelDriver } from "./index.js";
+import { requireSessionEvent } from "./session-event.test-support.js";
 
 test("the default coding registry exposes the twelve current prompt tools", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-coding-registry-"));
@@ -140,7 +139,7 @@ test("an approved shell command runs from the workspace root and persists its re
 
     const result = await session.run({ text: "Run the verification command" });
     const persistedToolEvents = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .filter((event) => event.type.startsWith("tool_"));
 
     expect({ result, persistedToolEvents }).toEqual({
@@ -233,7 +232,7 @@ test("a non-zero shell exit is a completed result that the model can handle", as
 
     const result = await session.run({ text: "Run a failing verification command" });
     const completed = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .find((event) => event.type === "tool_completed" && event.callId === "call-shell-nonzero");
 
     expect({
@@ -289,7 +288,7 @@ test("the shell receives an isolated HOME and does not inherit unrelated runtime
 
     await session.run({ text: "Inspect the shell environment" });
     const completed = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .find(
         (event) => event.type === "tool_completed" && event.callId === "call-shell-environment",
       );
@@ -502,7 +501,7 @@ test("the first timeout remains the shell outcome when caller cancellation races
     session.abort();
     const result = await run;
     const completed = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .find(
         (event) => event.type === "tool_completed" && event.callId === "call-shell-timeout-race",
       );
@@ -558,7 +557,7 @@ test("aborting an active shell command records interruption and removes its proc
     await waitForFile(join(workspaceRoot, "started.txt"));
     session.abort();
     const result = await run;
-    const persisted = (await store.read()).map((record) => record.event);
+    const persisted = (await store.read()).map((record) => requireSessionEvent(record).event);
     const completed = persisted.find(
       (event) => event.type === "tool_completed" && event.callId === "call-shell-abort",
     );
@@ -648,7 +647,7 @@ test("overflowing shell output is durably referenced before its bounded result i
 
     const result = await session.run({ text: "Capture the long command output" });
     const persistedCompleted = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .find((event) => event.type === "tool_completed" && event.callId === "call-shell-artifact");
     const output = requireJsonObject(
       persistedCompleted?.type === "tool_completed" ? persistedCompleted.output : undefined,
@@ -823,7 +822,7 @@ test("runtime-owned shell limits cap both the inline tail and durable artifact",
 
     const result = await session.run({ text: "Capture output under runtime limits" });
     const completed = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .find(
         (event) => event.type === "tool_completed" && event.callId === "call-shell-artifact-cap",
       );
@@ -919,7 +918,7 @@ test("an artifact write failure cannot publish a dangling completed shell result
 
     const result = await session.run({ text: "Capture output in an unavailable store" });
     const toolTerminalEvents = (await store.read())
-      .map((record) => record.event)
+      .map((record) => requireSessionEvent(record).event)
       .filter((event) => event.type === "tool_completed" || event.type === "tool_failed");
 
     expect({ result, toolTerminalEvents }).toEqual({

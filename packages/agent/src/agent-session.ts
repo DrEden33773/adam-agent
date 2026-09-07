@@ -438,7 +438,7 @@ export class AgentSession {
       throw new TypeError("The exact recorded Skill profile is not supported.");
     }
     this.#hasUncheckpointedInheritedMessages = this.#durableContext?.hasInheritedMessages === true;
-    this.#store = dependencies.store as unknown as SessionStore<SessionRecord>;
+    this.#store = dependencies.store;
     this.#nextSequence = this.#durableContext?.nextSequence ?? 1;
   }
 
@@ -4229,20 +4229,11 @@ export class AgentSession {
         throw new Error("Cannot persist a session event without an active run ID.");
       }
       try {
-        await this.#appendRecord(
-          this.#durableContext === undefined
-            ? {
-                schemaVersion: 2,
-                runId,
-                sequence: this.#nextSequence,
-                event: canonicalEvent,
-              }
-            : {
-                schemaVersion: 3,
-                sequence: this.#nextSequence,
-                record: { type: "runtime_event", runId, event: canonicalEvent },
-              },
-        );
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: { type: "runtime_event", runId, event: canonicalEvent },
+        });
       } catch (error) {
         if (error instanceof SessionLogicalQuotaError) throw error;
         throw new SessionPersistenceError();

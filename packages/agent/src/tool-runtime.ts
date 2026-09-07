@@ -49,6 +49,7 @@ import {
   updateTodoInputV1Schema,
   updateTodoToolDefinitionV1,
 } from "./todo.js";
+import type { ToolError } from "./tool-error.js";
 
 export type ToolEffect = "read" | "write" | "execute" | "network" | "delegate" | "administrative";
 
@@ -83,102 +84,7 @@ export type ToolReplayClass = "safe" | "never";
 
 export type ToolResult =
   | { readonly status: "completed"; readonly output: JsonValue }
-  | {
-      readonly status: "failed";
-      readonly error:
-        | {
-            readonly code:
-              | "unknown_tool"
-              | "invalid_tool_input"
-              | "permission_denied"
-              | "outside_workspace"
-              | "not_found"
-              | "already_exists"
-              | "ambiguous_match"
-              | "binary_file"
-              | "file_too_large"
-              | "no_match"
-              | "overlapping_edits"
-              | "path_conflict"
-              | "repository_context_changed"
-              | "repository_instructions_unavailable"
-              | "project_context_changed"
-              | "project_context_unavailable"
-              | "skill_unavailable"
-              | "skill_resource_unavailable"
-              | "skill_resource_changed"
-              | "unsupported_binary_resource"
-              | "resource_page_too_small"
-              | "skill_resource_quota_exceeded"
-              | "input_resource_corrupt"
-              | "input_resource_cursor_invalid"
-              | "input_resource_not_visible"
-              | "input_resource_quota_exceeded"
-              | "input_resource_unsupported"
-              | "search_cursor_invalid"
-              | "search_cursor_stale"
-              | "search_quota_exceeded"
-              | "todo_aggregate_limit_exceeded"
-              | "todo_completed_dependent"
-              | "todo_cursor_invalid"
-              | "todo_cursor_stale"
-              | "todo_dependency_cycle"
-              | "todo_dependency_incomplete"
-              | "todo_entity_limit_exceeded"
-              | "todo_revision_stale"
-              | "artifact_store_failed"
-              | "mcp_protocol_error"
-              | "mcp_output_invalid"
-              | "mcp_output_unsupported"
-              | "mcp_result_too_large"
-              | "managed_agent_cancelled"
-              | "managed_agent_capacity_exceeded"
-              | "managed_agent_deadline_exceeded"
-              | "managed_agent_failed"
-              | "managed_agent_result_too_large"
-              | "managed_agent_stalled"
-              | "managed_agent_unavailable"
-              | "web_cancelled"
-              | "web_deadline_exceeded"
-              | "web_provider_invalid"
-              | "web_provider_unavailable"
-              | "web_response_invalid"
-              | "web_response_too_large"
-              | "web_source_unavailable"
-              | "shell_start_failed"
-              | "tool_io_failed";
-            readonly message: string;
-          }
-        | {
-            readonly code: "tool_effect_indeterminate";
-            readonly reason:
-              | "mcp_request_timeout"
-              | "mcp_caller_cancelled"
-              | "mcp_connection_closed"
-              | "mcp_protocol_error"
-              | "process_restart";
-            readonly message: string;
-          }
-        | {
-            readonly code: "mcp_catalog_stale";
-            readonly message: string;
-            readonly generationId: string;
-            readonly serverId: string;
-            readonly catalogDigest: `sha256:${string}`;
-          }
-        | {
-            readonly code: "patch_recovery_cleanup_failed";
-            readonly message: string;
-            readonly settlement: "committed" | "rolled_back";
-            readonly recoveryReference: { readonly id: string };
-          }
-        | {
-            readonly code: "patch_state_uncertain";
-            readonly message: string;
-            readonly affectedPaths: readonly string[];
-            readonly recoveryReference: { readonly id: string };
-          };
-    };
+  | { readonly status: "failed"; readonly error: ToolError };
 
 export type ToolAdapter = {
   readonly definition: ModelToolDefinition;
