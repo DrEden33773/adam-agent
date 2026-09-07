@@ -2455,8 +2455,15 @@ describe("AgentSession", () => {
           latestMessage.callId === "call-1" &&
           latestMessage.name === "read_file" &&
           latestMessage.result.status === "completed" &&
-          JSON.stringify(latestMessage.result.output) ===
-            JSON.stringify({ path: "README.md", content: originalReadme, truncated: false });
+          expect
+            .objectContaining({
+              path: "README.md",
+              content: originalReadme,
+              truncated: false,
+              reason: "eof",
+              nextRead: null,
+            })
+            .asymmetricMatch(latestMessage.result.output);
 
         return [
           {
@@ -4724,6 +4731,7 @@ describe("AgentSession", () => {
           "get_todo",
           "list_todos",
           "update_todo",
+          "update_todos",
         ],
         commitOrder: ["first-started", "first-released", "write-completed"],
         results: [
@@ -5716,7 +5724,7 @@ describe("AgentSession", () => {
             name: "read_file",
             error: {
               code: "invalid_tool_input",
-              message: "The tool input did not match its schema.",
+              message: "path: supply a nonempty path of at most 4096 characters.",
             },
           },
         ],
@@ -5951,7 +5959,16 @@ describe("AgentSession", () => {
             type: "tool_completed",
             callId: "call-first",
             name: "read_file",
-            output: { path: "first.txt", content: "alpha\n", truncated: false },
+            output: {
+              path: "first.txt",
+              content: "alpha\n",
+              truncated: false,
+              reason: "eof",
+              fileVersion: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+              byteRange: { start: 0, endExclusive: 6 },
+              lineRange: { start: 1, endInclusive: 1 },
+              nextRead: null,
+            },
           },
           { type: "tool_requested", callId: "call-second", name: "read_file" },
           {
@@ -5968,7 +5985,16 @@ describe("AgentSession", () => {
             type: "tool_completed",
             callId: "call-second",
             name: "read_file",
-            output: { path: "second.txt", content: "beta\n", truncated: false },
+            output: {
+              path: "second.txt",
+              content: "beta\n",
+              truncated: false,
+              reason: "eof",
+              fileVersion: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+              byteRange: { start: 0, endExclusive: 5 },
+              lineRange: { start: 1, endInclusive: 1 },
+              nextRead: null,
+            },
           },
         ],
       });
@@ -6232,8 +6258,19 @@ describe("AgentSession", () => {
         const boundedOutput =
           latestMessage?.role === "tool" &&
           latestMessage.result.status === "completed" &&
-          JSON.stringify(latestMessage.result.output) ===
-            JSON.stringify({ path: "large.txt", content: "x".repeat(65_536), truncated: true });
+          Buffer.byteLength(JSON.stringify(latestMessage.result.output)) <= 65536 &&
+          expect
+            .objectContaining({
+              path: "large.txt",
+              content: expect.stringMatching(/^x+$/u),
+              truncated: true,
+              reason: "output_limit",
+              nextRead: expect.objectContaining({
+                path: "large.txt",
+                byteOffset: expect.any(Number),
+              }),
+            })
+            .asymmetricMatch(latestMessage.result.output);
         return [
           {
             type: "text_delta",

@@ -3,10 +3,8 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-
 import {
   createCodingToolRegistry,
-  createReadToolRegistry,
   createSessionLifecycle,
   type ModelTargetIdentity,
 } from "@adam-agent/agent";
@@ -18,6 +16,7 @@ import {
   type SessionRecord,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
+import { createFrozenPrefixReadRegistry } from "./frozen-read-registry.test-support.js";
 
 const fixturePath = fileURLToPath(
   new URL("../dist/context-compaction.fixture.js", import.meta.url),
@@ -550,7 +549,7 @@ async function createProcessHarness(prefix: string): Promise<{
     stateRoot,
     workspaceRoot,
     workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
-    tools: createReadToolRegistry({ workspaceRoot }),
+    tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
   }).create({ targetIdentity });
   return {
     testRoot,

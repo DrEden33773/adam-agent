@@ -10560,7 +10560,7 @@ test("PresentationSession normalizes a real read call without exposing raw argum
       label: "read",
       subject: { type: "path", value: "notes.txt" },
       status: "completed",
-      resultSummary: "65536 bytes · output truncated",
+      resultSummary: "63466 bytes · output truncated",
       artifacts: [],
       changePreviewRef: null,
       preview: {

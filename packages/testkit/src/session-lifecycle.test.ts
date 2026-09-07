@@ -3617,9 +3617,9 @@ function snapshotWithLastPromptProjection<Snapshot extends { readonly promptCont
 }
 
 const introductionRequestDigest =
-  "sha256:b6f1ebe78958c5213644321f4f936ba3f77800202a3c094c3fe4e96b065ca496" as const;
+  "sha256:4b1ce3fb95971aa644189e32db8be7d5149a881cf6742c6d5ae33c1650fc7717" as const;
 const permissionRequestDigest =
-  "sha256:c82b39aa784fec5a2d91bfc5f2471cde20a55ff8f618747023c3efc21ee16f8f" as const;
+  "sha256:9c1f59ec1ffd20fdfe7486b5fb9efa0d03394adfaf113c23d5e1a7bc22784b60" as const;
 
 test("SessionLifecycle rejects a deterministic competing owner and proceeds after release", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-memory-owner-"));
@@ -6693,7 +6693,7 @@ test("SessionLifecycle paginates prompt-admitted sessions while hiding genesis-o
   }
 });
 
-test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and twelve tools", async () => {
+test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and thirteen tools", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-skills-genesis-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -6738,6 +6738,7 @@ test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill s
               { name: "get_todo" },
               { name: "list_todos" },
               { name: "update_todo" },
+              { name: "update_todos" },
             ],
           },
         },
@@ -10141,7 +10142,16 @@ test("SessionLifecycle rejects interrupted naming without corrupting one replaya
           type: "tool_completed",
           callId: call.id,
           name: call.name,
-          output: { path: "README.md", content: "# Safe replay\n", truncated: false },
+          output: {
+            path: "README.md",
+            content: "# Safe replay\n",
+            truncated: false,
+            reason: "eof",
+            fileVersion: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+            byteRange: { start: 0, endExclusive: 14 },
+            lineRange: { start: 1, endInclusive: 1 },
+            nextRead: null,
+          },
         },
       ],
     });

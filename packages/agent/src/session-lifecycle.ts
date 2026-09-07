@@ -283,6 +283,7 @@ import {
   createCodingToolRegistry,
   createPermissionPolicy,
   type PermissionPolicy,
+  resolveToolDefinition,
   type ToolEffect,
   type ToolRegistry,
 } from "./tool-runtime.js";
@@ -8349,7 +8350,13 @@ function isExactSafeReplay(
   const intent = responseRecord.response.toolIntents.find(
     (candidate) => candidate.callId === call.id && candidate.name === call.name,
   );
-  const adapter = tools.resolve(call.name);
+  const definition = snapshot.promptContext?.toolProfile.definitions.find(
+    (entry) => entry.name === call.name,
+  );
+  const adapter =
+    definition === undefined
+      ? tools.resolve(call.name)
+      : resolveToolDefinition(tools, call.name, definition.digest);
   return intent?.replay === "safe" && adapter?.replay === "safe";
 }
 
@@ -8368,7 +8375,13 @@ function isExactToolIntent(
   const intent = responseRecord.response.toolIntents.find(
     (candidate) => candidate.callId === call.id && candidate.name === call.name,
   );
-  const adapter = tools.resolve(call.name);
+  const definition = snapshot.promptContext?.toolProfile.definitions.find(
+    (entry) => entry.name === call.name,
+  );
+  const adapter =
+    definition === undefined
+      ? tools.resolve(call.name)
+      : resolveToolDefinition(tools, call.name, definition.digest);
   return (
     intent !== undefined &&
     adapter !== undefined &&
@@ -9727,7 +9740,7 @@ function planToolProfileFromAuthority(
       }
       continue;
     }
-    const adapter = tools.resolve(definition.name);
+    const adapter = resolveToolDefinition(tools, definition.name, definition.digest);
     if (adapter === undefined || !/^sha256:[0-9a-f]{64}$/u.test(adapter.definitionDigest)) {
       throw new SessionLifecycleError("session_invalid");
     }

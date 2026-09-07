@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import {
   AgentSession,
   type ArtifactStore,
@@ -35,6 +34,7 @@ import {
   sessionDurableOutputLimits,
 } from "@adam-agent/agent/internal-testing";
 import { expect, expectTypeOf, test } from "vitest";
+import { createFrozenPrefixReadRegistry } from "./frozen-read-registry.test-support.js";
 import { createSessionLifecycleForTesting as createSessionLifecycle } from "./index.js";
 
 const { ADAM_AGENT_LARGE_OUTPUT_TESTS: largeOutputTests } = process.env;
@@ -1520,7 +1520,7 @@ test("AgentSession uses the latest provider input sample for the next v2 output 
   const dependencies = {
     model,
     store: createInMemorySessionStore(),
-    tools: createReadToolRegistry({ workspaceRoot }),
+    tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     contextProfile: preparedDirectDeepSeekV2ContextProfile,
   };
@@ -2832,7 +2832,7 @@ test("AgentSession reconsiders a complete retained tool turn during repeated com
   const dependencies = {
     model,
     store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
-    tools: createReadToolRegistry({ workspaceRoot }),
+    tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
     contextProfile: repeatedProfile,
@@ -4548,7 +4548,7 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
     modelTargets,
     stateRoot,
     workspaceRoot,
-    tools: createReadToolRegistry({ workspaceRoot }),
+    tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
   };
   const lifecycle = createSessionLifecycle(lifecycleOptions);
@@ -4820,7 +4820,7 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
     modelTargets,
     stateRoot,
     workspaceRoot,
-    tools: createReadToolRegistry({ workspaceRoot }),
+    tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
   };
   const lifecycle = createSessionLifecycle(options);

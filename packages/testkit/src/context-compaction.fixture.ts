@@ -2,7 +2,6 @@ import {
   type ContextProfile,
   createCodingToolRegistry,
   createPermissionPolicy,
-  createReadToolRegistry,
   createSessionLifecycle,
   type ModelDriver,
   ModelDriverError,
@@ -13,6 +12,7 @@ import {
   createTrustedWorkspaceTrustForTesting,
   sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
+import { createFrozenPrefixReadRegistry } from "./frozen-read-registry.test-support.js";
 
 const workspaceRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_WORKSPACE_ROOT");
 const stateRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_STATE_ROOT");
@@ -223,7 +223,7 @@ const lifecycle = createSessionLifecycle({
   workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
   tools: mode.startsWith("skill-")
     ? createCodingToolRegistry({ stateRoot, workspaceRoot })
-    : createReadToolRegistry({ workspaceRoot }),
+    : createFrozenPrefixReadRegistry({ workspaceRoot }),
   permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
 });
 if (mode === "committed-event-hang") {

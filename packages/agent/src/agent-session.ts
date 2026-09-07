@@ -163,6 +163,8 @@ import {
   todoPolicyVersionV1,
   updateTodoInputV1Schema,
   updateTodoMutationV1,
+  updateTodosInputV1Schema,
+  updateTodosMutationV1,
 } from "./todo.js";
 import type {
   ModelToolDefinition,
@@ -173,6 +175,7 @@ import type {
   ToolRegistry,
   ToolResult,
 } from "./tool-runtime.js";
+import { resolveToolDefinition } from "./tool-runtime.js";
 
 class InputResourceProjectionError extends Error {
   constructor(readonly details: Extract<RunResult, { readonly status: "failed" }>["error"]) {
@@ -358,6 +361,7 @@ export class AgentSession {
               "get_todo",
               "list_todos",
               "update_todo",
+              "update_todos",
             ])
           : ["read_file", "write_file", "edit_file", "run_shell"]
         : durablePromptContext.toolProfile.definitions.map((definition) => definition.name);
@@ -374,7 +378,11 @@ export class AgentSession {
             "edit_file",
             "run_shell",
           ])
-        : captureToolRegistry(dependencies.tools, selectedToolNames);
+        : captureToolRegistry(
+            dependencies.tools,
+            selectedToolNames,
+            durablePromptContext?.toolProfile.definitions,
+          );
     this.#plan = this.#durableContext?.plan;
     this.#planGitAttestation = this.#plan?.gitAttestation;
     this.#fixedRequestTools =
@@ -2550,16 +2558,20 @@ export class AgentSession {
       }
     }
     // Reject known-invalid Todo CAS before asking; execution rechecks after the decision.
-    if (call.name === "update_todo" && this.#plan === undefined) {
+    if ((call.name === "update_todo" || call.name === "update_todos") && this.#plan === undefined) {
       let parsed: unknown;
       try {
         parsed = JSON.parse(call.argumentsJson);
       } catch {
         parsed = undefined;
       }
-      const input = updateTodoInputV1Schema.safeParse(parsed);
+      const input = (
+        call.name === "update_todos" ? updateTodosInputV1Schema : updateTodoInputV1Schema
+      ).safeParse(parsed);
       if (input.success) {
-        const preflight = updateTodoMutationV1(this.#todo, input.data);
+        const preflight = (
+          call.name === "update_todos" ? updateTodosMutationV1 : updateTodoMutationV1
+        )(this.#todo, input.data);
         if (preflight.status === "failed") {
           toolResultsById.set(call.id, { call, result: preflight });
           await this.#appendToolResult(messages, call, preflight);
@@ -2672,6 +2684,9 @@ export class AgentSession {
     }
     if (call.name === "list_todos") {
       return this.#listTodos(call, messages, toolResultsById, options.emitStarted);
+    }
+    if (call.name === "update_todos") {
+      return this.#updateTodos(call, messages, toolResultsById, options.emitStarted);
     }
     if (call.name === "update_todo") {
       return this.#updateTodo(call, messages, toolResultsById, options.emitStarted);
@@ -3165,6 +3180,75 @@ export class AgentSession {
     this.#publish(completedEvent);
     messages.push({ role: "tool", callId: call.id, name: call.name, result });
     this.#todo = mutation.snapshot;
+    return undefined;
+  }
+
+  async #updateTodos(
+    call: ToolCall,
+    messages: ModelMessage[],
+    toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>,
+    emitStarted: boolean,
+  ): Promise<RunResult | undefined> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.argumentsJson);
+    } catch {
+      parsed = undefined;
+    }
+    const input = updateTodosInputV1Schema.safeParse(parsed);
+    const mutation =
+      this.#plan !== undefined
+        ? {
+            status: "failed" as const,
+            error: { code: "permission_denied" as const, message: "Plan denies Todo mutations." },
+          }
+        : updateTodosMutationV1(this.#todo, parsed);
+    if (!input.success || this.#activeRunId === undefined || mutation.status === "failed") {
+      const result: ToolResult =
+        mutation.status === "failed"
+          ? mutation
+          : {
+              status: "failed",
+              error: {
+                code: "invalid_tool_input",
+                message: "update_todos requires an active run and valid atomic batch.",
+              },
+            };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    if (emitStarted) await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    const items = mutation.items.map((item) => ({
+      id: item.id,
+      createdOrdinal: item.createdOrdinal,
+      itemRevision: item.itemRevision,
+      status: item.status,
+      title: item.title,
+      dependencyIds: item.dependencyIds,
+      ...(item.details === undefined ? {} : { details: item.details }),
+    }));
+    const storeRevision = mutation.snapshot.storeRevision;
+    const result = {
+      status: "completed" as const,
+      output: { batchVersion: 1, policyVersion: todoPolicyVersionV1, storeRevision, items },
+    };
+    const event = {
+      type: "tool_completed" as const,
+      callId: call.id,
+      name: call.name,
+      output: result.output,
+    };
+    // One canonical record is both the complete Todo mutation and its tool result.
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: { type: "runtime_event", runId: this.#activeRunId, event },
+    });
+    this.#todo = mutation.snapshot;
+    toolResultsById.set(call.id, { call, result });
+    this.#publish(event);
+    messages.push({ role: "tool", callId: call.id, name: call.name, result });
     return undefined;
   }
 
@@ -4828,6 +4912,7 @@ function repositoryScopesFromPermissionSubject(subject: PermissionSubject): read
 function captureToolRegistry(
   tools: ToolRegistry | undefined,
   selectedNames?: readonly string[],
+  recordedDefinitions?: readonly { readonly name: string; readonly digest: string }[],
 ): ToolRegistry | undefined {
   if (tools === undefined) {
     return undefined;
@@ -4839,13 +4924,21 @@ function captureToolRegistry(
     selectedNames === undefined
       ? [...availableDefinitions.values()]
       : selectedNames.flatMap((name) => {
-          const definition = availableDefinitions.get(name);
+          const recorded = recordedDefinitions?.find((entry) => entry.name === name);
+          const definition =
+            recorded === undefined
+              ? availableDefinitions.get(name)
+              : resolveToolDefinition(tools, name, recorded.digest)?.definition;
           return definition === undefined ? [] : [definition];
         })
   ).map((definition) => structuredClone(definition));
   const adapters = new Map(
     definitions.map((definition) => {
-      const adapter = tools.resolve(definition.name);
+      const recorded = recordedDefinitions?.find((entry) => entry.name === definition.name);
+      const adapter =
+        recorded === undefined
+          ? tools.resolve(definition.name)
+          : resolveToolDefinition(tools, definition.name, recorded.digest);
       if (adapter === undefined || !isDeepStrictEqual(adapter.definition, definition)) {
         throw new TypeError(`Tool definition cannot be resolved exactly: ${definition.name}`);
       }

@@ -426,7 +426,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               options.scenario === "managed-parent-permission" ||
               options.scenario === "managed-stalled"
             ? ["read", "delegate"]
-            : options.scenario === "todo-active"
+            : options.scenario === "todo-active" || options.scenario === "todo-batch"
               ? ["read", "write"]
               : options.scenario === "tool-artifact" || options.scenario === "shell"
                 ? ["read", "execute"]
@@ -1904,6 +1904,47 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Web search card complete." };
+      } else if (options.scenario === "todo-batch") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          for (let index = 0; index < 4; index++) {
+            const id = `batch-create-${index}`;
+            yield { type: "tool_call_start", id, name: "create_todo" };
+            yield {
+              type: "tool_call_delta",
+              id,
+              json: JSON.stringify({
+                title: `Atomic Task ${index}`,
+                details: "Atomic caller-visible detail.",
+              }),
+            };
+            yield { type: "tool_call_end", id };
+          }
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (latest?.role === "tool" && latest.name === "create_todo") {
+          const updates = request.messages.flatMap((message) => {
+            if (
+              message.role !== "tool" ||
+              message.name !== "create_todo" ||
+              message.result.status !== "completed"
+            )
+              return [];
+            const output = message.result.output as { item: { id: string } };
+            return [{ id: output.item.id, expectedItemRevision: 1, status: "completed" }];
+          });
+          yield { type: "tool_call_start", id: "atomic-update", name: "update_todos" };
+          yield {
+            type: "tool_call_delta",
+            id: "atomic-update",
+            json: JSON.stringify({ expectedStoreRevision: 4, updates }),
+          };
+          yield { type: "tool_call_end", id: "atomic-update" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Atomic Todo batch completed." };
       } else if (options.scenario === "todo" || options.scenario === "todo-active") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {

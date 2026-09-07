@@ -76,6 +76,7 @@ import {
   type TodoStoreSnapshotV1,
   todoStoreSnapshotDigestV1,
   updateTodoMutationV1,
+  updateTodosMutationV1,
 } from "./todo.js";
 import type { PermissionSubject } from "./tool-runtime.js";
 import { canonicalChangePreviewForToolCall } from "./tool-runtime.js";
@@ -2082,6 +2083,27 @@ export function validateCurrentSessionHistory(
         if (event.type === "tool_failed") {
           state.terminalErrorCode = event.error.code;
         } else {
+          if (state.call.name === "update_todos") {
+            let input: unknown;
+            try {
+              input = JSON.parse(state.call.argumentsJson);
+            } catch {
+              input = undefined;
+            }
+            const mutation = updateTodosMutationV1(todoSnapshot, input);
+            if (
+              activePlanState !== undefined ||
+              mutation.status !== "completed" ||
+              !isDeepStrictEqual(event.output, {
+                batchVersion: 1,
+                policyVersion: mutation.snapshot.policyVersion,
+                storeRevision: mutation.snapshot.storeRevision,
+                items: mutation.items,
+              })
+            )
+              throw new SessionLifecycleError("session_invalid");
+            todoSnapshot = mutation.snapshot;
+          }
           state.terminalOutput = event.output;
         }
       }

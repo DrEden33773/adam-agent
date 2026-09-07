@@ -12,6 +12,7 @@ import {
   todoStoreSnapshotFromRecordsV1,
   todoSummaryV1,
   updateTodoMutationV1,
+  updateTodosMutationV1,
 } from "./todo.js";
 
 describe("Todo v1", () => {
@@ -435,3 +436,122 @@ describe("Todo v1", () => {
 function todoId(index: number): string {
   return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
 }
+
+test("atomic Todo validation uses the complete candidate dependency graph", () => {
+  const snapshot: TodoStoreSnapshotV1 = {
+    policyVersion: todoPolicyVersionV1,
+    storeRevision: 2,
+    items: [
+      {
+        id: todoId(0),
+        createdOrdinal: 1,
+        itemRevision: 1,
+        status: "pending",
+        title: "Prerequisite",
+        dependencyIds: [],
+      },
+      {
+        id: todoId(1),
+        createdOrdinal: 2,
+        itemRevision: 1,
+        status: "pending",
+        title: "Dependent",
+        dependencyIds: [todoId(0)],
+      },
+    ],
+  };
+  const original = structuredClone(snapshot);
+  // Dependent first: sequential execution would reject this valid atomic final state.
+  const completed = updateTodosMutationV1(snapshot, {
+    expectedStoreRevision: 2,
+    updates: [
+      { id: todoId(1), expectedItemRevision: 1, status: "completed" },
+      { id: todoId(0), expectedItemRevision: 1, status: "completed" },
+    ],
+  });
+  expect(completed).toMatchObject({
+    status: "completed",
+    snapshot: {
+      storeRevision: 3,
+      items: [
+        { id: todoId(0), itemRevision: 2, status: "completed" },
+        { id: todoId(1), itemRevision: 2, status: "completed" },
+      ],
+    },
+  });
+  expect(snapshot).toEqual(original);
+  if (completed.status !== "completed") throw new Error("Expected complete candidate");
+  expect(
+    updateTodosMutationV1(completed.snapshot, {
+      expectedStoreRevision: 3,
+      updates: [
+        { id: todoId(0), expectedItemRevision: 2, status: "pending" },
+        { id: todoId(1), expectedItemRevision: 2, status: "pending" },
+      ],
+    }),
+  ).toMatchObject({
+    status: "completed",
+    snapshot: { storeRevision: 4, items: [{ status: "pending" }, { status: "pending" }] },
+  });
+});
+
+test.each([
+  "item-stale",
+  "store-stale",
+  "duplicate",
+  "cycle",
+  "blocked",
+  "invalid",
+  "no-op",
+  "oversized",
+])("atomic Todo rejection preserves all state and summary: %s", (reason) => {
+  const snapshot: TodoStoreSnapshotV1 = {
+    policyVersion: todoPolicyVersionV1,
+    storeRevision: 2,
+    items: [0, 1].map((index) => ({
+      id: todoId(index),
+      createdOrdinal: index + 1,
+      itemRevision: 1,
+      status: "pending",
+      title: `Task ${index}`,
+      dependencyIds: [],
+    })),
+  };
+  const original = structuredClone(snapshot);
+  const summary = todoSummaryV1(snapshot);
+  const valid = { id: todoId(0), expectedItemRevision: 1, title: "Changed" };
+  const bad =
+    reason === "item-stale"
+      ? { id: todoId(1), expectedItemRevision: 2, title: "Changed" }
+      : reason === "duplicate"
+        ? valid
+        : reason === "invalid"
+          ? { id: todoId(1), expectedItemRevision: 1, title: "" }
+          : reason === "no-op"
+            ? { id: todoId(1), expectedItemRevision: 1, title: "Task 1" }
+            : reason === "blocked"
+              ? {
+                  id: todoId(1),
+                  expectedItemRevision: 1,
+                  dependencyIds: [todoId(0)],
+                  status: "completed",
+                }
+              : {
+                  id: todoId(1),
+                  expectedItemRevision: 1,
+                  title: "Changed",
+                  ...(reason === "cycle" ? { dependencyIds: [todoId(0)] } : {}),
+                };
+  const updates =
+    reason === "oversized"
+      ? Array.from({ length: 17 }, () => valid)
+      : [{ ...valid, ...(reason === "cycle" ? { dependencyIds: [todoId(1)] } : {}) }, bad];
+  expect(
+    updateTodosMutationV1(snapshot, {
+      expectedStoreRevision: reason === "store-stale" ? 1 : 2,
+      updates,
+    }),
+  ).toMatchObject({ status: "failed" });
+  expect(snapshot).toEqual(original);
+  expect(todoSummaryV1(snapshot)).toEqual(summary);
+});

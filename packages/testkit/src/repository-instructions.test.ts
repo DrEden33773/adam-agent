@@ -199,7 +199,7 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
         definitions: [
           {
             name: "read_file",
-            digest: "sha256:84c7b9fde73815162c795cd0a12361061332b903018efe55266598639014cff3",
+            digest: "sha256:bdb41fa898c899908b16e170104c84f1bc6cd5393747d1c00f7bc72bb7526698",
           },
           {
             name: "search_repository",
@@ -245,8 +245,12 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
             name: "update_todo",
             digest: "sha256:862986580edb1216123bb51c83f171fd660419d55dee238eee1353b995b5a142",
           },
+          {
+            name: "update_todos",
+            digest: "sha256:7b996f5cafc0c80fdada49cfcacda572a0b74fe70e2331be5697efe4c8a98842",
+          },
         ],
-        digest: "sha256:d76ecac0966ef2b3d82985a0ec73add097b5fa5bafc808c698f7a3f09a80b182",
+        digest: "sha256:f8282573fbc7802d2cbd34ab0d1f58d7c90709837742ad2d16949e2e79a0a6c1",
       },
       repository: {
         version: 1,
@@ -2694,7 +2698,16 @@ test("restart after a committed read activation continues the exact read without
       expect.objectContaining({
         type: "tool_completed",
         callId: "read-before-crash",
-        output: { path: "nested/fact.txt", content: "after crash\n", truncated: false },
+        output: {
+          path: "nested/fact.txt",
+          content: "after crash\n",
+          truncated: false,
+          reason: "eof",
+          fileVersion: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          byteRange: { start: 0, endExclusive: 12 },
+          lineRange: { start: 1, endInclusive: 1 },
+          nextRead: null,
+        },
       }),
     ]);
     expect(JSON.stringify(requests.at(-1)?.messages)).toContain("after crash\\n");

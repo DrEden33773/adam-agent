@@ -8905,6 +8905,44 @@ test("slash Todos opens the authoritative read-only list and exact detail", asyn
   }
 });
 
+test("atomic Todo completion reaches the compact status and read-only navigator", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-todo-batch-frame-"));
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+  const fixture = startFixture({
+    scenario: "todo-batch",
+    workspaceRoot,
+    stateRoot: join(root, "state"),
+  });
+  try {
+    await fixture.waitForScreen("Adam · New session");
+    const beforeSubmit = fixture.output().length;
+    fixture.write("Complete the atomic Todo fixture\r");
+    await fixture.waitForCompleteFrameAfter("Atomic Todo batch completed.", beforeSubmit);
+    await fixture.waitForScreen("Todo 0/0/4 · 0 blocked");
+    const beforeList = fixture.output().length;
+    fixture.write("/todos\r");
+    await fixture.waitForCompleteFrameAfter("Todos · revision 5", beforeList);
+    const list = fixture.screen()?.join("\n") ?? "";
+    for (const index of [0, 1, 2, 3]) expect(list).toContain(`Atomic Task ${index}`);
+    const beforeDetail = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Todo detail · read-only", beforeDetail);
+    expect(fixture.screen()?.join("\n")).toContain("Atomic caller-visible detail.");
+    const beforeReturn = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForCompleteFrameAfter("Todos · revision 5", beforeReturn);
+    const beforeMain = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForCompleteFrameAfter("Todo 0/0/4 · 0 blocked", beforeMain);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await fixture.cleanup();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("active-run /todos reads the causally refreshed exact Todo revision", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-todo-active-"));
   const workspaceRoot = join(testRoot, "workspace");

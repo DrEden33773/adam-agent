@@ -1335,7 +1335,12 @@ describe("OpenAICompatibleModelDriver", () => {
 
       expect({
         result,
-        secondRequestMessages: requests[1]?.messages,
+        secondRequestMessages: requests[1]?.messages.map((message) => {
+          const value = message as { role: string; content?: string };
+          return value.role === "tool"
+            ? { ...value, content: JSON.parse(value.content ?? "") }
+            : value;
+        }),
         persistedReasoning: JSON.stringify(records).includes("I need the README."),
       }).toEqual({
         result: { status: "completed", answer: "The project is Adam Agent." },
@@ -1362,8 +1367,19 @@ describe("OpenAICompatibleModelDriver", () => {
           {
             role: "tool",
             tool_call_id: "read-project",
-            content:
-              '{"status":"completed","output":{"path":"README.md","content":"# Adam Agent\\n","truncated":false}}',
+            content: {
+              status: "completed",
+              output: {
+                path: "README.md",
+                content: "# Adam Agent\n",
+                truncated: false,
+                reason: "eof",
+                fileVersion: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+                byteRange: { start: 0, endExclusive: 13 },
+                lineRange: { start: 1, endInclusive: 1 },
+                nextRead: null,
+              },
+            },
           },
         ],
         persistedReasoning: false,
