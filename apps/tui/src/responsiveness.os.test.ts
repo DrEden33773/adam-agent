@@ -305,8 +305,36 @@ test("ordinary production keeps representative history, Todo and two unfinished 
     await terminal.waitForScreen("Main responsiveness ready.");
     await awaitEveReceipt(
       childrenStarted.promise,
-      "Both real child providers must reach their unfinished argument boundary.",
+      "Both real child providers must start before observing their argument boundaries.",
     );
+    const argumentsReady = Promise.withResolvers<void>();
+    const observeArguments = () => {
+      const state = presentation.getState();
+      const threads = state.authoritative.managedControl?.threads ?? [];
+      if (
+        threads.length === 2 &&
+        threads.every((thread) =>
+          state.managedAgentActivity?.some(
+            (activity) =>
+              activity.agentId === thread.threadId &&
+              activity.attemptId === thread.turn.attemptId &&
+              activity.tool?.name === "read_file" &&
+              activity.tool.status === "generating_arguments",
+          ),
+        )
+      )
+        argumentsReady.resolve();
+    };
+    const unsubscribeArguments = presentation.subscribe(observeArguments);
+    try {
+      observeArguments();
+      await awaitEveReceipt(
+        argumentsReady.promise,
+        "Both exact child attempts must publish unfinished read_file arguments.",
+      );
+    } finally {
+      unsubscribeArguments();
+    }
     expect(childRequests).toBe(2);
     for (let index = 0; index < 5; index++) {
       await press("todos", "/todos\r", "Todos · revision 4");
@@ -317,8 +345,18 @@ test("ordinary production keeps representative history, Todo and two unfinished 
       await press("agentsClose", "\u001b[27;1;27~", "Fleet", "Agents workspace");
       await press("fleet", "\u001b[B", "● Main");
       await press("childSelect", "\u001b[B", "● @explore-1");
-      await press("childOpen", "\r", "Generating arguments · read_file");
-      expect(presentation.getState().managedAgentActivity?.[0]?.tool).toMatchObject({
+      await press("childOpen", "\r", "Conversation · @explore-1");
+      const state = presentation.getState();
+      const selected = state.authoritative.managedControl?.threads.find(
+        (thread) => thread.handle === "@explore-1",
+      );
+      expect(
+        state.managedAgentActivity?.find(
+          (activity) =>
+            activity.agentId === selected?.threadId &&
+            activity.attemptId === selected?.turn.attemptId,
+        )?.tool,
+      ).toMatchObject({
         name: "read_file",
         status: "generating_arguments",
       });
