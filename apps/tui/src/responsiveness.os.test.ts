@@ -5,6 +5,8 @@ import {
   createJsonlSessionStoreDirectory,
   createPermissionPolicy,
   createPresentationPreferences,
+  createProductionManagedControlComposition,
+  createSessionLifecycle,
   createWorkspaceTrust,
   type ModelDriver,
   type ModelTargets,
@@ -204,6 +206,47 @@ test("ordinary production keeps representative history, Todo and two unfinished 
       };
     },
   };
+  const permissions = createPermissionPolicy({ allowedEffects: ["read", "write", "delegate"] });
+  const preferences = createPresentationPreferences({ environment });
+  phase("seed runtime setup");
+  const seedLifecycle = createSessionLifecycle({
+    workspaceRoot,
+    stateRoot,
+    workspaceTrust,
+    modelTargets,
+    permissions,
+    preferences,
+    managedControl: await createProductionManagedControlComposition({ workspaceRoot, stateRoot }),
+  });
+  let seeded: Awaited<ReturnType<typeof seedLifecycle.admit>>;
+  try {
+    const seedStarted = performance.now();
+    const seeding = seedLifecycle.admit({
+      targetIdentity: identity,
+      input: { text: "Seed responsiveness history" },
+    });
+    for (const [index, completion] of seedToolCompletions.entries()) {
+      phase(`seed tool ${index}`);
+      const observed = await awaitEveReceipt(
+        Promise.race([
+          completion.promise.then(() => "tool completed"),
+          seeding.then(() => "producer ended"),
+        ]),
+        `Seed tool ${index} must complete into the next real provider request.`,
+      );
+      expect(observed).toBe("tool completed");
+    }
+    phase("seed settlement");
+    seeded = await awaitEveReceipt(
+      seeding,
+      "Representative history must settle before opening its TUI.",
+    );
+    expect(seeded.result).toEqual({ status: "completed", answer: "Seed complete." });
+    measurements.seed = [performance.now() - seedStarted];
+  } finally {
+    expect(await seedLifecycle.close()).toMatchObject({ status: "closed" });
+  }
+  const sessionId = seeded.snapshot.sessionId;
   phase("runtime setup");
   const runtime = await createProductionProjectRuntime({
     environment,
@@ -211,20 +254,15 @@ test("ordinary production keeps representative history, Todo and two unfinished 
     stateRoot,
     workspaceTrust,
     modelTargets,
-    preferences: createPresentationPreferences({ environment }),
-    permissions: createPermissionPolicy({ allowedEffects: ["read", "write", "delegate"] }),
+    preferences,
+    permissions,
     extensionPermissions: createPermissionPolicy({ allowedEffects: [] }),
     projectLabel: "Production responsiveness",
     reservedCommandNames: [],
   });
-  const presentation = await runtime.createPresentation({ openProject: true });
+  const presentation = await runtime.createPresentation({ sessionId });
   const terminal = new VirtualTerminal({ columns: 80, rows: 32 });
-  const running = runTui({
-    presentation,
-    terminal,
-    startupTargetId: identity.targetId,
-    closeRuntime: () => runtime.close(),
-  });
+  let running: Promise<void> | undefined;
   const press = async (name: string, keys: string, expected: string, absentText?: string) => {
     phase(name);
     const offset = terminal.output().length;
@@ -235,35 +273,31 @@ test("ordinary production keeps representative history, Todo and two unfinished 
     measurements[name].push(performance.now() - start);
   };
   try {
-    phase("initial frame");
-    await terminal.whenStarted();
-    await terminal.waitForScreen("New session");
-    const seedOffset = terminal.output().length;
-    const seedStarted = performance.now();
-    terminal.input("Seed responsiveness history\r");
-    for (const [index, completion] of seedToolCompletions.entries()) {
-      phase(`seed tool ${index}`);
-      await awaitEveReceipt(
-        completion.promise,
-        `Seed tool ${index} must complete into the next real provider request.`,
-      );
-    }
-    phase("seed final frame");
-    await terminal.waitForFrameAfter("Seed complete.", seedOffset);
-    measurements.seed = [performance.now() - seedStarted];
-    await terminal.waitForScreen(" · idle");
     expect(seedAttempts).toBe(41);
     expect(presentation.getState().authoritative.continuity).toMatchObject({ status: "current" });
-    const sessionId = presentation.getState().authoritative.active?.session.id;
-    if (sessionId === undefined) throw new Error("Missing production Main session.");
+    expect(presentation.getState().authoritative.active?.session.id).toBe(sessionId);
     const sessions = createJsonlSessionStoreDirectory<SessionRecord>({ workspaceRoot, stateRoot });
     const store = await sessions.open(sessionId);
     const genesis = (await store?.read())?.[0];
     if (genesis?.schemaVersion !== 3 || genesis.record.type !== "session_genesis")
       throw new Error("Missing durable genesis.");
+    expect(genesis.record.managedAgentTools).toBeUndefined();
+    expect(genesis.record.promptContext?.toolProfile.definitions.map(({ name }) => name)).toContain(
+      "spawn_agents",
+    );
+    const restored = await runtime.inspectSession(sessionId);
+    if (restored.schemaVersion !== 3) throw new Error("Missing current production history.");
+    expect(restored.promptContext?.toolProfile.digest).toBe(
+      genesis.record.promptContext?.toolProfile.digest,
+    );
     expect(genesis.record.skillContext?.registry.candidates).toHaveLength(88);
     expect(genesis.record.skillContext?.catalog.content?.length).toBeGreaterThan(37000);
     const controlStore = await createJsonlManagedAgentControlStore({ workspaceRoot, stateRoot });
+    phase("initial historical frame");
+    running = runTui({ presentation, terminal, closeRuntime: () => runtime.close() });
+    await terminal.whenStarted();
+    await terminal.waitForScreen("Seed complete.");
+    await terminal.waitForScreen(" · idle");
     await press("permission", "Start two performance children\r", "Confirm delegation");
     expect(childRequests).toBe(0);
     expect(await controlStore.read()).toEqual([]);
