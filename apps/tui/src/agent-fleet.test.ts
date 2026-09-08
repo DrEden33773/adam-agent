@@ -99,99 +99,117 @@ test("running Explore has Widget and Fleet, layered Enter and Esc preserve indep
   }
 });
 
-test("background spawn cards settle to Started and Queued with frozen identities while Main returns", async () => {
-  let mainCalls = 0;
-  let preparedCount = 0;
-  let childCalls = 0;
-  const prepared = Promise.withResolvers<void>();
-  const releaseStart = Promise.withResolvers<void>();
-  const eightStarted = Promise.withResolvers<void>();
-  const h = await startManagedTui(
-    {
-      async *stream(request) {
-        if (!request.tools.some((tool) => tool.name === "spawn_agents")) {
-          yield { type: "text_delta", text: "Reading batch evidence." };
-          if (++childCalls === 8) eightStarted.resolve();
-          await new Promise<void>((resolve) => {
-            if (request.signal.aborted) resolve();
-            else request.signal.addEventListener("abort", () => resolve(), { once: true });
-          });
-        } else if (++mainCalls === 1) {
-          yield { type: "tool_call_start", id: "batch", name: "spawn_agents" };
-          yield {
-            type: "tool_call_delta",
-            id: "batch",
-            json: JSON.stringify({
-              entries: Array.from({ length: 9 }, (_, index) => ({
-                role: "builtin:explore",
-                task: `Read evidence ${index + 1}`,
-                description: `Inspect item ${index + 1}`,
-              })),
-            }),
-          };
-          yield { type: "tool_call_end", id: "batch" };
+test.each([40, 80, 120])(
+  "%i-column background cards retain exact Started and Queued identities while Main returns",
+  async (columns) => {
+    let mainCalls = 0;
+    let preparedCount = 0;
+    let childCalls = 0;
+    const prepared = Promise.withResolvers<void>();
+    const releaseStart = Promise.withResolvers<void>();
+    const eightStarted = Promise.withResolvers<void>();
+    const h = await startManagedTui(
+      {
+        async *stream(request) {
+          if (!request.tools.some((tool) => tool.name === "spawn_agents")) {
+            yield { type: "text_delta", text: "Reading batch evidence." };
+            if (++childCalls === 8) eightStarted.resolve();
+            await new Promise<void>((resolve) => {
+              if (request.signal.aborted) resolve();
+              else request.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          } else if (++mainCalls === 1) {
+            yield { type: "tool_call_start", id: "batch", name: "spawn_agents" };
+            yield {
+              type: "tool_call_delta",
+              id: "batch",
+              json: JSON.stringify({
+                entries: Array.from({ length: 9 }, (_, index) => ({
+                  role: "builtin:explore",
+                  task: `Read evidence ${index + 1}`,
+                  description: `核查 e\u0301 证据 ${index + 1}`,
+                })),
+              }),
+            };
+            yield { type: "tool_call_end", id: "batch" };
+            yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          } else yield { type: "text_delta", text: "Batch admitted; Main ready." };
           yield { type: "usage", inputTokens: 20, outputTokens: 10 };
-          yield { type: "finish", reason: "tool_calls" };
-          return;
-        } else yield { type: "text_delta", text: "Batch admitted; Main ready." };
-        yield { type: "usage", inputTokens: 20, outputTokens: 10 };
-        yield { type: "finish", reason: "stop" };
+          yield { type: "finish", reason: "stop" };
+        },
       },
-    },
-    {
-      rows: 64,
-      childRecordBarrier: async (record) => {
-        if (record.schemaVersion === 3 && record.record.type === "session_genesis") {
-          if (++preparedCount === 8) prepared.resolve();
-          await releaseStart.promise;
-        }
+      {
+        columns,
+        rows: 64,
+        childRecordBarrier: async (record) => {
+          if (record.schemaVersion === 3 && record.record.type === "session_genesis") {
+            if (++preparedCount === 8) prepared.resolve();
+            await releaseStart.promise;
+          }
+        },
       },
-    },
-  );
-  try {
-    await h.press("Inspect these nine items.\r", "Confirm delegation");
-    await h.press("\r", "Batch admitted; Main ready.");
-    await prepared.promise;
-    await h.terminal.waitForScreen("Starting · 0 used");
-    const screen = h.terminal.lines().join("\n");
-    expect(screen).toContain("Started @explore-1 · Explore · Inspect item 1");
-    expect(screen).toContain("Queued @explore-9 · Explore · Inspect item 9");
-    expect(
-      h.presentation
-        .getState()
-        .authoritative.managedControl?.threads.filter((thread) => thread.turn.phase === "starting"),
-    ).toHaveLength(8);
-    expect(
-      h.presentation
-        .getState()
-        .authoritative.managedControl?.threads.filter((thread) => thread.turn.phase === "queued"),
-    ).toHaveLength(1);
-    releaseStart.resolve();
-    await eightStarted.promise;
-    await h.terminal.waitForScreen("● Agents · 8 running · 1 queued");
-    const state = h.presentation.getState();
-    expect(
-      state.authoritative.managedControl?.threads.filter(
-        (thread) => thread.turn.phase === "executing",
-      ),
-    ).toHaveLength(8);
-    expect(
-      state.authoritative.managedControl?.threads.filter(
-        (thread) => thread.turn.phase === "queued",
-      ),
-    ).toHaveLength(1);
-    expect(
-      state.authoritative.active?.transcript.items.find(
-        (item) => item.type === "tool_call" && item.qualifiedName === "spawn_agents",
-      ),
-    ).toMatchObject({ status: "completed" });
-    expect(screen.slice(screen.indexOf("Fleet ·"))).not.toContain("@explore-9");
-    expect(mainCalls).toBe(2);
-  } finally {
-    releaseStart.resolve();
-    await h.close();
-  }
-});
+    );
+    try {
+      await h.press("Inspect these nine items.\r", "Confirm delegation");
+      expect(h.terminal.lines().join("\n")).not.toMatch(/Started @|Queued @/u);
+      expect(childCalls).toBe(0);
+      await h.press("\r", "Batch admitted; Main ready.");
+      await prepared.promise;
+      await h.terminal.waitForScreen("⎿ Starting");
+      const screen = h.terminal.lines().join("\n");
+      const lines = h.terminal.lines().map((line) => line.trim());
+      // The physical terminal exposes the continuation cell after each wide character.
+      const cardStart = lines.indexOf("Explore · 核 查  e\u0301 证 据  1");
+      expect(cardStart).toBeGreaterThanOrEqual(0);
+      expect(lines.slice(cardStart, cardStart + 18)).toEqual(
+        Array.from({ length: 9 }, (_, index) => [
+          `Explore · 核 查  e\u0301 证 据  ${index + 1}`,
+          index === 8 ? "Queued @explore-9 · Ctrl+O expand" : `Started @explore-${index + 1}`,
+        ]).flat(),
+      );
+      expect(lines).not.toContain("Completed");
+      expect(screen).not.toContain("managed_agent_batch");
+      expect(
+        h.presentation
+          .getState()
+          .authoritative.managedControl?.threads.filter(
+            (thread) => thread.turn.phase === "starting",
+          ),
+      ).toHaveLength(8);
+      expect(
+        h.presentation
+          .getState()
+          .authoritative.managedControl?.threads.filter((thread) => thread.turn.phase === "queued"),
+      ).toHaveLength(1);
+      releaseStart.resolve();
+      await eightStarted.promise;
+      await h.terminal.waitForScreen("● Agents · 8 running · 1 queued");
+      const state = h.presentation.getState();
+      expect(
+        state.authoritative.managedControl?.threads.filter(
+          (thread) => thread.turn.phase === "executing",
+        ),
+      ).toHaveLength(8);
+      expect(
+        state.authoritative.managedControl?.threads.filter(
+          (thread) => thread.turn.phase === "queued",
+        ),
+      ).toHaveLength(1);
+      expect(
+        state.authoritative.active?.transcript.items.find(
+          (item) => item.type === "tool_call" && item.qualifiedName === "spawn_agents",
+        ),
+      ).toMatchObject({ status: "completed" });
+      expect(screen.slice(screen.indexOf("Fleet ·"))).not.toContain("@explore-9");
+      expect(mainCalls).toBe(2);
+    } finally {
+      releaseStart.resolve();
+      await h.close();
+    }
+  },
+);
 
 test("Widget projects live child activity and queued details expose frozen configuration and budget", async () => {
   const eightStarted = Promise.withResolvers<void>();
@@ -506,8 +524,10 @@ test("ConversationViewer follows live output, preserves manual scroll, and survi
     await h.terminal.waitForScreen("@explore-1 · Explore · Running");
     await h.openFirstAgent();
     expect(h.conversationText()).toContain("First live line.");
-    expect(h.conversationText()).toContain("deepseek-v4-flash.direct · thinking default");
-    expect(h.conversationText()).toContain("128000 context");
+    await h.press("d", "Conversation details");
+    expect(h.terminal.lines().join("\n")).toContain("deepseek-v4-flash.direct · thinking default");
+    expect(h.terminal.lines().join("\n")).toContain("128000 context");
+    await h.press("\u001b", "First live line.", "Conversation details");
     const beforeLines = h.terminal.output().length;
     releaseLines.resolve();
     await h.terminal.waitForFrameAfter("Live line 50", beforeLines);
@@ -879,7 +899,8 @@ test("viewer x x cancels the exact turn only on two presses and retains unknown 
     expect(
       h.presentation.getState().authoritative.managedControl?.threads[0]?.budget?.unknownReserved,
     ).toBeGreaterThan(0);
-    expect(h.conversationText()).toContain("unknown reserved");
+    await h.press("d", "Conversation details");
+    expect(h.terminal.lines().join("\n")).toContain("unknown reserved");
   } finally {
     await h.close();
   }
@@ -1183,7 +1204,7 @@ test.each([
       ).toMatchObject({ managedDraft: { text: "界é👩‍💻" } });
       expect(h.terminal.lines().join("\n")).not.toContain("�");
       await h.press("\u001b[27u", "Draft");
-      await h.press("?", "Conversation details");
+      await h.press("d", "Conversation details");
       expect(h.terminal.lines().join("\n")).toContain("deepseek-v4-flash.direct");
       await h.press("\u001b[27u", "Draft");
       await h.press("\u001b[27u", "Fleet");
@@ -1197,7 +1218,7 @@ test.each([
   },
 );
 
-test("Widget and viewer expose owner-timed elapsed duration and actual compact model and usage preferences", async () => {
+test("Widget retains elapsed and optional model while details expose current usage", async () => {
   const started = Promise.withResolvers<void>();
   const finish = Promise.withResolvers<void>();
   const usageRendered = Promise.withResolvers<void>();
@@ -1230,6 +1251,10 @@ test("Widget and viewer expose owner-timed elapsed duration and actual compact m
     await h.press("/agents settings\r", "Agent settings");
     await h.press("\u001b[B\u001b[B\r", "Model/thinking · shown");
     await h.press("\u001b", "thinking default");
+    expect(h.terminal.lines().join("\n")).not.toMatch(/\d+ used|\d+ reserved/u);
+    await h.press("/agents\r", "Agents workspace");
+    await h.press("\r", "Conversation ·");
+    await h.press("d", "Conversation details");
     expect(h.terminal.lines().join("\n")).toContain("0 used");
     const offset = h.terminal.output().length;
     finish.resolve();
@@ -1241,9 +1266,7 @@ test("Widget and viewer expose owner-timed elapsed duration and actual compact m
     expect(thread?.turn.outcome?.atUnixMilliseconds).toBeGreaterThanOrEqual(
       thread?.turn.startedAtUnixMilliseconds ?? Infinity,
     );
-    await h.press("/agents\r", "Agents workspace");
-    await h.press("\r", "elapsed");
-    expect(h.conversationText()).toContain("40 used");
+    expect(h.terminal.lines().join("\n")).toContain("40 used");
   } finally {
     finish.resolve();
     usageRendered.resolve();
@@ -1784,6 +1807,7 @@ test("a queued cancellation keeps per-thread export available without creating a
     await h.press("\u001b[F", "@explore-9");
     await h.press("x", "x again to cancel");
     await h.press("x", "Cancelled");
+    await h.press("\r", "Enter result / export");
     await h.press("\r", "e export");
     expect(h.terminal.lines().join("\n")).toContain("e export");
     await h.press("e", "Export agent");
@@ -1837,7 +1861,7 @@ test("viewer Help disarms an earlier x-x cancellation before returning to the sa
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Conversation");
     await h.press("x", "x again to cancel");
-    await h.press("?", "Conversation details");
+    await h.press("?", "Conversation help");
     await h.press("\u001b", "Following tail");
     await h.press("x", "x again to cancel");
     expect(h.conversationText()).toContain("x again to cancel");
@@ -2085,6 +2109,55 @@ test("workspace Attention navigation disarms an earlier exact cancellation", asy
     );
     await h.press("x", "Cancelled");
     expect(aborts).toBe(1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("declined admission keeps its reason visible without reporting a child start", async () => {
+  let calls = 0;
+  const h = await startManagedTui({
+    async *stream() {
+      if (++calls === 1) {
+        yield { type: "tool_call_start", id: "declined-spawn", name: "spawn_agents" };
+        yield {
+          type: "tool_call_delta",
+          id: "declined-spawn",
+          json: JSON.stringify({
+            entries: [
+              {
+                role: "builtin:explore",
+                task: "Inspect requested evidence",
+                description: "Requested evidence",
+              },
+            ],
+          }),
+        };
+        yield { type: "tool_call_end", id: "declined-spawn" };
+        yield { type: "finish", reason: "tool_calls" };
+      } else {
+        yield { type: "text_delta", text: "Delegation declined; Main ready." };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  });
+  try {
+    await h.press("Consider delegation.\r", "Confirm delegation");
+    expect(h.terminal.lines().join("\n")).not.toMatch(/Started @|Queued @/u);
+    await h.press("\u001b", "Delegation declined; Main ready.");
+    const screen = h.terminal.lines().join("\n");
+    expect(screen).toContain("permission_denied");
+    expect(screen).not.toMatch(/Started @|Queued @|managed_agent_batch/u);
+    expect(h.presentation.getState().authoritative.managedControl?.threads).toHaveLength(0);
+    const admission = h.presentation
+      .getState()
+      .authoritative.active?.transcript.items.find(
+        (item) => item.type === "tool_call" && item.callId === "declined-spawn",
+      );
+    expect(admission).toMatchObject({
+      status: "denied",
+      outcome: { status: "failed", code: "permission_denied" },
+    });
   } finally {
     await h.close();
   }

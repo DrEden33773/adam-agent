@@ -1088,6 +1088,31 @@ export async function createPresentationSession(
         await persistCurrentTurnDraft();
       }
     };
+    const clearAcceptedTurnDraft = async (
+      draftRevision: number,
+      expectedScope: TurnDraftScopeV1,
+      submittedScope?: TurnDraftScopeV1 | null,
+    ): Promise<boolean> => {
+      const stillCurrent = () =>
+        turnComposer.snapshot().revision === draftRevision &&
+        isDeepStrictEqual(expectedScope, currentDraftScope());
+      if (!stillCurrent()) return false;
+      try {
+        if (recoverableDrafts !== null) {
+          // Queue captured scopes together before edits can enqueue newer saves.
+          const deletions = [recoverableDrafts.delete(expectedScope)];
+          if (submittedScope != null && !isDeepStrictEqual(submittedScope, expectedScope))
+            deletions.push(recoverableDrafts.delete(submittedScope));
+          await Promise.all(deletions);
+        }
+        // Disk I/O never mutates the composer; a newer edit wins this comparison.
+        if (!stillCurrent()) return false;
+        return !(await turnComposer.reset(draftRevision));
+      } catch {
+        // Control acceptance is already durable; draft cleanup cannot revoke it.
+        return true;
+      }
+    };
     const loadTurnDraft = async (scope: TurnDraftScopeV1, targetId?: string) => {
       const recovered = await recoverableDrafts?.load(scope);
       if (
@@ -3117,17 +3142,17 @@ export async function createPresentationSession(
           { directThinkingSelection: command.thinkingSelection ?? null, directResources },
         );
         if (receipt.status === "rejected") return receipt;
-        if (turnComposer.snapshot().revision === command.draftRevision) {
-          await turnComposer.clear();
-          await persistCurrentTurnDraft();
-          if (recoverableDrafts !== null && submittedScope !== null)
-            await recoverableDrafts.delete(submittedScope);
-        }
+        const draftCleanupFailed = await clearAcceptedTurnDraft(
+          command.draftRevision,
+          { type: "session", sessionId: parentSessionId },
+          submittedScope,
+        );
         return {
           status: "admitted",
           commandId: command.confirmedEnvelope.id,
           resource: null,
           control: receipt,
+          ...(draftCleanupFailed ? { draftCleanupFailed: true as const } : {}),
         };
       }
       if (command.type === "direct_agent_input") {
@@ -3271,11 +3296,17 @@ export async function createPresentationSession(
           { directResources },
         );
         if (receipt.status === "rejected") return receipt;
-        if (turnComposer.snapshot().revision === command.draftRevision) {
-          await turnComposer.clear();
-          await persistCurrentTurnDraft();
-        }
-        return { status: "admitted", commandId: input.inputId, resource: null, control: receipt };
+        const draftCleanupFailed = await clearAcceptedTurnDraft(command.draftRevision, {
+          type: "session",
+          sessionId: parentSessionId,
+        });
+        return {
+          status: "admitted",
+          commandId: input.inputId,
+          resource: null,
+          control: receipt,
+          ...(draftCleanupFailed ? { draftCleanupFailed: true as const } : {}),
+        };
       }
       if (command.type === "managed_control") {
         const parentSessionId = command.command.parentSessionId;

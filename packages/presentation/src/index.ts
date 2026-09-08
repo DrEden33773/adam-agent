@@ -1383,6 +1383,7 @@ export type CommandReceipt =
       readonly commandId: string;
       readonly resource: ArtifactChunk | null;
       readonly draftText?: string;
+      readonly draftCleanupFailed?: true;
       readonly roleTarget?: {
         readonly qualifiedId: string;
         readonly definitionDigest: string;

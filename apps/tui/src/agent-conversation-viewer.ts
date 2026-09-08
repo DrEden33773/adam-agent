@@ -37,15 +37,21 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { agentElapsedLabel } from "./agent-widget.js";
+import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import type { AdamTuiTheme } from "./theme.js";
 import { ToolPreview } from "./tool-preview.js";
 
 const viewerKeys = {
-  up: (data: string) => getKeybindings().matches(data, "tui.select.up") || matchesKey(data, "k"),
+  up: (data: string) =>
+    focusedWheelDirection(data) === -1 ||
+    getKeybindings().matches(data, "tui.select.up") ||
+    matchesKey(data, "k"),
   down: (data: string) =>
-    getKeybindings().matches(data, "tui.select.down") || matchesKey(data, "j"),
+    focusedWheelDirection(data) === 1 ||
+    getKeybindings().matches(data, "tui.select.down") ||
+    matchesKey(data, "j"),
   pageUp: (data: string) =>
     getKeybindings().matches(data, "tui.select.pageUp") || matchesKey(data, "shift+up"),
   pageDown: (data: string) =>
@@ -118,6 +124,9 @@ export class AgentConversationViewer implements Component {
   #readGeneration = 0;
   #closed = false;
   #details = false;
+  #help = false;
+  #helpScroll = 0;
+  #helpMaximumScroll = 0;
   #detailScroll = 0;
   #detailMaximumScroll = 0;
   #notice = "";
@@ -179,6 +188,7 @@ export class AgentConversationViewer implements Component {
         cursor: string | null,
       ) => Promise<ManagedAgentTranscriptPageResource>;
       readonly onSend: (command: ManagedControlCommand) => Promise<CommandReceipt>;
+      readonly isMainCommand?: (text: string) => boolean;
       readonly onSaveDraft: (draft: ManagedComposerDraft) => Promise<void>;
       readonly onClearDraft: (draft: ManagedComposerDraft) => Promise<boolean>;
       readonly onReadResource: (
@@ -396,6 +406,11 @@ export class AgentConversationViewer implements Component {
       this.back();
       return;
     }
+    if (this.options.isMainCommand?.(text)) {
+      this.#inputNotice = "Run this command in Main. Child draft retained.";
+      this.options.onChange();
+      return;
+    }
     const target = this.#composeTarget;
     if (target === undefined) return;
     if (
@@ -528,7 +543,9 @@ export class AgentConversationViewer implements Component {
     });
   }
   back(): void {
-    if (this.#exportView !== undefined) {
+    if (this.#help) {
+      this.#help = false;
+    } else if (this.#exportView !== undefined) {
       if (this.#exportView.phase === "confirm") this.#exportView.phase = "fields";
       else this.#exportView = undefined;
     } else if (this.#suppressTarget !== undefined) {
@@ -550,15 +567,42 @@ export class AgentConversationViewer implements Component {
   }
   handleInput(data: string): void {
     if (isKeyRelease(data)) return;
+    const wheel = focusedWheelDirection(data);
     if (!isKeyRepeat(data) && !matchesKey(data, "x")) this.#cancelTarget = undefined;
     if (matchesKey(data, "enter") && isKeyRepeat(data)) return;
+    if (this.#help) {
+      if ((matchesKey(data, "escape") || matchesKey(data, "?")) && !isKeyRepeat(data))
+        this.#help = false;
+      else if (matchesKey(data, "home")) this.#helpScroll = 0;
+      else if (matchesKey(data, "end")) this.#helpScroll = this.#helpMaximumScroll;
+      else if (viewerKeys.up(data) || viewerKeys.pageUp(data))
+        this.#helpScroll = Math.max(
+          0,
+          this.#helpScroll -
+            (viewerKeys.up(data) ? 1 : Math.max(1, this.options.maximumLines() - 2)),
+        );
+      else if (viewerKeys.down(data) || viewerKeys.pageDown(data))
+        this.#helpScroll = Math.min(
+          this.#helpMaximumScroll,
+          this.#helpScroll +
+            (viewerKeys.down(data) ? 1 : Math.max(1, this.options.maximumLines() - 2)),
+        );
+      this.options.onChange();
+      return;
+    }
     if (this.#exportView !== undefined) {
       this.handleExportInput(data, this.#exportView);
       this.options.onChange();
       return;
     }
+    if (this.#resources !== undefined) {
+      this.handleResourceInput(data);
+      this.options.onChange();
+      return;
+    }
     if (this.#details) {
-      if ((matchesKey(data, "escape") || data === "?") && !isKeyRepeat(data)) this.#details = false;
+      if ((matchesKey(data, "escape") || matchesKey(data, "d")) && !isKeyRepeat(data))
+        this.#details = false;
       else if (matchesKey(data, "home")) this.#detailScroll = 0;
       else if (matchesKey(data, "end")) this.#detailScroll = this.#detailMaximumScroll;
       else if (viewerKeys.up(data) || viewerKeys.pageUp(data))
@@ -576,14 +620,15 @@ export class AgentConversationViewer implements Component {
       this.options.onChange();
       return;
     }
-    if (!this.#composing && data === "?" && !isKeyRepeat(data)) {
-      this.#details = true;
-      this.#detailScroll = 0;
+    if (!this.#composing && matchesKey(data, "?") && !isKeyRepeat(data)) {
+      this.#help = true;
+      this.#helpScroll = 0;
       this.options.onChange();
       return;
     }
-    if (this.#resources !== undefined) {
-      this.handleResourceInput(data);
+    if (!this.#composing && matchesKey(data, "d") && !isKeyRepeat(data)) {
+      this.#details = true;
+      this.#detailScroll = 0;
       this.options.onChange();
       return;
     }
@@ -693,6 +738,11 @@ export class AgentConversationViewer implements Component {
       if (!isKeyRepeat(data)) this.back();
       return;
     }
+    if (wheel !== null) {
+      this.scrollConversation(wheel, false);
+      this.options.onChange();
+      return;
+    }
     if (this.#composing) {
       if (this.#sending) return;
       if (
@@ -725,7 +775,12 @@ export class AgentConversationViewer implements Component {
       }
       this.#composing = true;
       this.#composer.focused = this.#focused;
-    } else if (matchesKey(data, "d") && !isKeyRepeat(data) && this.#composer.getValue()) {
+    } else if (
+      matchesKey(data, "ctrl+d") &&
+      !isKeyRepeat(data) &&
+      !this.#sending &&
+      this.#composer.getValue()
+    ) {
       this.#composer.setValue("");
       void this.saveLocalDraft().catch(() => undefined);
       this.#composeTarget = undefined;
@@ -769,27 +824,30 @@ export class AgentConversationViewer implements Component {
     } else if (matchesKey(data, "end")) {
       this.followTail();
     } else if (viewerKeys.up(data) || viewerKeys.pageUp(data)) {
-      this.freezePage();
-      if (viewerKeys.pageUp(data) && this.#scrollOffset === 0 && this.#manualPage?.olderCursor)
-        this.loadPage(this.#manualPage.olderCursor, "older");
-      else
-        this.#scrollOffset = Math.max(
-          0,
-          this.#scrollOffset - (viewerKeys.pageUp(data) ? this.#bodyHeight : 1),
-        );
+      this.scrollConversation(-1, viewerKeys.pageUp(data));
     } else if (viewerKeys.down(data) || viewerKeys.pageDown(data)) {
+      this.scrollConversation(1, viewerKeys.pageDown(data));
+    }
+    this.options.onChange();
+  }
+  private scrollConversation(direction: -1 | 1, page: boolean): void {
+    if (direction < 0) {
+      this.freezePage();
+      if (page && this.#scrollOffset === 0 && this.#manualPage?.olderCursor)
+        this.loadPage(this.#manualPage.olderCursor, "older");
+      else this.#scrollOffset = Math.max(0, this.#scrollOffset - (page ? this.#bodyHeight : 1));
+    } else {
       if (this.#scrollOffset >= this.#maximumScroll && this.#newerCursors.length > 0)
         this.loadPage(this.#newerCursors.at(-1) ?? null, "newer");
       else {
         this.#scrollOffset = Math.min(
           this.#maximumScroll,
-          this.#scrollOffset + (viewerKeys.pageDown(data) ? this.#bodyHeight : 1),
+          this.#scrollOffset + (page ? this.#bodyHeight : 1),
         );
         if (this.#scrollOffset >= this.#maximumScroll && this.#newerCursors.length === 0)
           this.followTail();
       }
     }
-    this.options.onChange();
   }
   invalidate(): void {}
   private canCompose(): boolean {
@@ -1165,6 +1223,30 @@ export class AgentConversationViewer implements Component {
     ].map((line) => truncateToWidth(line, width));
   }
   render(width: number): string[] {
+    if (this.#help) {
+      const lines = [
+        "Enter: focus the independent child editor",
+        "Enter in editor: send · Tab: cooperative/interrupt delivery",
+        "Esc: editor to viewer to Fleet to Main",
+        "d: exact agent details · Ctrl+D: discard retained draft",
+        "t: confirm retarget to the current turn",
+        "x x: cancel the exact turn",
+        "v: bounded resources · i: exact input receipts",
+        "m: raw/assistant/full Markdown",
+        "Home/End: scroll start/follow tail",
+        "j/k, arrows or wheel: scroll current viewport",
+        "PgUp/PgDown or Shift+arrows: page and bounded transcript",
+        "Run built-in commands in Main; child drafts stay private.",
+      ].flatMap((line) => wrapTextWithAnsi(line, width));
+      const height = Math.max(1, this.options.maximumLines() - 2);
+      this.#helpMaximumScroll = Math.max(0, lines.length - height);
+      this.#helpScroll = Math.min(this.#helpScroll, this.#helpMaximumScroll);
+      return [
+        this.options.theme.primary("Conversation help"),
+        ...lines.slice(this.#helpScroll, this.#helpScroll + height),
+        "↑↓ / wheel scroll · Esc conversation",
+      ].map((line) => truncateToWidth(line, width));
+    }
     const completion = this.#completion;
     if (
       this.#focused &&
@@ -1195,9 +1277,7 @@ export class AgentConversationViewer implements Component {
       this.#manualPage === undefined ? this.#olderCursor : this.#manualPage.olderCursor;
     const liveOmittedBytes =
       this.#manualPage === undefined ? this.#liveOmittedBytes : this.#manualPage.liveOmittedBytes;
-    const header = [
-      this.options.theme.primary(`Conversation · ${thread.handle} · ${thread.displayName}`),
-      safeTerminalText(thread.description),
+    const configurationDetails = [
       config === undefined
         ? "Recorded target unavailable"
         : `${safeTerminalText(config.targetId)} · thinking ${safeTerminalText(config.thinking)}`,
@@ -1210,6 +1290,10 @@ export class AgentConversationViewer implements Component {
               ? [`Provider usage exceeded request estimates by ${thread.budget.overrun} tokens.`]
               : []),
           ]),
+    ];
+    const header = [
+      this.options.theme.primary(`Conversation · ${thread.handle} · ${thread.displayName}`),
+      safeTerminalText(thread.description),
       `${thread.turn.label}${agentElapsedLabel(thread)}`,
       ...(this.#activity?.tool?.status === "generating_arguments"
         ? [`Generating arguments · ${safeTerminalText(this.#activity.tool.name)}`]
@@ -1247,7 +1331,7 @@ export class AgentConversationViewer implements Component {
       ...(this.#composeTarget !== undefined &&
       this.#composer.getValue() &&
       this.#composeTarget.expectedTurnId !== thread.turn.turnId
-        ? ["Draft targets an earlier turn · d discard · t retarget"]
+        ? ["Draft targets an earlier turn · Ctrl+D discard · t retarget"]
         : []),
       `${this.#followTail ? "Following tail" : "Manual scroll · End tail"} · m ${this.#renderMode === "raw" ? "raw" : `${this.#renderMode} Markdown`}`,
       ...(olderCursor === null ? [] : ["PgUp at top: older transcript page"]),
@@ -1278,12 +1362,12 @@ export class AgentConversationViewer implements Component {
               : "Enter send · Esc viewer",
           ]
         : [
-            ...(this.#composer.getValue() ? [`Draft to ${thread.handle}`] : []),
+            ...(this.#composer.getValue() ? [`Draft to ${thread.handle} · Ctrl+D discard`] : []),
             this.canCompose()
-              ? "Enter compose · Esc back"
+              ? "Enter compose · Esc back · d details · ? help"
               : this.#thread.turn.phase === "settling"
-                ? "Settling · input available after cleanup · Esc back"
-                : "Input unavailable · Esc back",
+                ? "Settling · input available after cleanup · Esc back · d details · ? help"
+                : "Input unavailable · Esc back · d details · ? help",
           ]),
     ];
     const body = (this.#manualPage?.items ?? this.#items).flatMap((item) => {
@@ -1332,15 +1416,12 @@ export class AgentConversationViewer implements Component {
     if (this.#details) {
       const details = [
         ...header.slice(1),
-        `Rendering: ${this.#renderMode} · m cycles raw/assistant/full`,
-        "Enter: focus the independent child editor",
-        "Esc: editor to viewer to Fleet to Main",
-        "x x: cancel the exact turn",
-        "v: bounded resources · i: exact input receipts",
-        "d: discard retained draft · t: confirm retarget",
-        "Home/End: scroll start/follow tail",
-        "j/k or configured arrows: scroll",
-        "PgUp/PgDown or Shift+arrows: page and bounded transcript",
+        ...configurationDetails,
+        `Role: ${thread.role}`,
+        `Thread: ${thread.threadId}`,
+        `Turn: ${thread.turn.turnId}`,
+        `Attempt: ${thread.turn.attemptId}`,
+        ...(config === undefined ? [] : [`Configuration: ${config.digest}`]),
       ].flatMap((line) => wrapTextWithAnsi(safeTerminalText(line), width));
       const height = Math.max(1, maximum - 2);
       this.#detailMaximumScroll = Math.max(0, details.length - height);
@@ -1383,7 +1464,9 @@ export class AgentConversationViewer implements Component {
             `Enter send${this.#mode === "cooperative" || this.#mode === "interrupt" ? " · Tab" : ""} · Esc viewer`,
           ]
         : [
-            ...(this.#composer.getValue() ? [`Draft to ${thread.handle} · d/t`] : []),
+            ...(this.#composer.getValue()
+              ? [`Draft to ${thread.handle} · Ctrl+D discard · t retarget`]
+              : []),
             ...(this.#suppressTarget !== undefined
               ? ["Suppress from Main? s confirm", "Esc cancel · skip automatic delivery"]
               : this.#retargetPending
@@ -1407,7 +1490,7 @@ export class AgentConversationViewer implements Component {
         Math.max(0, compactBody.length - this.#bodyHeight);
       return [
         this.options.theme.primary(`Conversation · ${thread.handle}`),
-        `${hidden} lines hidden · m ${this.#renderMode} · ?`,
+        `${this.#followTail ? "Tail" : "Manual · End tail"} · d details · ? help · ${hidden} lines hidden · m ${this.#renderMode}`,
         ...compactBody.slice(this.#scrollOffset, this.#scrollOffset + this.#bodyHeight),
         ...essential,
       ].map((line) => truncateToWidth(line, width));

@@ -43,6 +43,7 @@ import {
   VStack,
 } from "@earendil-works/pi-tui";
 import PQueue from "p-queue";
+import { AgentAdmissionCard } from "./agent-admission-card.js";
 import { AgentConversationViewer } from "./agent-conversation-viewer.js";
 import { AgentFleet, AgentSessionTransition, AgentWorkspace } from "./agent-fleet.js";
 import { AgentNavigator, ManagedAgentRoster } from "./agent-navigator.js";
@@ -384,7 +385,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   });
   const agentWidget = new AgentWidget(
     theme,
-    () => Math.max(2, Math.min(12, Math.floor((physicalTerminal.rows - 8) / 2))),
+    () =>
+      editor.isShowingAutocomplete()
+        ? 2
+        : Math.max(2, Math.min(12, Math.floor((physicalTerminal.rows - 8) / 2))),
     {
       scheduler: deadlineScheduler,
       onChange: () => renderState(),
@@ -403,7 +407,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             draft.threadId === thread.threadId && draft.parentSessionId === thread.parentSessionId,
         ) ?? false,
     maximumLines: () =>
-      Math.max(1, Math.min(7, physicalTerminal.rows - (physicalTerminal.columns < 80 ? 15 : 12))),
+      editor.isShowingAutocomplete()
+        ? 1
+        : Math.max(
+            1,
+            Math.min(7, physicalTerminal.rows - (physicalTerminal.columns < 80 ? 15 : 12)),
+          ),
   });
   const todoCompactViewModel = new TodoCompactViewModel();
   const todoCompactOverlay = new TodoCompactOverlay(todoCompactViewModel, theme);
@@ -697,6 +706,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let workspaceTrustMutationPending = false;
   let webSearchConfigurationPending = false;
   editorSlot.addChild(editor);
+  const compactCompletionFooter = () =>
+    options.presentation.getState().authoritative.managedControl !== undefined &&
+    editor.isShowingAutocomplete() &&
+    physicalTerminal.rows < 18;
   const supportedRoot = new VStack([
     header,
     {
@@ -763,7 +776,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             options.presentation.getState().authoritative.managedControl !== undefined &&
             options.presentation.getState().agentUiSettings?.fleetEnabled !== false,
         },
-        footer,
+        { component: footer, visible: () => !compactCompletionFooter() },
+        {
+          component: new ResponsiveLine(theme.muted("Tab select · ↑↓ choose · Esc close")),
+          visible: compactCompletionFooter,
+        },
       ]),
       basis: "auto",
       minSize: 1,
@@ -2219,17 +2236,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         const key = JSON.stringify([item, expanded]);
         let cachedTool = toolComponents.get(item.id);
         if (cachedTool?.key !== key) {
-          const tool = new Box(1, 1, theme.toolBackground);
+          const admissionCard = item.qualifiedName === "spawn_agents";
+          const admissions = item.managedAdmissions ?? [];
+          const tool = new Box(admissionCard ? 0 : 1, admissionCard ? 0 : 1, theme.toolBackground);
           const subject = item.subject?.value;
           const label = safeTerminalText(item.label);
           const baseTitle =
-            item.kind === "shell"
-              ? subject === undefined
-                ? "$"
-                : `$ ${safeTerminalText(subject)}`
-              : subject === undefined
-                ? label
-                : `${label} ${safeTerminalText(subject)}`;
+            admissionCard && !expanded
+              ? "Agents"
+              : item.kind === "shell"
+                ? subject === undefined
+                  ? "$"
+                  : `$ ${safeTerminalText(subject)}`
+                : subject === undefined
+                  ? label
+                  : `${label} ${safeTerminalText(subject)}`;
           const action = `Ctrl+O ${expanded ? "fold" : "expand"}`;
           const firstTitleLine = baseTitle.split("\n", 1)[0] ?? "";
           const singleLineTitle = firstTitleLine === baseTitle ? baseTitle : `${firstTitleLine} …`;
@@ -2241,22 +2262,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             standard: titleWithAction(32),
             wide: titleWithAction(90),
           });
-          tool.addChild(toolTitle);
-          for (const admission of item.managedAdmissions ?? []) {
+          if (admissions.length === 0 || expanded) {
+            tool.addChild(admissionCard ? new ResponsiveLine(titleWithAction(90)) : toolTitle);
+          }
+          for (const [index, admission] of admissions.entries()) {
             tool.addChild(
-              new ResponsiveLine(
-                theme.toolOutput(
-                  safeTerminalText(
-                    `${admission.status === "started" ? "Started" : "Queued"} ${admission.handle} · ${admission.displayName} · ${admission.description}`,
-                  ),
-                ),
+              new AgentAdmissionCard(
+                admission,
+                theme,
+                index === admissions.length - 1 && !expanded,
               ),
             );
           }
           if (item.preview !== null) {
             tool.addChild(new ToolPreview(item.preview, expanded, theme));
           }
-          const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
+          const detail =
+            admissions.length > 0 && item.status === "completed"
+              ? null
+              : (item.resultSummary ?? toolStatusText(item.status, item.outcome?.status));
           if (detail !== null) {
             tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));
           }
@@ -3684,6 +3708,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           commandId: randomUUID(),
           command,
         }),
+      isMainCommand: (text) => commandRegistry.parse(text.trimStart()).kind === "known",
       onSaveDraft: async (draft) => {
         const receipt = await options.presentation.dispatch({ type: "save_agent_draft", draft });
         if (receipt.status === "rejected") {
@@ -5082,6 +5107,35 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     if (first?.type === "mention" && first.kind === "agent") {
+      if (commandRegistry.parse(text.trimStart()).kind === "known") {
+        editor.disableSubmit = false;
+        showNotice("warning", "Run this command in Main. The draft is retained.", "until_edit");
+        renderState();
+        return;
+      }
+      if (
+        state.composer.elements.every(
+          (element) =>
+            element === first || (element.type === "text" && element.text.trim().length === 0),
+        )
+      ) {
+        const thread = state.authoritative.managedControl?.threads.find(
+          (entry) =>
+            entry.parentSessionId === first.parentSessionId &&
+            entry.threadId === first.threadId &&
+            entry.handle === first.handle,
+        );
+        editor.disableSubmit = false;
+        clearNotice();
+        if (thread === undefined) showUnavailableRecipient(first, state.composer.draftRevision);
+        else if (!thread.turn.hasStarted) {
+          showAgentNavigator(thread.parentSessionId);
+          if (!agentWorkspace?.workspace.openDetails(thread))
+            showUnavailableRecipient(first, state.composer.draftRevision);
+        } else showManagedConversation(thread);
+        renderState();
+        return;
+      }
       const draftRevision = state.composer.draftRevision;
       void options.presentation
         .dispatch({ type: "direct_agent_input", draftRevision })
@@ -5101,6 +5155,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           };
           const send = (mode: "cooperative" | "interrupt" | "new_turn" | "reply") => {
             handle?.hide();
+            const actionId = showNotice(
+              "progress",
+              `Sending to ${first.handle}…`,
+              "until_replaced",
+              first.parentSessionId,
+            );
+            renderState();
             void options.presentation
               .dispatch({
                 type: "direct_agent_input",
@@ -5112,19 +5173,35 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               })
               .then((result) => {
                 editor.disableSubmit = false;
-                if (result.status === "rejected") showNotice("error", result.message, "until_edit");
+                if (result.status === "rejected")
+                  settleNotice(
+                    actionId,
+                    "error",
+                    result.message,
+                    "until_edit",
+                    first.parentSessionId,
+                  );
                 else {
-                  editor.setText("");
-                  showNotice("success", `Input accepted for ${first.handle}.`, "until_edit");
+                  settleNotice(
+                    actionId,
+                    result.draftCleanupFailed ? "warning" : "success",
+                    result.draftCleanupFailed
+                      ? `Input accepted for ${first.handle}. Draft cleanup failed; do not resend.`
+                      : `Input accepted for ${first.handle}.`,
+                    "until_edit",
+                    first.parentSessionId,
+                  );
                 }
                 renderState();
               })
               .catch(() => {
                 editor.disableSubmit = false;
-                showNotice(
+                settleNotice(
+                  actionId,
                   "error",
                   "The exact input could not be accepted. The draft is retained.",
                   "until_edit",
+                  first.parentSessionId,
                 );
                 renderState();
               });
@@ -5321,7 +5398,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 .then((result) => {
                   if (result.status === "rejected")
                     showNotice("error", result.message, "until_edit");
-                  else editor.setText("");
+                  else if (result.draftCleanupFailed)
+                    showNotice(
+                      "warning",
+                      "Agent admitted. Draft cleanup failed; do not resend.",
+                      "until_edit",
+                    );
                   editor.disableSubmit = false;
                   renderState();
                 })
@@ -5351,11 +5433,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (
-      text.trim().length === 0 &&
-      state.composer.pastedTexts.length === 0 &&
-      !state.composer.elements.some((element) => element.type === "skill")
-    ) {
+    if (text.trim().length === 0 && state.composer.renderedText.trim().length === 0) {
+      editor.disableSubmit = false;
+      clearNotice();
+      renderState();
       return;
     }
     const earlyParsed = commandRegistry.parse(text);
