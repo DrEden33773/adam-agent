@@ -17,6 +17,7 @@ import {
 } from "./exit-policy.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
+import { toolArgumentPhaseLabel } from "./tool-argument-phase.js";
 
 export function agentElapsedLabel(thread: ManagedControlThread): string {
   const start = thread.turn.startedAtUnixMilliseconds;
@@ -183,9 +184,11 @@ export class AgentWidget implements Component {
           thread.turn.phase === "waiting" ||
           thread.turn.phase === "settling");
       const elapsed = agentElapsedLabel(thread);
+      const argumentPhase =
+        activity?.tool === undefined ? undefined : toolArgumentPhaseLabel(activity.tool.status);
       const content =
-        (activity?.tool?.status === "generating_arguments"
-          ? `Generating arguments · ${activity.tool.name}`
+        (argumentPhase !== undefined
+          ? `${argumentPhase} · ${activity?.tool?.name}`
           : activity?.tool?.name) ??
         activity?.assistant?.text.split("\n").find((line) => line.trim().length > 0) ??
         (activity?.reasoning ? "Thinking…" : thread.turn.label);

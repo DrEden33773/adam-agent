@@ -235,6 +235,7 @@ test("direct role and exact-thread messages preserve folded pasted evidence", as
       await h.press("\r", "Delegation");
       await h.press("\r", mention === "@Explore" ? "Completed" : "Input accepted for @explore-1");
       await h.terminal.waitForScreen("○ @explore-1 · Explore · Completed");
+      expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
       expect(JSON.stringify(requests.at(-1)?.messages)).toContain(marker);
       expect(h.presentation.getState().composer.renderedText).toBe("");
     }
@@ -683,6 +684,8 @@ test("a direct handle confirmation rejects a changed turn and retains the draft"
     ).toMatchObject({ status: "accepted" });
     await started.promise;
     await h.press("\r", "The exact turn or input action changed.");
+    expect(h.terminal.lines().join("\n")).not.toContain("Sending to @explore-1…");
+    expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
     expect(h.presentation.getState().composer.renderedText).toBe(
       "@explore-1 Send only to the reviewed turn.",
     );
@@ -960,6 +963,7 @@ test("ordinary Enter seals manual recipients as one Main request without child r
     const text = "Inspect @探索🧭 @Explore @main";
     await h.press(text, "Inspect");
     await h.press("\r", "Main received literal mentions.");
+    expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
     expect(requests).toHaveLength(1);
     expect(JSON.stringify(requests[0]?.messages)).toContain(text);
     expect(await h.store.read()).toEqual([]);
@@ -1307,5 +1311,67 @@ test("an Explore continuation retains its activated Skill and resources across a
   } finally {
     await h.close();
     await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("cancelling direct role and exact handle confirmation ends submission and retains the draft", async () => {
+  const h = await startManagedTui({
+    async *stream() {
+      yield { type: "text_delta", text: "Evidence complete." };
+      yield { type: "usage", inputTokens: 100, outputTokens: 20 };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  try {
+    await h.press("@Explore", "New agent · Explore");
+    await h.press("\t", "@Explore");
+    await h.press(" Inspect evidence.", "Inspect evidence.");
+    await h.press("\r", "Delegation");
+    await h.press("\x1b", "Inspect evidence.", "Delegation");
+    expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
+    expect(h.presentation.getState().composer.renderedText).toBe("@Explore Inspect evidence.");
+    expect(h.presentation.getState().authoritative.managedControl?.threads).toHaveLength(0);
+    await h.press("\r", "Delegation");
+    await h.press("\r", "Completed");
+    await h.press("@explore-1", "[Agent] @explore-1 · Inspect evidence.");
+    await h.press("\t", "@explore-1");
+    await h.press(" Continue evidence.", "Continue evidence.");
+    await h.press("\r", "Delegation");
+    await h.press("\x1b", "Continue evidence.", "Delegation");
+    expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
+    expect(h.presentation.getState().composer.renderedText).toBe("@explore-1 Continue evidence.");
+    expect(
+      (await h.store.read()).filter((record) => record.event.type === "admitted"),
+    ).toHaveLength(1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a rejected role confirmation ends admission progress and keeps its changed draft", async () => {
+  const h = await startManagedTui({
+    stream() {
+      throw new Error("Rejected delegation must not dispatch.");
+    },
+  });
+  try {
+    await h.press("@Explore", "New agent · Explore");
+    await h.press("\t", "@Explore");
+    await h.press(" Inspect evidence.", "Inspect evidence.");
+    await h.press("\r", "Delegation");
+    expect(
+      await h.presentation.dispatch({
+        type: "stage_pasted_text",
+        text: "Later evidence\n".repeat(50),
+      }),
+    ).toMatchObject({ status: "admitted" });
+    const changedDraft = h.presentation.getState().composer.elements;
+    await h.press("\r", "Select a current role and retry this exact draft.");
+    expect(h.terminal.lines().join("\n")).not.toContain("Admitting agent…");
+    expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
+    expect(h.presentation.getState().composer.elements).toEqual(changedDraft);
+    expect(h.presentation.getState().authoritative.managedControl?.threads).toHaveLength(0);
+  } finally {
+    await h.close();
   }
 });

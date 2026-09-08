@@ -245,6 +245,14 @@ export type ActiveContextUsage =
 
 export type RuntimeEvent =
   | { readonly type: "model_tool_arguments_started"; readonly id: string; readonly name: string }
+  | { readonly type: "model_tool_arguments_completed"; readonly id: string; readonly name: string }
+  | { readonly type: "model_response_processing"; readonly callIds: readonly string[] }
+  | {
+      readonly type: "model_tool_arguments_settled";
+      readonly id: string;
+      readonly name: string;
+      readonly status: "failed" | "cancelled";
+    }
   | { readonly type: "user_message"; readonly text: string }
   | { readonly type: "model_message_started" }
   | {

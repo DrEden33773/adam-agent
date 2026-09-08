@@ -65,7 +65,10 @@ export type CanonicalRuntimeEvent = Exclude<
       | "model_message_delta"
       | "model_reasoning_updated"
       | "mcp_catalog_state_changed"
-      | "model_tool_arguments_started";
+      | "model_tool_arguments_started"
+      | "model_tool_arguments_completed"
+      | "model_response_processing"
+      | "model_tool_arguments_settled";
   }
 >;
 

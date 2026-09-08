@@ -78,6 +78,42 @@ const emptyComposer = {
 } as const;
 
 describe("presentation reconciliation", () => {
+  it("preserves the role catalog during same-session updates and clears it on selection", () => {
+    const roles = [
+      {
+        qualifiedId: "builtin:explore",
+        name: "Explore",
+        description: "Explore",
+        definitionDigest: "digest",
+      },
+    ];
+    const initial: PresentationDisplayState = {
+      revision: 1,
+      authoritative: emptySnapshot,
+      draft: null,
+      composer: emptyComposer,
+      transient: null,
+      agentRoles: roles,
+    };
+    const streaming = reconcilePresentationUpdate(initial, {
+      type: "assistant_delta",
+      streamId: "s",
+      afterSequence: 0,
+      text: "Hello",
+    });
+    expect(streaming.agentRoles).toEqual(roles);
+    const refreshed = reconcilePresentationUpdate(streaming, {
+      type: "authoritative_snapshot",
+      snapshot: emptySnapshot,
+    });
+    expect(refreshed.agentRoles).toEqual(roles);
+    const switched = reconcilePresentationUpdate(refreshed, {
+      type: "authoritative_snapshot",
+      snapshot: { ...emptySnapshot, active: null },
+    });
+    expect(switched.agentRoles).toBeUndefined();
+  });
+
   it("replaces a transient assistant delta with durable completion", () => {
     const initial: PresentationDisplayState = {
       revision: 1,

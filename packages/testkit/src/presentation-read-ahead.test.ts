@@ -5,6 +5,7 @@ import {
   createPermissionPolicy,
   createPresentationSession,
   type ModelDriver,
+  ModelDriverError,
   type SessionRuntimeNotification,
 } from "@adam-agent/agent";
 import {
@@ -279,3 +280,254 @@ test("Presentation ignores completed-run tool and assistant notifications after 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test.each([false, true])(
+  "Presentation consumes the matching transient at durable handoff and retains equal text from distinct responses (read ahead: %s)",
+  async (readAhead) => {
+    const root = await mkdtemp(join(tmpdir(), "adam-presentation-handoff-"));
+    const releaseSecond = Promise.withResolvers<void>();
+    const firstDurable = Promise.withResolvers<PresentationDisplayState>();
+    const settled = Promise.withResolvers<PresentationDisplayState>();
+    const secondEntered = Promise.withResolvers<void>();
+    const queueDrained = Promise.withResolvers<void>();
+    const duplicates: number[] = [];
+    let secondReleased = false;
+    let calls = 0;
+    const model: ModelDriver = {
+      async *stream() {
+        if (++calls === 1) {
+          yield { type: "text_delta", text: "Identical legitimate answer." };
+          yield { type: "tool_call_start", id: "read", name: "read_file" };
+          yield { type: "tool_call_delta", id: "read", json: '{"path":"evidence.txt"}' };
+          yield { type: "tool_call_end", id: "read" };
+          yield { type: "finish", reason: "tool_calls" };
+        } else {
+          secondEntered.resolve();
+          await releaseSecond.promise;
+          yield { type: "text_delta", text: "Identical legitimate answer." };
+          yield { type: "finish", reason: "stop" };
+        }
+      },
+    };
+    await writeFile(join(root, "evidence.txt"), "Evidence.");
+    const harness = createInMemorySessionLifecycleHarness();
+    const modelTargets = modelTargetsWithDriver(model);
+    const lifecycle = harness.createLifecycle({
+      workspaceRoot: root,
+      stateRoot: join(root, "state"),
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    });
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      workspaceRoot: root,
+      stateRoot: join(root, "state"),
+      projectLabel: "handoff",
+      sessionId: created.sessionId,
+      [presentationRuntimeRefreshBarrier]: {
+        async beforeRead(notification) {
+          if (readAhead && notification.event.type === "user_message") await secondEntered.promise;
+          if (notification.event.type === "model_message_completed") queueDrained.resolve();
+        },
+      },
+      [presentationSessionRecordReader]: async (id) =>
+        (await (await harness.sessions.open(id))?.read()) ?? [],
+    });
+    const unsubscribe = presentation.subscribe(() => {
+      const state = presentation.getState();
+      if (
+        !secondReleased &&
+        state.transient?.assistant?.text === "Identical legitimate answer." &&
+        state.authoritative.active?.transcript.items.some(
+          (item) => item.type === "assistant_message",
+        )
+      )
+        duplicates.push(state.revision);
+      if (
+        state.authoritative.active?.transcript.items.some(
+          (item) => item.type === "assistant_message",
+        )
+      )
+        firstDurable.resolve(state);
+      if (state.authoritative.active?.session.status === "settled" && state.transient === null)
+        settled.resolve(state);
+    });
+    try {
+      expect(
+        await presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: created.sessionId,
+          text: "Inspect evidence.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).toMatchObject({ status: "admitted" });
+      const handoff = await withManagedFailureGuard(
+        firstDurable.promise,
+        "first durable assistant response",
+      );
+      expect(handoff.transient?.assistant ?? null).toBeNull();
+      await withManagedFailureGuard(
+        queueDrained.promise,
+        "queued model completion after earlier deltas",
+      );
+      expect(duplicates).toEqual([]);
+      secondReleased = true;
+      releaseSecond.resolve();
+      const final = await withManagedFailureGuard(
+        settled.promise,
+        "two distinct equal responses settled",
+      );
+      const answers = final.authoritative.active?.transcript.items.filter(
+        (item) => item.type === "assistant_message",
+      );
+      expect(answers?.map((item) => item.text)).toEqual([
+        "Identical legitimate answer.",
+        "Identical legitimate answer.",
+      ]);
+      expect(new Set(answers?.map((item) => item.id)).size).toBe(2);
+      expect(final.transient).toBeNull();
+    } finally {
+      releaseSecond.resolve();
+      unsubscribe();
+      await presentation.close();
+      await lifecycle.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["cancel", "failure"] as const)(
+  "Presentation does not revive delayed output after %s",
+  async (ending) => {
+    const root = await mkdtemp(join(tmpdir(), "adam-presentation-terminal-"));
+    const finish = Promise.withResolvers<void>();
+    const live = Promise.withResolvers<void>();
+    const nextLive = Promise.withResolvers<void>();
+    let calls = 0;
+    const settled = Promise.withResolvers<void>();
+    let user: SessionRuntimeNotification | undefined;
+    let delta: SessionRuntimeNotification | undefined;
+    let replayed = false;
+    let terminalSeen = false;
+    const revived: number[] = [];
+    const model: ModelDriver = {
+      async *stream(request) {
+        if (++calls > 1) {
+          yield { type: "text_delta", text: "Next turn works." };
+          yield { type: "finish", reason: "stop" };
+          return;
+        }
+        yield { type: "text_delta", text: "Do not revive this output." };
+        await Promise.race([
+          finish.promise,
+          new Promise<void>((resolve) =>
+            request.signal.addEventListener("abort", () => resolve(), { once: true }),
+          ),
+        ]);
+        if (ending === "failure")
+          throw new ModelDriverError("invalid_request", "Fixture provider failure.", {
+            cause: undefined,
+          });
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const harness = createInMemorySessionLifecycleHarness();
+    const modelTargets = modelTargetsWithDriver(model);
+    const lifecycle = harness.createLifecycle({
+      workspaceRoot: root,
+      stateRoot: join(root, "state"),
+      modelTargets,
+      [sessionRuntimeNotificationTransform]: {
+        project(notification) {
+          if (notification.event.type === "user_message") user = notification;
+          if (notification.event.type === "model_message_delta") delta = notification;
+          if (
+            !replayed &&
+            (notification.event.type === "session_interrupted" ||
+              notification.event.type === "session_settled") &&
+            delta !== undefined &&
+            user !== undefined
+          ) {
+            replayed = true;
+            return [
+              notification,
+              { ...delta, notificationId: `${delta.notificationId}:late` },
+              { ...user, notificationId: `${user.notificationId}:late` },
+            ];
+          }
+          return [notification];
+        },
+      },
+    });
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      workspaceRoot: root,
+      stateRoot: join(root, "state"),
+      projectLabel: "terminal",
+      sessionId: created.sessionId,
+      [presentationSessionRecordReader]: async (id) =>
+        (await (await harness.sessions.open(id))?.read()) ?? [],
+    });
+    const unsubscribe = presentation.subscribe(() => {
+      const state = presentation.getState();
+      if (state.transient?.assistant?.text === "Next turn works.") nextLive.resolve();
+      if (state.transient?.assistant?.text === "Do not revive this output.") {
+        live.resolve();
+        if (terminalSeen) revived.push(state.revision);
+      }
+      if (
+        replayed &&
+        state.transient === null &&
+        (state.authoritative.active?.session.status === "settled" ||
+          state.authoritative.active?.session.status === "interrupted")
+      ) {
+        terminalSeen = true;
+        settled.resolve();
+      }
+    });
+    try {
+      expect(
+        await presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: created.sessionId,
+          text: "Start bounded output.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).toMatchObject({ status: "admitted" });
+      await withManagedFailureGuard(live.promise, "live output before terminal event");
+      if (ending === "cancel")
+        expect(
+          await presentation.dispatch({ type: "cancel_run", sessionId: created.sessionId }),
+        ).toMatchObject({ status: "admitted" });
+      else finish.resolve();
+      await withManagedFailureGuard(settled.promise, "terminal presentation state");
+      expect(
+        await presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: created.sessionId,
+          text: "Continue after terminal.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).toMatchObject({ status: "admitted" });
+      await withManagedFailureGuard(nextLive.promise, "next live turn after late notifications");
+      expect(replayed).toBe(true);
+      expect(revived).toEqual([]);
+      expect(presentation.getState().transient?.assistant?.text).not.toBe(
+        "Do not revive this output.",
+      );
+    } finally {
+      finish.resolve();
+      unsubscribe();
+      await presentation.close();
+      await lifecycle.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

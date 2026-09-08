@@ -1179,8 +1179,15 @@ export type AuthoritativePresentationSnapshot = {
   };
 };
 
+export type ToolArgumentsDisplay = {
+  readonly callId: string;
+  readonly name: string;
+  readonly status: "generating_arguments" | "awaiting_model_completion" | "processing_response";
+};
+
 export type PresentationTransientState = {
-  readonly toolArguments?: { readonly callId: string; readonly name: string };
+  readonly argumentCalls?: readonly ToolArgumentsDisplay[];
+  readonly toolArguments?: ToolArgumentsDisplay;
   readonly activity: "working" | "replying" | "using_tool" | null;
   readonly assistant: {
     readonly streamId: string;
@@ -1381,10 +1388,11 @@ export type PresentationDisplayState = {
       readonly status: "active" | "completed" | "interrupted" | "failed";
       readonly hasContent: boolean;
     };
+    readonly argumentCalls?: readonly ToolArgumentsDisplay[];
     readonly tool?: {
       readonly callId: string;
       readonly name: string;
-      readonly status: "generating_arguments" | "requested" | "running";
+      readonly status: ToolArgumentsDisplay["status"] | "requested" | "running";
     };
   }[];
 };
@@ -1958,6 +1966,9 @@ export function reconcilePresentationUpdate(
 ): PresentationDisplayState {
   if (update.type === "authoritative_snapshot") {
     return {
+      ...(state.authoritative.active?.session.id === update.snapshot.active?.session.id
+        ? state
+        : {}),
       revision: state.revision + 1,
       authoritative: update.snapshot,
       draft: update.snapshot.active === null ? state.draft : null,
@@ -1971,6 +1982,7 @@ export function reconcilePresentationUpdate(
     update.afterSequence !== state.authoritative.continuity.sessionThroughSequence
   ) {
     return {
+      ...state,
       revision: state.revision + 1,
       authoritative: {
         ...state.authoritative,
@@ -1984,6 +1996,7 @@ export function reconcilePresentationUpdate(
 
   if (update.type === "reasoning_snapshot") {
     return {
+      ...state,
       revision: state.revision + 1,
       authoritative: state.authoritative,
       draft: state.draft,
@@ -1998,6 +2011,7 @@ export function reconcilePresentationUpdate(
   }
 
   return {
+    ...state,
     revision: state.revision + 1,
     authoritative: state.authoritative,
     draft: state.draft,

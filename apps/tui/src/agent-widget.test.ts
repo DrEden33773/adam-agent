@@ -259,3 +259,39 @@ test.each([2, 3])(
     }
   },
 );
+
+test.each([
+  ["generating_arguments", "Generating arguments"],
+  ["awaiting_model_completion", "Arguments received · waiting for model completion"],
+  ["processing_response", "Processing model response"],
+] as const)("Widget distinguishes %s from tool execution", (status, label) => {
+  const thread = agentViewThread();
+  const widget = new AgentWidget(createAdamTuiTheme(true), () => 12, {
+    scheduler: {
+      schedule() {
+        return { cancel() {} };
+      },
+    },
+  });
+  try {
+    widget.setSnapshot({
+      parentSessionId: "parent",
+      revision: 1,
+      status: "ready",
+      completions: [],
+      threads: [thread],
+    });
+    widget.setActivity([
+      {
+        agentId: thread.threadId,
+        attemptId: thread.turn.attemptId,
+        childSessionId: thread.turn.childSessionId,
+        activity: "using_tool",
+        tool: { callId: "call-1", name: "read_file", status },
+      },
+    ]);
+    expect(widget.render(120).join("\n")).toContain(`${label} · read_file`);
+  } finally {
+    widget.dispose();
+  }
+});
