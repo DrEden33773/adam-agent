@@ -25,6 +25,7 @@ export {
   ManagedAgentStoreError,
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
+export { createManagedAgentCapacityConfiguration } from "./managed-agent-capacity.js";
 export {
   createManagedAgentControl,
   createManagedAgentControlToolRegistry,

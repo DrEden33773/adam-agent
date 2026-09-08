@@ -105,13 +105,13 @@ test("background spawn cards settle to Started and Queued with frozen identities
   let childCalls = 0;
   const prepared = Promise.withResolvers<void>();
   const releaseStart = Promise.withResolvers<void>();
-  const fourStarted = Promise.withResolvers<void>();
+  const eightStarted = Promise.withResolvers<void>();
   const h = await startManagedTui(
     {
       async *stream(request) {
         if (!request.tools.some((tool) => tool.name === "spawn_agents")) {
           yield { type: "text_delta", text: "Reading batch evidence." };
-          if (++childCalls === 4) fourStarted.resolve();
+          if (++childCalls === 8) eightStarted.resolve();
           await new Promise<void>((resolve) => {
             if (request.signal.aborted) resolve();
             else request.signal.addEventListener("abort", () => resolve(), { once: true });
@@ -122,7 +122,7 @@ test("background spawn cards settle to Started and Queued with frozen identities
             type: "tool_call_delta",
             id: "batch",
             json: JSON.stringify({
-              entries: Array.from({ length: 5 }, (_, index) => ({
+              entries: Array.from({ length: 9 }, (_, index) => ({
                 role: "builtin:explore",
                 task: `Read evidence ${index + 1}`,
                 description: `Inspect item ${index + 1}`,
@@ -139,42 +139,42 @@ test("background spawn cards settle to Started and Queued with frozen identities
       },
     },
     {
-      rows: 48,
+      rows: 64,
       childRecordBarrier: async (record) => {
         if (record.schemaVersion === 3 && record.record.type === "session_genesis") {
-          if (++preparedCount === 4) prepared.resolve();
+          if (++preparedCount === 8) prepared.resolve();
           await releaseStart.promise;
         }
       },
     },
   );
   try {
-    await h.press("Inspect these five items.\r", "Confirm delegation");
+    await h.press("Inspect these nine items.\r", "Confirm delegation");
     await h.press("\r", "Batch admitted; Main ready.");
     await prepared.promise;
     await h.terminal.waitForScreen("Starting · 0 used");
     const screen = h.terminal.lines().join("\n");
     expect(screen).toContain("Started @explore-1 · Explore · Inspect item 1");
-    expect(screen).toContain("Queued @explore-5 · Explore · Inspect item 5");
+    expect(screen).toContain("Queued @explore-9 · Explore · Inspect item 9");
     expect(
       h.presentation
         .getState()
         .authoritative.managedControl?.threads.filter((thread) => thread.turn.phase === "starting"),
-    ).toHaveLength(4);
+    ).toHaveLength(8);
     expect(
       h.presentation
         .getState()
         .authoritative.managedControl?.threads.filter((thread) => thread.turn.phase === "queued"),
     ).toHaveLength(1);
     releaseStart.resolve();
-    await fourStarted.promise;
-    await h.terminal.waitForScreen("@explore-4 · Explore · Running");
+    await eightStarted.promise;
+    await h.terminal.waitForScreen("● Agents · 8 running · 1 queued");
     const state = h.presentation.getState();
     expect(
       state.authoritative.managedControl?.threads.filter(
         (thread) => thread.turn.phase === "executing",
       ),
-    ).toHaveLength(4);
+    ).toHaveLength(8);
     expect(
       state.authoritative.managedControl?.threads.filter(
         (thread) => thread.turn.phase === "queued",
@@ -185,7 +185,7 @@ test("background spawn cards settle to Started and Queued with frozen identities
         (item) => item.type === "tool_call" && item.qualifiedName === "spawn_agents",
       ),
     ).toMatchObject({ status: "completed" });
-    expect(screen.slice(screen.indexOf("Fleet ·"))).not.toContain("@explore-5");
+    expect(screen.slice(screen.indexOf("Fleet ·"))).not.toContain("@explore-9");
     expect(mainCalls).toBe(2);
   } finally {
     releaseStart.resolve();
@@ -193,14 +193,14 @@ test("background spawn cards settle to Started and Queued with frozen identities
   }
 });
 
-test("Widget projects live child activity and individually frozen queued configuration and budget", async () => {
-  const fourStarted = Promise.withResolvers<void>();
+test("Widget projects live child activity and queued details expose frozen configuration and budget", async () => {
+  const eightStarted = Promise.withResolvers<void>();
   let calls = 0;
   const h = await startManagedTui(
     {
       async *stream(request) {
         yield { type: "text_delta", text: "Inspecting exact repository evidence." };
-        if (++calls === 4) fourStarted.resolve();
+        if (++calls === 8) eightStarted.resolve();
         await new Promise<void>((resolve) => {
           if (request.signal.aborted) resolve();
           else request.signal.addEventListener("abort", () => resolve(), { once: true });
@@ -215,11 +215,11 @@ test("Widget projects live child activity and individually frozen queued configu
     expect(
       await h.presentation.dispatch({
         type: "managed_control",
-        commandId: "visible-five",
+        commandId: "visible-nine",
         command: {
           type: "spawn_agents",
           parentSessionId: h.parent.sessionId,
-          entries: Array.from({ length: 5 }, (_, index) => ({
+          entries: Array.from({ length: 9 }, (_, index) => ({
             role: "builtin:explore",
             task: `Read item ${index + 1}`,
             description: `Evidence ${index + 1}`,
@@ -227,14 +227,21 @@ test("Widget projects live child activity and individually frozen queued configu
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await fourStarted.promise;
+    await eightStarted.promise;
     await h.press("Independent Main draft", "Independent Main draft");
     const screen = h.terminal.lines().join("\n");
     expect(screen).toContain("Inspecting exact repository evidence.");
-    expect(screen).toContain("Queued @explore-5 · Explore · Evidence 5");
-    expect(screen).toContain("deepseek-v4-flash.direct · thinking default");
-    expect(screen).toContain("0 used · 0 reserved");
-    const queued = h.presentation.getState().authoritative.managedControl?.threads[4];
+    expect(screen).toContain("● Agents · 8 running · 1 queued");
+    await h.press("\u0001\u000b/agents\r", "Agents workspace");
+    await h.press("\u001b[F", "@explore-9");
+    await h.press("\r", "Queued tasks are immutable.");
+    const detail = h.terminal.lines().join("\n");
+    expect(detail).toContain("Evidence 9");
+    expect(detail).toContain("deepseek-v4-flash.direct");
+    expect(detail).toContain("thinking default");
+    expect(detail).toContain("0 used");
+    expect(detail).toContain("0 reserved");
+    const queued = h.presentation.getState().authoritative.managedControl?.threads[8];
     expect(queued?.turn.configuration).toMatchObject({
       targetId: "deepseek-v4-flash.direct",
       thinking: "default",
@@ -247,23 +254,27 @@ test("Widget projects live child activity and individually frozen queued configu
       ceiling: null,
       available: null,
     });
-    expect(calls).toBe(4);
+    expect(calls).toBe(8);
   } finally {
     await h.close();
   }
 });
 
 test("thirty-two admitted agents compress truthfully without hiding the Main editor", async () => {
-  const fourStarted = Promise.withResolvers<void>();
+  const eightStarted = Promise.withResolvers<void>();
   const firstFinish = Promise.withResolvers<void>();
-  const fifthStarted = Promise.withResolvers<void>();
+  const ninthStarted = Promise.withResolvers<void>();
   let calls = 0;
+  let ninthRequest = "";
   const h = await startManagedTui(
     {
       async *stream(request) {
         const call = ++calls;
-        if (call === 4) fourStarted.resolve();
-        if (call === 5) fifthStarted.resolve();
+        if (call === 8) eightStarted.resolve();
+        if (call === 9) {
+          ninthRequest = JSON.stringify(request.messages);
+          ninthStarted.resolve();
+        }
         await Promise.race([
           call === 1 ? firstFinish.promise : new Promise<void>(() => {}),
           new Promise<void>((resolve) => {
@@ -302,18 +313,27 @@ test("thirty-two admitted agents compress truthfully without hiding the Main edi
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await fourStarted.promise;
+    await eightStarted.promise;
     await h.press("Main draft", "Main draft");
     const screen = h.terminal.lines().join("\n");
     expect(screen).toContain("Main draft");
-    expect(screen).toContain("28 queued");
-    expect(screen).toContain("… hidden 3 run/28 queued/1 line");
+    expect(screen).toContain("● Agents · 8 running · 24 queued");
+    expect(screen).toContain("… hidden 7 run/24 queued/1 line");
     expect(screen).toContain("Fleet");
-    expect(h.presentation.getState().authoritative.managedControl?.threads).toHaveLength(32);
+    const admitted = h.presentation.getState().authoritative.managedControl?.threads ?? [];
+    expect(admitted).toHaveLength(32);
+    expect(admitted.filter((thread) => thread.turn.phase === "executing")).toHaveLength(8);
+    expect(admitted.filter((thread) => thread.turn.phase === "queued")).toHaveLength(24);
+    expect(calls).toBe(8);
     const beforeFinish = h.terminal.output().length;
     firstFinish.resolve();
-    await fifthStarted.promise;
-    await h.terminal.waitForFrameAfter("… hidden 3 run/27 queued/1 done/1 line", beforeFinish);
+    await ninthStarted.promise;
+    await h.terminal.waitForFrameAfter("… hidden 7 run/23 queued/1 done/1 line", beforeFinish);
+    expect(calls).toBe(9);
+    expect(ninthRequest).toContain("Read item 9");
+    const advanced = h.presentation.getState().authoritative.managedControl?.threads ?? [];
+    expect(advanced[8]?.turn.phase).toBe("executing");
+    expect(advanced.filter((thread) => thread.turn.phase === "queued")).toHaveLength(23);
     const mixed = h.terminal.lines().join("\n");
     expect(mixed).toContain("Main draft");
     expect(mixed).toContain("Fleet");
@@ -324,11 +344,11 @@ test("thirty-two admitted agents compress truthfully without hiding the Main edi
 });
 
 test("queued agents stay individually inspectable and exact cancellation never opens a dead Fleet row", async () => {
-  const fourStarted = Promise.withResolvers<void>();
+  const eightStarted = Promise.withResolvers<void>();
   let calls = 0;
   const h = await startManagedTui({
     async *stream(request) {
-      if (++calls === 4) fourStarted.resolve();
+      if (++calls === 8) eightStarted.resolve();
       await new Promise<void>((resolve) => {
         if (request.signal.aborted) resolve();
         else request.signal.addEventListener("abort", () => resolve(), { once: true });
@@ -344,7 +364,7 @@ test("queued agents stay individually inspectable and exact cancellation never o
         command: {
           type: "spawn_agents",
           parentSessionId: h.parent.sessionId,
-          entries: Array.from({ length: 5 }, (_, index) => ({
+          entries: Array.from({ length: 9 }, (_, index) => ({
             role: "builtin:explore",
             task: `Private task ${index + 1}`,
             description: `Queued evidence ${index + 1}`,
@@ -352,27 +372,27 @@ test("queued agents stay individually inspectable and exact cancellation never o
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await fourStarted.promise;
+    await eightStarted.promise;
     await h.press("/agents\r", "Agents workspace");
-    await h.press("\u001b[F", "@explore-5");
+    await h.press("\u001b[F", "@explore-9");
     await h.press("\r", "Queued tasks are immutable.");
     const detail = h.terminal.lines().join("\n");
     expect(detail).toContain("deepseek-v4-flash.direct");
     expect(detail).toContain("thinking default");
     expect(detail).toContain("no cumulative budget");
-    expect(detail).not.toContain("Private task 5");
+    expect(detail).not.toContain("Private task 9");
     await h.press("x", "x again to cancel");
     await h.press("x", "Cancelled");
-    expect(h.presentation.getState().authoritative.managedControl?.threads[4]?.turn).toMatchObject({
+    expect(h.presentation.getState().authoritative.managedControl?.threads[8]?.turn).toMatchObject({
       phase: "idle",
       lastOutcome: "cancelled",
     });
-    expect(calls).toBe(4);
+    expect(calls).toBe(8);
     await h.press("\u001b[27;1;27~", "Agents workspace", "Esc list");
     await h.press("\u001b[27;1;27~", "Fleet", "Agents workspace");
     expect(
       h.terminal.lines().join("\n").slice(h.terminal.lines().join("\n").indexOf("Fleet ·")),
-    ).not.toContain("@explore-5");
+    ).not.toContain("@explore-9");
   } finally {
     await h.close();
   }
@@ -1732,11 +1752,11 @@ test("cold Seen and Suppress reconcile an already durable wait tool result befor
 
 test("a queued cancellation keeps per-thread export available without creating a child session or continuation action", async () => {
   let calls = 0;
-  const fourStarted = Promise.withResolvers<void>();
+  const eightStarted = Promise.withResolvers<void>();
   const h = await startManagedTui({
     async *stream(request) {
       calls += 1;
-      if (calls === 4) fourStarted.resolve();
+      if (calls === 8) eightStarted.resolve();
       await new Promise<void>((resolve) =>
         request.signal.addEventListener("abort", () => resolve(), { once: true }),
       );
@@ -1751,7 +1771,7 @@ test("a queued cancellation keeps per-thread export available without creating a
         command: {
           type: "spawn_agents",
           parentSessionId: h.parent.sessionId,
-          entries: Array.from({ length: 5 }, (_, index) => ({
+          entries: Array.from({ length: 9 }, (_, index) => ({
             role: "builtin:explore" as const,
             task: "Inspect",
             description: `Export queue ${index}`,
@@ -1759,9 +1779,9 @@ test("a queued cancellation keeps per-thread export available without creating a
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await fourStarted.promise;
+    await eightStarted.promise;
     await h.press("/agents\r", "Agents workspace");
-    await h.press("\u001b[F", "@explore-5");
+    await h.press("\u001b[F", "@explore-9");
     await h.press("x", "x again to cancel");
     await h.press("x", "Cancelled");
     await h.press("\r", "e export");
@@ -1769,14 +1789,14 @@ test("a queued cancellation keeps per-thread export available without creating a
     await h.press("e", "Export agent");
     await h.press("\r", "Confirm export");
     await h.press("\r", "Export ready");
-    const thread = h.presentation.getState().authoritative.managedControl?.threads[4];
+    const thread = h.presentation.getState().authoritative.managedControl?.threads[8];
     if (thread === undefined) throw new Error("Missing cancelled queue entry");
     expect(thread.actions).not.toContain("new_turn");
     expect(await h.children.open(thread.turn.childSessionId)).toBeUndefined();
     expect(h.presentation.getState().authoritative.managedControl?.exports?.[0]?.turnId).toBe(
       thread.turn.turnId,
     );
-    expect(calls).toBe(4);
+    expect(calls).toBe(8);
   } finally {
     await h.close();
   }

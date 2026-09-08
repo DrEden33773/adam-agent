@@ -289,7 +289,7 @@ test("a retained child draft rejects after another turn starts without rebinding
 test.each(["wait", "suspend"] as const)(
   "Session picker offers Stay and %s before switching and preserves child draft scope",
   async (decision) => {
-    const fourStarted = Promise.withResolvers<void>();
+    const eightStarted = Promise.withResolvers<void>();
     const finish = Promise.withResolvers<void>();
     let calls = 0;
     const h = await startManagedTui(
@@ -301,7 +301,7 @@ test.each(["wait", "suspend"] as const)(
             yield { type: "finish", reason: "stop" };
             return;
           }
-          if (++calls === 4) fourStarted.resolve();
+          if (++calls === 8) eightStarted.resolve();
           await Promise.race([
             finish.promise,
             new Promise<void>((resolve) => {
@@ -329,7 +329,7 @@ test.each(["wait", "suspend"] as const)(
           command: {
             type: "spawn_agents",
             parentSessionId: h.parent.sessionId,
-            entries: Array.from({ length: 5 }, (_, index) => ({
+            entries: Array.from({ length: 9 }, (_, index) => ({
               role: "builtin:explore",
               task: `Source ${index + 1}.`,
               description: `Source item ${index + 1}`,
@@ -337,7 +337,10 @@ test.each(["wait", "suspend"] as const)(
           },
         }),
       ).toMatchObject({ status: "admitted" });
-      await fourStarted.promise;
+      await eightStarted.promise;
+      expect(h.presentation.getState().authoritative.managedControl?.threads[8]?.turn.phase).toBe(
+        "queued",
+      );
       await h.terminal.waitForScreen("@explore-1 · Explore · Running");
       await h.openFirstAgent();
       await h.press("\r", "Cooperative");
@@ -370,7 +373,7 @@ test.each(["wait", "suspend"] as const)(
       );
       expect(h.presentation.getState().managedDrafts).toHaveLength(0);
       expect(h.presentation.getState().authoritative.managedControl?.threads).toHaveLength(0);
-      expect(calls).toBe(decision === "wait" ? 5 : 4);
+      expect(calls).toBe(decision === "wait" ? 9 : 8);
       await h.press("/resume\r", "Select a project session");
       await h.press("Fleet fixture", "Search: Fleet fixture");
       await h.press("\r", "Adam · Fleet fixture");

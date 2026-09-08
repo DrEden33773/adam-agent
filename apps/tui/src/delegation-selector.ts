@@ -77,7 +77,7 @@ export class DelegationSelector implements Component {
   }
   #createList(): SelectList {
     const envelope = this.#envelope;
-    const lane = envelope.policy[envelope.mode === "background" ? "background" : "reserved"];
+    const lane = delegationLaneBounds(envelope, envelope.mode);
     const items =
       this.#page === "review"
         ? [
@@ -138,7 +138,7 @@ export class DelegationSelector implements Component {
               },
             ]
           : this.#page === "custom"
-            ? (envelope.version === 2
+            ? (envelope.version !== 1
                 ? this.options.canChangeMode === false
                   ? (["running", "queued"] as const)
                   : (["budgetTokens", "running", "queued"] as const)
@@ -177,7 +177,7 @@ export class DelegationSelector implements Component {
                         },
                       ]
                     : []),
-                  ...(envelope.version === 2
+                  ...(envelope.version !== 1
                     ? this.options.canChangeMode === false
                       ? []
                       : [
@@ -205,7 +205,7 @@ export class DelegationSelector implements Component {
                       label: `Running ${running}`,
                       description: `Range 1–${lane.running}; queued ${Math.max(0, envelope.threads - running)} (0–${lane.queued})`,
                     })),
-                  ...(envelope.version === 2
+                  ...(envelope.version !== 1
                     ? []
                     : [0.25, 0.5, 1].map((n) => ({
                         value: `thread:${Math.max(1, Math.floor(n * (envelope.policy.threadTokens ?? 0)))}`,
@@ -349,14 +349,7 @@ export class DelegationSelector implements Component {
           this.#list = this.#createList();
           return;
         }
-        const limits: ManagedDelegationLimits = {
-          mode: envelope.mode,
-          running: envelope.running,
-          queued: envelope.queued,
-          aggregateTokens: envelope.aggregateTokens,
-          threadTokens: envelope.threadTokens,
-          sessionTokens: envelope.sessionTokens,
-        };
+        const limits = this.#limits();
         const [field, raw] = item.value.split(":");
         const update: ManagedDelegationLimits =
           item.value === "unbudgeted"
@@ -369,16 +362,17 @@ export class DelegationSelector implements Component {
                   ? { running: Number(raw), queued: Math.max(0, envelope.threads - Number(raw)) }
                   : {
                       mode: item.value === "foreground" ? "foreground" : "background",
-                      running: Math.min(
-                        envelope.threads,
-                        envelope.policy[item.value === "foreground" ? "reserved" : "background"]
-                          .running,
-                      ),
+                      running: delegationLaneBounds(
+                        envelope,
+                        item.value === "foreground" ? "foreground" : "background",
+                      ).running,
                       queued: Math.max(
                         0,
                         envelope.threads -
-                          envelope.policy[item.value === "foreground" ? "reserved" : "background"]
-                            .running,
+                          delegationLaneBounds(
+                            envelope,
+                            item.value === "foreground" ? "foreground" : "background",
+                          ).running,
                       ),
                     };
         if (this.options.onLimits !== undefined)
@@ -456,12 +450,14 @@ export class DelegationSelector implements Component {
     const { mode, running, queued, aggregateTokens, threadTokens, sessionTokens } = this.#envelope;
     return {
       mode,
-      running,
+      ...(this.#envelope.version === 3 && this.#envelope.concurrency?.mode === "owner"
+        ? {}
+        : { running }),
       queued,
       aggregateTokens,
       threadTokens,
       sessionTokens,
-      ...(this.#envelope.version === 2 && this.options.canChangeMode !== false
+      ...(this.#envelope.version !== 1 && this.options.canChangeMode !== false
         ? {
             budgetTokens:
               this.#envelope.taskBudget?.mode === "limited"
@@ -473,7 +469,7 @@ export class DelegationSelector implements Component {
   }
   #numericBound(field: NumericLimit): { label: string; min: number; max: number } {
     const envelope = this.#envelope;
-    const lane = envelope.policy[envelope.mode === "background" ? "background" : "reserved"];
+    const lane = delegationLaneBounds(envelope, envelope.mode);
     switch (field) {
       case "budgetTokens":
         return { label: "Task budget tokens", min: 1, max: Number.MAX_SAFE_INTEGER };
@@ -615,4 +611,16 @@ export class DelegationSelector implements Component {
       truncateToWidth(theme.muted("Enter choose · Esc cancel"), width),
     ];
   }
+}
+
+function delegationLaneBounds(
+  envelope: ManagedDelegationEnvelope,
+  mode: "background" | "foreground",
+) {
+  const lane = envelope.policy[mode === "background" ? "background" : "reserved"];
+  return {
+    running:
+      lane.running === "unlimited" ? envelope.threads : Math.min(lane.running, envelope.threads),
+    queued: lane.queued === "unlimited" ? 32 : lane.queued,
+  };
 }

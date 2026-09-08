@@ -2144,6 +2144,7 @@ export type ManagedAgentExport = {
 };
 
 export type ManagedWorkspaceSnapshot = {
+  readonly policy?: ManagedFleetPolicy;
   readonly reviewers?: {
     readonly running: number;
     readonly queued: number;
@@ -2184,16 +2185,31 @@ export type ManagedWorkspaceSnapshot = {
   readonly threads: readonly ManagedControlThread[];
 };
 
+export type ManagedBackgroundCapacity = number | "unlimited";
 export type ManagedFleetPolicy = {
-  readonly version: 1 | 2;
-  readonly background: { readonly running: number; readonly queued: number };
   readonly reserved: { readonly running: 1; readonly queued: number };
-  readonly maximumAttempts: number;
-  readonly threadTokens: number | null;
-  readonly batchTokens: number | null;
-  readonly sessionTokens: number | null;
   readonly storageBytes: number;
-};
+} & (
+  | {
+      readonly version: 1 | 2;
+      readonly background: { readonly running: number; readonly queued: number };
+      readonly maximumAttempts: number;
+      readonly threadTokens: number | null;
+      readonly batchTokens: number | null;
+      readonly sessionTokens: number | null;
+    }
+  | {
+      readonly version: 3;
+      readonly background: {
+        readonly running: ManagedBackgroundCapacity;
+        readonly queued: "unlimited";
+      };
+      readonly maximumAttempts: "unlimited";
+      readonly threadTokens: null;
+      readonly batchTokens: null;
+      readonly sessionTokens: null;
+    }
+);
 export type ManagedDelegationMessage = ManagedControlLink & {
   readonly role: "user" | "assistant";
   readonly text: string;
@@ -2225,7 +2241,11 @@ export type ManagedDelegationEnvelope = {
         readonly grants: { readonly id: string; readonly tokens: number }[];
       }
     | undefined;
-  readonly version: 1 | 2;
+  readonly version: 1 | 2 | 3;
+  readonly concurrency?:
+    | { readonly mode: "owner" }
+    | { readonly mode: "limited"; readonly running: number }
+    | undefined;
   readonly id: string;
   readonly digest: `sha256:${string}`;
   readonly origin: {

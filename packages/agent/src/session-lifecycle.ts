@@ -72,6 +72,7 @@ import {
   managedAgentSnapshotWithChildHistories,
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
+import { createManagedAgentCapacityConfiguration } from "./managed-agent-capacity.js";
 import {
   createManagedAgentControl,
   createManagedAgentControlToolRegistry,
@@ -1577,6 +1578,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         )
           throw new SessionLifecycleError("session_model_target_incompatible");
         const webTools = await toolsForWebProfile(genesis.record.webEvidence);
+        let policy = resolveFleetPolicy(contextProfile, composition.policy);
+        const capacityConfiguration =
+          policy.version === 3
+            ? await createManagedAgentCapacityConfiguration({
+                workspaceRoot: options.workspaceRoot,
+                stateRoot: effectiveStateRoot,
+                parentSessionId: sessionId,
+              })
+            : undefined;
+        const backgroundRunning = await capacityConfiguration?.load();
+        if (policy.version === 3 && backgroundRunning !== undefined)
+          policy = { ...policy, background: { ...policy.background, running: backgroundRunning } };
         return createManagedAgentControl({
           roleCatalog: agentRoleCatalog,
           roleTargets,
@@ -1588,7 +1601,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           workspaceRoot: options.workspaceRoot,
           targetIdentity: snapshot.targetIdentity,
           contextProfile,
-          ...(composition.policy === undefined ? {} : { policy: composition.policy }),
+          policy,
+          ...(capacityConfiguration === undefined
+            ? {}
+            : { persistBackgroundCapacity: capacityConfiguration.save }),
           admissionGuard: (operation, constraints) =>
             serializeFamily(async () => {
               if (
