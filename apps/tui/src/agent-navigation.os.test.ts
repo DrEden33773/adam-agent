@@ -44,7 +44,7 @@ test("managed viewer wheel owns a fresh frame and leaves the Main viewport uncha
     await fixture.waitForScreen("type search");
     const beforeMain = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForCompleteFrameAfter("fake.local", beforeMain);
+    await fixture.waitForCompleteFrameAfter("fake.local", beforeMain, "type search");
     const beforeEvidence = fixture.output().length;
     fixture.write("\u001b[<64;40;12M".repeat(6));
     await fixture.waitForCompleteFrameAfter("Main-evidence-", beforeEvidence);
@@ -72,7 +72,7 @@ test("managed viewer wheel owns a fresh frame and leaves the Main viewport uncha
     await fixture.waitForScreen("type search");
     const beforeReturn = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForCompleteFrameAfter("fake.local", beforeReturn);
+    await fixture.waitForCompleteFrameAfter("fake.local", beforeReturn, "type search");
     expect(fixture.screen()).toEqual(main);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });

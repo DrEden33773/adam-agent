@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
-import { access, mkdir, watch, writeFile } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,6 +45,7 @@ import {
 import type { PresentationSession } from "@adam-agent/presentation";
 import { ProcessTerminal, type Terminal } from "@earendil-works/pi-tui";
 import { createAdamCommandRegistry } from "./command-registry.js";
+import { observeFilesystemEffect } from "./filesystem-observation.test-support.js";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { createProductionProjectRuntime, projectRuntimeManagedControl } from "./project-runtime.js";
@@ -2876,24 +2877,15 @@ async function waitForFile(
   filename: string,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const watcher = watch(directory, { signal });
   try {
-    if (await fileExists(join(directory, filename))) {
-      return true;
-    }
-    for await (const _event of watcher) {
-      if (await fileExists(join(directory, filename))) {
-        return true;
-      }
-    }
-    return false;
+    return await observeFilesystemEffect(
+      join(directory, filename),
+      async () => ((await fileExists(join(directory, filename))) ? true : undefined),
+      signal,
+    );
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).name === "AbortError") {
-      return false;
-    }
+    if (signal?.aborted) return false;
     throw error;
-  } finally {
-    await watcher.return?.();
   }
 }
 

@@ -1,7 +1,7 @@
-import { watch } from "node:fs";
 import { access, readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
+import { observeFilesystemEffect } from "./filesystem-observation.test-support.js";
 import { cleanupActiveTuiFixtures } from "./tui-fixture.test-support.js";
 
 const missingFilesystemEffectFailureMilliseconds = 30_000;
@@ -51,27 +51,16 @@ export async function waitForFilesystemEffect<T>(
 ): Promise<T> {
   const directory = join(path, "..");
   const filename = path.slice(directory.length + 1);
-  let change = Promise.withResolvers<void>();
-  const failure = Promise.withResolvers<never>();
-  // fs.watch subscribes immediately; the promise-based iterator is lazy.
-  const watcher = watch(directory, () => change.resolve());
-  watcher.on("error", failure.reject);
+  const controller = new AbortController();
   const guard = setTimeout(
-    () => failure.reject(new Error(`The fixture did not ${action} ${filename}.`)),
+    () => controller.abort(new Error(`The fixture did not ${action} ${filename}.`)),
     missingFilesystemEffectFailureMilliseconds,
   );
   guard.unref();
   try {
-    while (true) {
-      const changed = change.promise;
-      const observed = await Promise.race([observe(), failure.promise]);
-      if (observed !== undefined) return observed;
-      await Promise.race([changed, failure.promise]);
-      change = Promise.withResolvers<void>();
-    }
+    return await observeFilesystemEffect(path, observe, controller.signal);
   } finally {
     clearTimeout(guard);
-    watcher.close();
   }
 }
 

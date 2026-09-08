@@ -1994,7 +1994,11 @@ test("production terminal navigation keeps ordinary Enter in Main and preserves 
     for (const visible of ["Agents · 0 active · 1 terminal", " · idle"]) {
       offset = fixture.output().length;
       fixture.write("\u001b");
-      await fixture.waitForCompleteFrameAfter(visible, offset);
+      await fixture.waitForCompleteFrameAfter(
+        visible,
+        offset,
+        visible === " · idle" ? "type search" : undefined,
+      );
     }
     offset = fixture.output().length;
     fixture.write("Continue in Main from exact evidence.");
@@ -2091,7 +2095,7 @@ test.each(["escape", "command"] as const)(
         await fixture.waitForCompleteFrameAfter("Adam Help", offset);
         offset = fixture.output().length;
         fixture.write("\u001b");
-        await fixture.waitForCompleteFrameAfter(" · idle", offset);
+        await fixture.waitForCompleteFrameAfter(" · idle", offset, "Adam Help");
         offset = fixture.output().length;
         fixture.write(mainText);
         await fixture.waitForCompleteFrameAfter(mainText, offset);
