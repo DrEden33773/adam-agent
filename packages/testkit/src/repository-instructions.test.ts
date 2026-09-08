@@ -231,7 +231,7 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
           },
           {
             name: "create_todo",
-            digest: "sha256:77dc7d7915b067e706692df71cf5489f275d76168397be783c7a2fdee9875a1e",
+            digest: "sha256:6ebf6eaf74e007dd2e2a7a17e37b658e3d937813ec314e866d82fbb9c3379fe6",
           },
           {
             name: "get_todo",
@@ -243,14 +243,14 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
           },
           {
             name: "update_todo",
-            digest: "sha256:862986580edb1216123bb51c83f171fd660419d55dee238eee1353b995b5a142",
+            digest: "sha256:8558d8dcf74deb5b827da332e928ef1147e81b8b510b135fe22ec87298843921",
           },
           {
             name: "update_todos",
-            digest: "sha256:7b996f5cafc0c80fdada49cfcacda572a0b74fe70e2331be5697efe4c8a98842",
+            digest: "sha256:4e13855e4c2bfe76d9b02fe0caeab4fcd3a8b45574ba79049b3a1f9a09ff17f5",
           },
         ],
-        digest: "sha256:f8282573fbc7802d2cbd34ab0d1f58d7c90709837742ad2d16949e2e79a0a6c1",
+        digest: "sha256:3e8b0029a2b17b806a63d1f89c8a31fb6ce1047813b0f18d6fd4a2efcc0c9541",
       },
       repository: {
         version: 1,

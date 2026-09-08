@@ -64,6 +64,7 @@ import {
   projectLinkedOperation,
 } from "./presentation-operation-projection.js";
 import type { PresentationPreferences } from "./presentation-preferences.js";
+import { projectTodoSummary } from "./presentation-todo-projection.js";
 import {
   type ChangePreviewProjectionRequest,
   collectChangePreviewRequests,
@@ -104,7 +105,6 @@ import {
   sessionManagedAgentTranscriptReader,
 } from "./session-lifecycle.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
-import { todoStoreSnapshotFromRecordsV1, todoSummaryV1 } from "./todo.js";
 import {
   createTurnComposer,
   type TurnComposer,
@@ -650,7 +650,15 @@ export async function createPresentationSession(
               skills: projectSkills(created),
               projectPaths,
               mcp: projectMcp(created),
-              ...(created.todo === undefined ? {} : { todo: created.todo }),
+              ...(created.todo === undefined
+                ? {}
+                : {
+                    todo: projectTodoSummary(
+                      records.flatMap((record) =>
+                        record.sessionId === created.sessionId ? [record.entry] : [],
+                      ),
+                    ),
+                  }),
               ...(created.plan === undefined ? {} : { plan: created.plan }),
             },
     };
@@ -1744,7 +1752,15 @@ export async function createPresentationSession(
             skills: activatedSkills,
             projectPaths,
             mcp: projectMcp(snapshot),
-            ...(snapshot.todo === undefined ? {} : { todo: snapshot.todo }),
+            ...(snapshot.todo === undefined
+              ? {}
+              : {
+                  todo: projectTodoSummary(
+                    activatedRecords.flatMap((record) =>
+                      record.sessionId === snapshot.sessionId ? [record.entry] : [],
+                    ),
+                  ),
+                }),
             ...(snapshot.plan === undefined ? {} : { plan: snapshot.plan }),
           },
         },
@@ -2427,11 +2443,9 @@ export async function createPresentationSession(
             const refreshedTodo =
               latest.todo === undefined
                 ? undefined
-                : todoSummaryV1(
-                    todoStoreSnapshotFromRecordsV1(
-                      refreshedRecords.flatMap((record) =>
-                        record.sessionId === active.session.id ? [record.entry] : [],
-                      ),
+                : projectTodoSummary(
+                    refreshedRecords.flatMap((record) =>
+                      record.sessionId === active.session.id ? [record.entry] : [],
                     ),
                   );
             const effectiveOperations = refreshedOperations.map((operation) => {

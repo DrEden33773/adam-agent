@@ -5,16 +5,18 @@ import type {
 } from "@adam-agent/presentation";
 import {
   type Component,
+  fuzzyFilter,
   getKeybindings,
   isKeyRelease,
   isKeyRepeat,
   matchesKey,
+  SelectList,
   truncateToWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
 import { safeTerminalText } from "./safe-terminal-text.js";
-import { type SearchableSelectItem, SearchableSelectList } from "./searchable-select-list.js";
+import { textKeyInput } from "./text-key-input.js";
 import type { AdamTuiTheme } from "./theme.js";
 
 type TodoSummary = NonNullable<ActiveSessionDisplay["todo"]>;
@@ -29,13 +31,15 @@ export class TodoNavigator implements Component {
   readonly #onList: (cursor: string | null) => Promise<TodoPageResource>;
   readonly #maximumContentHeight: () => number;
   readonly #onCompactCollapseChange: ((collapsed: boolean) => void) | undefined;
+  readonly #toggleHint: string;
+  readonly #isToggleInput: (data: string) => boolean;
   readonly #summary: TodoSummary;
   readonly #theme: AdamTuiTheme;
   #cursor: string | null = null;
   #compactCollapsed: boolean;
   #detail: TodoEntityResource | null = null;
   #generation = 0;
-  #list: SearchableSelectList;
+  #list: GroupedTodoList;
   #notice: string | null = null;
   #page: TodoPageResource;
   #previousCursors: readonly (string | null)[] = [];
@@ -44,6 +48,8 @@ export class TodoNavigator implements Component {
     readonly initialPage: TodoPageResource;
     readonly maximumContentHeight?: () => number;
     readonly compactCollapsed?: boolean;
+    readonly toggleHint?: string;
+    readonly isToggleInput?: (data: string) => boolean;
     readonly onChange: () => void;
     readonly onClose: () => void;
     readonly onGet: (id: string) => Promise<TodoEntityResource>;
@@ -62,6 +68,8 @@ export class TodoNavigator implements Component {
     this.#summary = options.summary;
     this.#theme = options.theme;
     this.#compactCollapsed = options.compactCollapsed ?? false;
+    this.#toggleHint = options.toggleHint ?? "Alt+T";
+    this.#isToggleInput = options.isToggleInput ?? ((data) => matchesKey(data, "alt+t"));
     this.#list = this.#createList(options.initialPage);
   }
 
@@ -90,7 +98,7 @@ export class TodoNavigator implements Component {
       }
       return;
     }
-    if (matchesKey(data, "c") && this.#onCompactCollapseChange !== undefined) {
+    if (this.#isToggleInput(data) && this.#onCompactCollapseChange !== undefined) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return;
       }
@@ -129,6 +137,7 @@ export class TodoNavigator implements Component {
         safeTerminalText(item.title),
         `${item.status} · item revision ${item.itemRevision} · created ${item.createdOrdinal}`,
         `ID ${item.id}`,
+        ...(item.activeForm === undefined ? [] : [`Active: ${safeTerminalText(item.activeForm)}`]),
         "",
         ...(item.details === undefined
           ? [this.#theme.muted("No details.")]
@@ -152,14 +161,13 @@ export class TodoNavigator implements Component {
     const counts = this.#summary.counts;
     const noticeLines = this.#notice === null ? [] : [this.#theme.muted(this.#notice)];
     const listHeight = Math.max(1, maximumContentHeight - 4 - noticeLines.length);
-    this.#list.setMaximumVisible(Math.min(8, Math.max(1, listHeight - 3)));
     const listLines = this.#list.render(width, listHeight);
     return [
       this.#theme.toolTitle(`Todos · revision ${this.#summary.storeRevision}`),
       `${counts.pending} pending · ${counts.inProgress} in progress · ${counts.completed} completed · ${this.#summary.blockedCount} blocked`,
       this.#theme.muted("Enter detail · type filter"),
       this.#theme.muted(
-        `Esc close · c ${this.#compactCollapsed ? "expand" : "collapse"} compact · PgUp/PgDn · Ctrl+Q`,
+        `Esc close · ${this.#toggleHint} ${this.#compactCollapsed ? "expand" : "collapse"} compact · PgUp/PgDn · Ctrl+Q`,
       ),
       ...listLines,
       ...noticeLines,
@@ -168,25 +176,16 @@ export class TodoNavigator implements Component {
       .map((line) => truncateToWidth(line, width));
   }
 
-  #createList(page: TodoPageResource): SearchableSelectList {
-    const items: SearchableSelectItem[] = page.items.map((item) => ({
-      item: {
-        value: item.id,
-        label: safeTerminalText(item.title),
-        description: `${item.status} · ${item.blocked ? "blocked" : "ready"} · revision ${item.itemRevision}`,
-      },
-      searchText: `${item.title} ${item.status} ${item.id}`,
-    }));
-    return new SearchableSelectList({
-      items,
-      maxVisible: 8,
-      onCancel: () => {
+  #createList(page: TodoPageResource): GroupedTodoList {
+    return new GroupedTodoList(
+      page.items,
+      this.#theme,
+      () => {
         this.cancelPendingRead();
         this.#onClose();
       },
-      onSelect: (selected) => this.#loadDetail(selected.value),
-      theme: this.#theme.editor.selectList,
-    });
+      (id) => this.#loadDetail(id),
+    );
   }
 
   #loadDetail(id: string): void {
@@ -237,5 +236,119 @@ export class TodoNavigator implements Component {
         this.#onChange();
       },
     );
+  }
+}
+
+// Todo-specific grouping is display state over the authoritative bounded page.
+// Pi owns selection/keybindings; headings never enter its selectable items.
+class GroupedTodoList {
+  readonly #items: TodoPageResource["items"];
+  readonly #theme: AdamTuiTheme;
+  readonly #onCancel: () => void;
+  readonly #onSelect: (id: string) => void;
+  #query = "";
+  #visible: TodoPageResource["items"] = [];
+  #selection: SelectList;
+
+  constructor(
+    items: TodoPageResource["items"],
+    theme: AdamTuiTheme,
+    onCancel: () => void,
+    onSelect: (id: string) => void,
+  ) {
+    this.#items = items;
+    this.#theme = theme;
+    this.#onCancel = onCancel;
+    this.#onSelect = onSelect;
+    this.#selection = this.#createSelection();
+  }
+
+  handleInput(data: string): void {
+    if (getKeybindings().matches(data, "tui.editor.deleteCharBackward") && this.#query.length > 0) {
+      this.#query = Array.from(this.#query).slice(0, -1).join("");
+      this.#selection = this.#createSelection();
+      return;
+    }
+    const text = textKeyInput(data);
+    if (text !== undefined) {
+      this.#query += safeTerminalText(text);
+      this.#selection = this.#createSelection();
+      return;
+    }
+    this.#selection.handleInput(data);
+  }
+
+  invalidate(): void {
+    this.#selection.invalidate();
+  }
+
+  render(width: number, maximumLines: number): string[] {
+    const lines = [`Search: ${this.#query}`];
+    if (this.#visible.length === 0) {
+      return [...lines, this.#theme.muted("No matching Todos.")].slice(0, maximumLines);
+    }
+    const selectedId = this.#selection.getSelectedItem()?.value;
+    const selectedIndex = Math.max(
+      0,
+      this.#visible.findIndex((item) => item.id === selectedId),
+    );
+    const budget = Math.max(1, maximumLines - 1);
+    let start = selectedIndex;
+    let used = 2;
+    while (start > 0) {
+      const cost = this.#visible[start - 1]?.status === this.#visible[start]?.status ? 1 : 2;
+      if (used + cost > budget) break;
+      used += cost;
+      start -= 1;
+    }
+    let status: string | undefined;
+    for (const item of this.#visible.slice(start)) {
+      if (lines.length >= maximumLines) break;
+      if (item.status !== status && budget > 1) {
+        // Do not leave a heading at the bottom without its first visible item.
+        if (lines.length + 2 > maximumLines) break;
+        lines.push(
+          this.#theme.toolTitle(
+            item.status === "pending"
+              ? "Pending"
+              : item.status === "in_progress"
+                ? "In Progress"
+                : "Completed",
+          ),
+        );
+        status = item.status;
+      }
+      const selected = item.id === selectedId;
+      const title = safeTerminalText(
+        item.status === "in_progress" && item.activeForm !== undefined
+          ? `${item.title} (${item.activeForm})`
+          : item.title,
+      );
+      const description = `${item.status} · ${item.blocked ? "blocked" : "ready"} · revision ${item.itemRevision} · ${item.dependencyCount} dependencies`;
+      const label = `${selected ? "> " : "  "}${title}`;
+      lines.push(
+        `${selected ? this.#theme.editor.selectList.selectedText(label) : label} ${this.#theme.muted(description)}`,
+      );
+    }
+    return lines.map((line) => truncateToWidth(line, width));
+  }
+
+  #createSelection(): SelectList {
+    const matching = fuzzyFilter(
+      [...this.#items],
+      this.#query,
+      (item) => `${item.title} ${item.activeForm ?? ""} ${item.status} ${item.id}`,
+    );
+    this.#visible = ["pending", "in_progress", "completed"].flatMap((status) =>
+      matching.filter((item) => item.status === status),
+    );
+    const selection = new SelectList(
+      this.#visible.map((item) => ({ value: item.id, label: item.title })),
+      8,
+      this.#theme.editor.selectList,
+    );
+    selection.onCancel = this.#onCancel;
+    selection.onSelect = (item) => this.#onSelect(item.value);
+    return selection;
   }
 }

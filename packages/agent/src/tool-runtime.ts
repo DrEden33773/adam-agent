@@ -46,16 +46,22 @@ import {
 } from "./text-read.js";
 import {
   createTodoInputV1Schema,
+  createTodoInputV2Schema,
   createTodoToolDefinitionV1,
+  createTodoToolDefinitionV2,
   getTodoInputV1Schema,
   getTodoToolDefinitionV1,
   listTodoInputV1Schema,
   listTodoToolDefinitionV1,
   updateTodoInputV1Schema,
+  updateTodoInputV2Schema,
   updateTodosInputV1Schema,
+  updateTodosInputV2Schema,
   updateTodosOutputV1Schema,
   updateTodosToolDefinitionV1,
+  updateTodosToolDefinitionV2,
   updateTodoToolDefinitionV1,
+  updateTodoToolDefinitionV2,
 } from "./todo.js";
 import type { ToolError } from "./tool-error.js";
 
@@ -1208,35 +1214,43 @@ function createCodingToolRegistryInternal(options: {
     artifactStore: options.artifactStore,
     occurrences: [],
   });
-  const createTodoAdapter = identifyToolAdapter(
-    {
-      definition: createTodoToolDefinitionV1,
-      outputSchema: z.json(),
-      effect: "write",
-      cancellation: "unsupported",
-      maximumResult: {},
-      prepare(argumentsJson) {
-        const parsedArguments = parseInput(createTodoInputV1Schema, argumentsJson);
-        if (!parsedArguments.success) {
-          return invalidToolInput();
-        }
-        return {
-          status: "ready",
-          permissionSubject: { type: "workspace_path", path: "." },
-          async execute() {
-            return {
-              status: "failed",
-              error: {
-                code: "unknown_tool",
-                message: "create_todo is available only through an active Adam session.",
-              },
-            };
-          },
-        };
+  const makeCreateTodoAdapter = (version: 1 | 2) =>
+    identifyToolAdapter(
+      {
+        definition: version === 1 ? createTodoToolDefinitionV1 : createTodoToolDefinitionV2,
+        outputSchema: z.json(),
+        effect: "write",
+        cancellation: "unsupported",
+        maximumResult: {},
+        prepare(argumentsJson) {
+          const parsedArguments = parseInput(
+            version === 1 ? createTodoInputV1Schema : createTodoInputV2Schema,
+            argumentsJson,
+          );
+          if (!parsedArguments.success) {
+            return invalidToolInput();
+          }
+          return {
+            status: "ready",
+            permissionSubject: { type: "workspace_path", path: "." },
+            async execute() {
+              return {
+                status: "failed",
+                error: {
+                  code: "unknown_tool",
+                  message: "create_todo is available only through an active Adam session.",
+                },
+              };
+            },
+          };
+        },
       },
-    },
-    "never",
-  );
+      "never",
+    );
+  const createTodoAdapter = {
+    ...makeCreateTodoAdapter(2),
+    retainedVersions: [makeCreateTodoAdapter(1)],
+  };
   const getTodoAdapter = identifyToolAdapter(
     {
       definition: getTodoToolDefinitionV1,
@@ -1295,75 +1309,91 @@ function createCodingToolRegistryInternal(options: {
     },
     "safe",
   );
-  const updateTodoAdapter = identifyToolAdapter(
-    {
-      definition: updateTodoToolDefinitionV1,
-      outputSchema: z.json(),
-      effect: "write",
-      cancellation: "unsupported",
-      maximumResult: {},
-      prepare(argumentsJson) {
-        const parsedArguments = parseInput(updateTodoInputV1Schema, argumentsJson);
-        if (!parsedArguments.success) {
-          return invalidToolInput();
-        }
-        return {
-          status: "ready",
-          permissionSubject: { type: "workspace_path", path: "." },
-          async execute() {
-            return {
-              status: "failed",
-              error: {
-                code: "unknown_tool",
-                message: "update_todo is available only through an active Adam session.",
-              },
-            };
-          },
-        };
+  const makeUpdateTodoAdapter = (version: 1 | 2) =>
+    identifyToolAdapter(
+      {
+        definition: version === 1 ? updateTodoToolDefinitionV1 : updateTodoToolDefinitionV2,
+        outputSchema: z.json(),
+        effect: "write",
+        cancellation: "unsupported",
+        maximumResult: {},
+        prepare(argumentsJson) {
+          const parsedArguments = parseInput(
+            version === 1 ? updateTodoInputV1Schema : updateTodoInputV2Schema,
+            argumentsJson,
+          );
+          if (!parsedArguments.success) {
+            return invalidToolInput();
+          }
+          return {
+            status: "ready",
+            permissionSubject: { type: "workspace_path", path: "." },
+            async execute() {
+              return {
+                status: "failed",
+                error: {
+                  code: "unknown_tool",
+                  message: "update_todo is available only through an active Adam session.",
+                },
+              };
+            },
+          };
+        },
       },
-    },
-    "never",
-  );
-  const updateTodosAdapter = identifyToolAdapter(
-    {
-      definition: updateTodosToolDefinitionV1,
-      outputSchema: z
-        .json()
-        .refine((output) => updateTodosOutputV1Schema.safeParse(output).success),
-      effect: "write",
-      cancellation: "unsupported",
-      maximumResult: {},
-      prepare(argumentsJson) {
-        const parsed = parseInput(updateTodosInputV1Schema, argumentsJson);
-        if (!parsed.success) {
-          return actionableInputFailure(parsed, {
-            expectedStoreRevision: "supply the current nonnegative store revision",
-            updates: "supply 1–16 updates with distinct Todo IDs and explicit mutations",
-            id: "supply an existing Todo UUID",
-            expectedItemRevision: "supply the current positive item revision",
-            title: "supply a nonempty title of at most 512 UTF-8 bytes",
-            details: "supply at most 8192 UTF-8 bytes, or null to clear",
-            dependencyIds: "supply at most 64 Todo UUIDs",
-            status: "use pending, in_progress, or completed",
-          });
-        }
-        return {
-          status: "ready",
-          permissionSubject: { type: "workspace_path", path: "." },
-          async execute() {
-            return {
-              status: "failed",
-              error: {
-                code: "unknown_tool",
-                message: "update_todos requires an active Adam session.",
-              },
-            };
-          },
-        };
+      "never",
+    );
+  const updateTodoAdapter = {
+    ...makeUpdateTodoAdapter(2),
+    retainedVersions: [makeUpdateTodoAdapter(1)],
+  };
+  const makeUpdateTodosAdapter = (version: 1 | 2) =>
+    identifyToolAdapter(
+      {
+        definition: version === 1 ? updateTodosToolDefinitionV1 : updateTodosToolDefinitionV2,
+        outputSchema: z
+          .json()
+          .refine((output) => updateTodosOutputV1Schema.safeParse(output).success),
+        effect: "write",
+        cancellation: "unsupported",
+        maximumResult: {},
+        prepare(argumentsJson) {
+          const parsed = parseInput(
+            version === 1 ? updateTodosInputV1Schema : updateTodosInputV2Schema,
+            argumentsJson,
+          );
+          if (!parsed.success) {
+            return actionableInputFailure(parsed, {
+              expectedStoreRevision: "supply the current nonnegative store revision",
+              updates: "supply 1–16 updates with distinct Todo IDs and explicit mutations",
+              id: "supply an existing Todo UUID",
+              expectedItemRevision: "supply the current positive item revision",
+              title: "supply a nonempty title of at most 512 UTF-8 bytes",
+              details: "supply at most 8192 UTF-8 bytes, or null to clear",
+              dependencyIds: "supply at most 64 Todo UUIDs",
+              status: "use pending, in_progress, or completed",
+            });
+          }
+          return {
+            status: "ready",
+            permissionSubject: { type: "workspace_path", path: "." },
+            async execute() {
+              return {
+                status: "failed",
+                error: {
+                  code: "unknown_tool",
+                  message: "update_todos requires an active Adam session.",
+                },
+              };
+            },
+          };
+        },
       },
-    },
-    "never",
-  );
+      "never",
+    );
+  const updateTodosAdapter = {
+    ...makeUpdateTodosAdapter(2),
+    retainedVersions: [makeUpdateTodosAdapter(1)],
+  };
   const adapters = [
     requireAdapter(readTools, "read_file"),
     requireAdapter(readTools, "search_repository"),

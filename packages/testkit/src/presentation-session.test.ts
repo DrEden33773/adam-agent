@@ -842,11 +842,34 @@ test("PresentationSession exposes authoritative read-only Todo summary, list, an
       workspaceRoot,
       [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
     });
+    const createdTodo = (await (await harness.sessions.open(created.sessionId))?.read())?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_created",
+    );
+    if (createdTodo?.schemaVersion !== 3 || createdTodo.record.type !== "todo_created")
+      throw new Error("Missing canonical Todo identity");
     expect(presentation.getState().authoritative.active?.todo).toEqual({
       policyVersion: "todo-policy.v1",
       storeRevision: 1,
       counts: { pending: 1, inProgress: 0, completed: 0 },
       blockedCount: 0,
+      overlay: {
+        turnId: createdTodo.record.runId,
+        completedCount: 0,
+        items: [
+          {
+            id: createdTodo.record.item.id,
+            label: createdTodo.record.item.id.slice(0, 8),
+            createdOrdinal: 1,
+            itemRevision: 1,
+            status: "pending",
+            title: "Presented Todo",
+            dependencies: [],
+            dependencyLabels: [],
+            dependencyCount: 0,
+            blocked: false,
+          },
+        ],
+      },
     });
 
     const listed = await presentation.dispatch({

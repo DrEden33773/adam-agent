@@ -127,7 +127,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## `@juicesharp/rpiv-todo` 2.9.0 selected presentation hierarchy
 
-Adam Agent selectively adapts the compact Todo glyph, completed-row linger, completed-first overflow, hidden-count, and pure row-selection presentation hierarchy from [`@juicesharp/rpiv-todo@2.9.0`](https://github.com/juicesharp/rpiv-mono/tree/f3291e1ea14729d42aafd5f0f713e63c813e1f2e/packages/rpiv-todo) at commit `f3291e1ea14729d42aafd5f0f713e63c813e1f2e`, specifically `state/selectors.ts`, `view/format.ts`, and `todo-overlay.ts`. Adam does not include the package, its store, reducer, numeric IDs, delete/clear behavior, replay format, continuation semantics, or runtime dependencies. The selected source is licensed under the MIT License.
+Adam Agent adapts the compact Todo tree, state glyphs, active-form formatting, completed-row linger, completed-first overflow, hidden counts, pure row selection, and default line-budget/collapse behavior from [`@juicesharp/rpiv-todo@2.9.0`](https://github.com/juicesharp/rpiv-mono/tree/f3291e1ea14729d42aafd5f0f713e63c813e1f2e/packages/rpiv-todo) at commit `f3291e1ea14729d42aafd5f0f713e63c813e1f2e`, specifically `state/selectors.ts`, `view/format.ts`, `todo-overlay.ts`, and `config.ts`. Adam derives completion visibility from its canonical Main-run records, uses stable UUID references and a bounded display projection, and configures its semantic shortcut through its own CLI/Registry. Adam does not include the package, its store, reducer, numeric IDs, delete/clear behavior, replay format, continuation semantics, or runtime dependencies. The selected source is licensed under the MIT License.
 
 Copyright (c) 2026 juicesharp
 

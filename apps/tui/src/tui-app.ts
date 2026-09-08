@@ -18,7 +18,6 @@ import type {
   TargetDisplay,
   ThinkingCapabilityDisplay,
   ThinkingPolicySelectionDisplay,
-  TodoPageResource,
 } from "@adam-agent/presentation";
 import { defaultAgentUiSettings, leadingMentionRecipients } from "@adam-agent/presentation";
 import {
@@ -139,6 +138,7 @@ export type RunTuiOptions = {
   readonly clipboard?: ClipboardAdapter;
   readonly deadlineScheduler?: DeadlineScheduler;
   readonly mouse?: boolean;
+  readonly todoOverlayLines?: number;
 };
 
 type TuiNotice = {
@@ -415,9 +415,27 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           ),
   });
   const todoCompactViewModel = new TodoCompactViewModel();
-  const todoCompactOverlay = new TodoCompactOverlay(todoCompactViewModel, theme);
-  let todoCompactReadGeneration = 0;
-  let todoCompactReadKey: string | null = null;
+  const todoCompactOverlay = new TodoCompactOverlay(todoCompactViewModel, theme, {
+    maximumLines: (width) => {
+      const state = options.presentation.getState();
+      const hasControl = state.authoritative.managedControl !== undefined;
+      const occupied =
+        header.render(width).length +
+        inputRegion.render(width).length +
+        (physicalTerminal.rows > 12 ? 1 : 0) +
+        1;
+      const agents = hasControl
+        ? agentWidget.render(width).length
+        : state.authoritative.managedAgents.counts.active > 0
+          ? managedAgentRoster.render(width).length
+          : 0;
+      return Math.min(
+        options.todoOverlayLines ?? 12,
+        Math.max(1, physicalTerminal.rows - occupied - agents - 1),
+      );
+    },
+    toggleHint: () => commandRegistry.keybinding("toggle_todo_overlay").keys,
+  });
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
@@ -710,6 +728,39 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     options.presentation.getState().authoritative.managedControl !== undefined &&
     editor.isShowingAutocomplete() &&
     physicalTerminal.rows < 18;
+  const inputRegion = new VStack([
+    {
+      component: executionFailureNotice,
+      visible: () => options.presentation.getState().executionFailure !== undefined,
+    },
+    {
+      component: interruption,
+      visible: () =>
+        options.presentation.getState().authoritative.active?.parentRun?.phase === "interrupted",
+    },
+    draftInputsSlot,
+    {
+      component: editorSlot,
+      visible: () =>
+        options.presentation.getState().authoritative.active?.parentRun?.phase !== "interrupted",
+    },
+    {
+      component: statusLine,
+      visible: () => statusNotice !== null,
+    },
+    {
+      component: agentFleet,
+      shrink: 0,
+      visible: () =>
+        options.presentation.getState().authoritative.managedControl !== undefined &&
+        options.presentation.getState().agentUiSettings?.fleetEnabled !== false,
+    },
+    { component: footer, visible: () => !compactCompletionFooter() },
+    {
+      component: new ResponsiveLine(theme.muted("Tab select · ↑↓ choose · Esc close")),
+      visible: compactCompletionFooter,
+    },
+  ]);
   const supportedRoot = new VStack([
     header,
     {
@@ -740,48 +791,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     {
       component: todoCompactOverlay,
       basis: "auto",
+      shrink: 0,
       minSize: 0,
       visible: () => {
         const todo = options.presentation.getState().authoritative.active?.todo;
-        return todo !== undefined && todo.counts.pending + todo.counts.inProgress > 0;
+        return (
+          todo !== undefined &&
+          todo.counts.pending + todo.counts.inProgress + (todo.overlay?.completedCount ?? 0) > 0
+        );
       },
     },
     {
-      component: new VStack([
-        {
-          component: executionFailureNotice,
-          visible: () => options.presentation.getState().executionFailure !== undefined,
-        },
-        {
-          component: interruption,
-          visible: () =>
-            options.presentation.getState().authoritative.active?.parentRun?.phase ===
-            "interrupted",
-        },
-        draftInputsSlot,
-        {
-          component: editorSlot,
-          visible: () =>
-            options.presentation.getState().authoritative.active?.parentRun?.phase !==
-            "interrupted",
-        },
-        {
-          component: statusLine,
-          visible: () => statusNotice !== null,
-        },
-        {
-          component: agentFleet,
-          shrink: 0,
-          visible: () =>
-            options.presentation.getState().authoritative.managedControl !== undefined &&
-            options.presentation.getState().agentUiSettings?.fleetEnabled !== false,
-        },
-        { component: footer, visible: () => !compactCompletionFooter() },
-        {
-          component: new ResponsiveLine(theme.muted("Tab select · ↑↓ choose · Esc close")),
-          visible: compactCompletionFooter,
-        },
-      ]),
+      component: inputRegion,
       basis: "auto",
       minSize: 1,
       shrink: 1,
@@ -1472,74 +1493,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   };
 
   const synchronizeTodoCompactOverlay = (active: ActiveSessionDisplay | null): void => {
-    const summary = active?.todo;
-    if (
-      active === null ||
-      summary === undefined ||
-      summary.counts.pending + summary.counts.inProgress === 0
-    ) {
-      todoCompactReadKey = null;
-      todoCompactReadGeneration += 1;
+    if (active?.todo === undefined) {
+      todoCompactViewModel.clear();
       return;
     }
-    const turnKey =
-      active.transcript.items.findLast((item) => item.type === "user_message")?.id ??
-      `${active.session.id}:genesis`;
-    todoCompactViewModel.advanceTurn(active.session.id, turnKey);
-    const readKey = `${active.session.id}:${summary.storeRevision}:${turnKey}`;
-    if (todoCompactReadKey === readKey) {
-      return;
-    }
-    todoCompactReadKey = readKey;
-    const generation = ++todoCompactReadGeneration;
-    const readStatus = async (
-      status: "pending" | "in_progress",
-    ): Promise<TodoPageResource["items"]> => {
-      const receipt = await options.presentation.dispatch({
-        type: "list_todos",
-        sessionId: active.session.id,
-        expectedStoreRevision: summary.storeRevision,
-        filter: { status, titleContains: null },
-        limit: 20,
-        cursor: null,
-      });
-      if (receipt.status === "rejected" || receipt.todo?.type !== "todo_page") {
-        throw new Error(
-          receipt.status === "rejected" ? receipt.message : "The compact Todo page is unavailable.",
-        );
-      }
-      return receipt.todo.items;
-    };
-    void Promise.all([readStatus("in_progress"), readStatus("pending")]).then(
-      ([inProgress, pending]) => {
-        const current = options.presentation.getState().authoritative.active;
-        if (
-          generation !== todoCompactReadGeneration ||
-          current?.session.id !== active.session.id ||
-          current.todo?.storeRevision !== summary.storeRevision
-        ) {
-          return;
-        }
-        todoCompactViewModel.setState({
-          items: [...inProgress, ...pending],
-          sessionId: active.session.id,
-          summary,
-          turnKey,
-        });
-        tui.requestRender();
-      },
-      () => {
-        if (generation !== todoCompactReadGeneration) {
-          return;
-        }
-        todoCompactViewModel.setUnavailable({
-          sessionId: active.session.id,
-          summary,
-          turnKey,
-        });
-        tui.requestRender();
-      },
-    );
+    todoCompactViewModel.setState({
+      items: active.todo.overlay?.items ?? [],
+      sessionId: active.session.id,
+      summary: active.todo,
+      turnKey: active.todo.overlay?.turnId ?? "genesis",
+    });
   };
 
   const renderState = () => {
@@ -4118,6 +4081,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           tui.requestRender();
         };
         const navigator = new TodoNavigator({
+          toggleHint: commandRegistry.keybinding("toggle_todo_overlay").keys,
+          isToggleInput: (data) => commandRegistry.matchesInput(data, "toggle_todo_overlay"),
           compactCollapsed: todoCompactViewModel.collapsed,
           initialPage: receipt.todo,
           maximumContentHeight: () => Math.max(8, physicalTerminal.rows - 4),
@@ -6093,11 +6058,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       parsedCommand.kind === "known" &&
       parsedCommand.command.id === "todos" &&
-      parsedCommand.argumentsText.length === 0
+      ["", "toggle"].includes(parsedCommand.argumentsText)
     ) {
       editor.setText("");
       editor.disableSubmit = false;
-      showTodoNavigator(active.session.id);
+      if (parsedCommand.argumentsText === "toggle") {
+        todoCompactViewModel.setCollapsed(!todoCompactViewModel.collapsed);
+        tui.requestRender();
+      } else showTodoNavigator(active.session.id);
       return;
     }
     if (
@@ -7109,6 +7077,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return { consume: true };
       }
       if (!commandRegistry.matchesInput(data, "interrupt")) return { consume: true };
+    }
+    if (
+      commandRegistry.matchesInput(data, "toggle_todo_overlay") &&
+      permission === undefined &&
+      focusedCloseableOverlay() === undefined
+    ) {
+      if (!isKeyRepeat(data) && !isKeyRelease(data)) {
+        todoCompactViewModel.setCollapsed(!todoCompactViewModel.collapsed);
+        tui.requestRender();
+      }
+      return { consume: true };
     }
     if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {

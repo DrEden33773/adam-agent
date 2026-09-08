@@ -45,6 +45,55 @@ const productionFixturePath = fileURLToPath(
 const cliPath = fileURLToPath(new URL("../../cli/dist/main.js", import.meta.url));
 const productRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const execFile = promisify(execFileCallback);
+
+test("ordinary TUI CLI configures the Todo key shown by effective Help and rejects invalid line budgets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-todo-cli-"));
+  const workspaceRoot = join(root, "workspace");
+  const stateRoot = join(root, "state");
+  const terminalProcessMarker = join(root, "terminal-process");
+  await mkdir(workspaceRoot);
+  await trustWorkspace(join(root, "config"), workspaceRoot);
+  const fixture = startFixture({
+    workspaceRoot,
+    stateRoot,
+    terminalProcessMarker,
+    program: {
+      cwd: workspaceRoot,
+      entrypoint: productionFixturePath,
+      arguments: [
+        "--target",
+        "deepseek-v4-flash.direct",
+        "--state-root",
+        stateRoot,
+        "--todo-toggle-key",
+        "ctrl+shift+t",
+        "--todo-lines",
+        "8",
+      ],
+      environment: {
+        XDG_CONFIG_HOME: join(root, "config"),
+        DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+        ADAM_TEST_TERMINAL_PROCESS_MARKER: terminalProcessMarker,
+      },
+    },
+  });
+  try {
+    await fixture.waitForScreen("Adam · New session");
+    await fixture.resize(120, 40);
+    const offset = fixture.output().length;
+    fixture.write("/hotkeys\r");
+    await fixture.waitForCompleteFrameAfter("Ctrl+Shift+T", offset);
+    expect(fixture.screen()?.join("\n")).toContain("read-only Todo overlay");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(
+      execFile(process.execPath, [productionPath, "--todo-lines", "2"], { cwd: workspaceRoot }),
+    ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Todo options require") });
+  } finally {
+    await fixture.cleanup();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 const mcpFixturePath = fileURLToPath(
   new URL("../../../packages/testkit/dist/mcp-stdio-server.fixture.js", import.meta.url),
 );
