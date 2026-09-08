@@ -358,6 +358,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         registry: commandRegistry,
       }),
     );
+    // Fleet input belongs to the focused editor route so Pi schedules its immediate input frame.
+    const handleEditorInput = created.handleInput.bind(created);
+    created.handleInput = (data) => {
+      if (
+        permission === undefined &&
+        created.focused &&
+        focusedCloseableOverlay() === undefined &&
+        terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
+        options.presentation.getState().agentUiSettings?.fleetEnabled !== false &&
+        agentFleet.handleMainInput(data, created.getText() === "")
+      )
+        return;
+      handleEditorInput(data);
+    };
     created.setStructuredCompletion(structuredEditorCompletion);
     for (const prompt of authoritativePromptHistory(active)) {
       created.addToHistory(prompt);
@@ -461,6 +475,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     {
       scheduler: deadlineScheduler,
       onChange: () => renderState(),
+      onAnimation: () => tui.requestRender(),
       settings: () => options.presentation.getState().agentUiSettings ?? defaultAgentUiSettings,
     },
   );
@@ -1588,16 +1603,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     synchronizeTodoCompactOverlay(active);
     agentWidget.setSnapshot(state.authoritative.managedControl);
     agentWidget.setActivity(state.managedAgentActivity);
-    const visibleFleetThreads = [...agentWidget.visibleThreads()];
-    const viewingThread = state.authoritative.managedControl?.threads.find(
-      (thread) => thread.threadId === agentConversation?.threadId,
-    );
-    if (
-      viewingThread !== undefined &&
-      !visibleFleetThreads.some((thread) => thread.threadId === viewingThread.threadId)
-    )
-      visibleFleetThreads.push(viewingThread);
-    agentFleet.setSnapshot(state.authoritative.managedControl, visibleFleetThreads);
+    agentFleet.setSnapshot(state.authoritative.managedControl, agentWidget.visibleThreads());
     if (state.authoritative.managedControl !== undefined)
       agentWorkspace?.workspace.setSnapshot(
         state.authoritative.managedControl,
@@ -6873,16 +6879,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       (isKeyRepeat(data) || isKeyRelease(data))
     )
       return { consume: true };
-    if (
-      permission === undefined &&
-      editor.focused &&
-      focusedCloseableOverlay() === undefined &&
-      terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
-      options.presentation.getState().agentUiSettings?.fleetEnabled !== false &&
-      agentFleet.handleMainInput(data, editor.getText() === "")
-    ) {
-      return { consume: true };
-    }
     if (
       !terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
       !commandRegistry.matchesInput(data, "interrupt")
