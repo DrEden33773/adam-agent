@@ -60,7 +60,6 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly #getThreads: () => readonly ManagedControlThread[];
   readonly #getMain: () => boolean;
   readonly #mention: (text: string) => string;
-  readonly #structuralBadges: () => boolean;
   readonly #getRoles: () => NonNullable<PresentationDisplayState["agentRoles"]>;
   readonly triggerCharacters = ["$", "@"];
   readonly #getAttachmentsAvailable: () => boolean;
@@ -77,7 +76,6 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     readonly getThreads?: () => readonly ManagedControlThread[];
     readonly getMain?: () => boolean;
     readonly mention?: (text: string) => string;
-    readonly structuralBadges?: () => boolean;
     readonly getRoles?: () => NonNullable<PresentationDisplayState["agentRoles"]>;
     readonly getAttachmentsAvailable?: () => boolean;
     readonly getProjectPaths: () => readonly string[];
@@ -94,7 +92,6 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     this.#getThreads = options.getThreads ?? (() => []);
     this.#getMain = options.getMain ?? (() => false);
     this.#mention = options.mention ?? ((text) => text);
-    this.#structuralBadges = options.structuralBadges ?? (() => false);
     this.#getProjectPaths = options.getProjectPaths;
     this.#getRunActive = options.getRunActive;
     this.#getSkills = options.getSkills;
@@ -244,8 +241,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         return {
           adamPath: { path: safePath },
           value: `@${safePath}`,
-          label: this.#path(`${this.#structuralBadges() ? "F " : ""}@${columns.fileName}`),
-          description: `F · ${columns.parentPath}`,
+          label: this.#path(`[File] @${columns.fileName}`),
+          description: `[File] ${safePath}`,
         };
       });
       const catalog = this.#getRoles();
@@ -273,10 +270,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
             definitionDigest: role.definitionDigest,
           } satisfies AtMentionAtom,
           value: `@${alias}`,
-          label: this.#mention(
-            `${this.#structuralBadges() ? "A " : ""}${safeTerminalText(`@${alias}`)}`,
-          ),
-          description: `A · ${safeTerminalText(role.description)}`,
+          label: this.#mention(`New agent ${safeTerminalText(`@${alias}`)}`),
+          description: `New agent · ${safeTerminalText(role.description)}`,
         }));
       const threads = this.#getThreads()
         .filter((thread) => thread.lifecycle === "open")
@@ -295,10 +290,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
                 handle: thread.handle,
               } satisfies AtMentionAtom,
               value: literal,
-              label: this.#mention(
-                `${this.#structuralBadges() ? "A " : ""}${safeTerminalText(literal)}`,
-              ),
-              description: `A · ${safeTerminalText(thread.description)} · ${safeTerminalText(thread.turn.label)}`,
+              label: this.#mention(`[Agent] ${safeTerminalText(literal)}`),
+              description: `[Agent] ${safeTerminalText(thread.handle)} · ${safeTerminalText(thread.description)} · ${safeTerminalText(thread.turn.label)}`,
             })),
         );
       const main =
@@ -311,8 +304,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
                   literal: "@main",
                 } satisfies AtMentionAtom,
                 value: "@main",
-                label: this.#mention(`${this.#structuralBadges() ? "A " : ""}@main`),
-                description: "A · Main conversation",
+                label: this.#mention(`[Agent] @main`),
+                description: "[Agent] @main · Main conversation",
               },
             ]
           : [];

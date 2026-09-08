@@ -66,7 +66,7 @@ test.each([
         await h.press("Fetch the exact Web evidence.", "Fetch the exact Web evidence.");
         await h.press("\r", "Web evidence complete.");
       } else {
-        await h.press("@Research", "A · Research evidence");
+        await h.press("@Research", "New agent · Research evidence");
         await h.press("\t", "@Research");
         await h.press(" Fetch the exact Web evidence.", "Fetch the exact Web evidence.");
         await h.press("\r", "Delegation");
@@ -255,7 +255,7 @@ test("Research uses the configured search provider and immutable open/find witho
   );
   try {
     await h.presentation.dispatch({ type: "enter_plan", sessionId: h.parent.sessionId });
-    await h.press("@Research", "A · Research evidence");
+    await h.press("@Research", "New agent · Research evidence");
     await h.press("\t", "@Research");
     await h.press(
       " Search and inspect immutable evidence.",
@@ -344,7 +344,7 @@ test.each(["allow", "deny"] as const)(
     );
     try {
       await h.presentation.dispatch({ type: "enter_plan", sessionId: h.parent.sessionId });
-      await h.press("@Research", "A · Research evidence");
+      await h.press("@Research", "New agent · Research evidence");
       await h.press("\t", "@Research");
       await h.press(" Fetch the exact request.", "Fetch the exact request.");
       await h.press("\r", "Delegation");

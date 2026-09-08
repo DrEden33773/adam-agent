@@ -40,7 +40,7 @@ test("an inherited role retains the parent's tightened context and output policy
     { preferences },
   );
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect within the parent policy.\r", "Delegation");
     await h.press("\r", "Completed");
@@ -97,7 +97,7 @@ test("a trusted custom role admits only its narrowed tools and appends its instr
       status: "roles_listed",
       roles: [{ qualifiedId: "project:Auditor", tools: ["read_file"] }],
     });
-    await h.press("@Auditor", "A · Inspect one exact evidence file.");
+    await h.press("@Auditor", "New agent · Inspect one exact evidence file.");
     await h.press("\t", "@Auditor");
     await h.press(" Inspect the evidence.", "Inspect the evidence.");
     await h.press("\r", "Delegation");
@@ -202,7 +202,7 @@ test("a role uses its configured certified target and keeps it after definition 
     },
   });
   try {
-    await h.press("@Specialist", "A · Inspect using");
+    await h.press("@Specialist", "New agent · Inspect using");
     await h.press("\t", "@Specialist");
     await h.press(" Inspect specialist evidence.", "Inspect specialist evidence.");
     await h.press("\r", "Delegation");
@@ -254,7 +254,7 @@ test.each(
       { workspaceRoot, blankDraft },
     );
     try {
-      await h.press("@Specialist", "A · Inspect with");
+      await h.press("@Specialist", "New agent · Inspect with");
       await h.press("\t", "@Specialist");
       await h.press(" Inspect evidence.", "Inspect evidence.");
       await h.press("\r", "Role target unavailable");

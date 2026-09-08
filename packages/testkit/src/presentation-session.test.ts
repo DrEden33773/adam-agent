@@ -1513,6 +1513,7 @@ test("PresentationSession opens an empty project catalog without creating a sess
       composer: {
         attachmentAvailable: false,
         draftRevision: 0,
+        canUndo: false,
         elements: [],
         renderedText: "",
         unavailableReason: "New session required for attachments",
@@ -4898,6 +4899,7 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
       composer: {
         attachmentAvailable: true,
         draftRevision: 0,
+        canUndo: false,
         elements: [],
         renderedText: "",
         unavailableReason: null,

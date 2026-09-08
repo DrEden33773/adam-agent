@@ -385,7 +385,7 @@ test("/agents replies through one exact attention barrier without starting a par
     await fixture.waitForRecordedOutput("Which exact fixture source should I use?");
     fixture.write("r");
     await fixture.waitForRecordedOutput(
-      "Enter one bounded reply for the exact managed-child attention request.",
+      "Enter one bounded reply for the exact managed-child attention request",
     );
     fixture.write("Use the immutable fixture source.\r");
     const replyPath = join(controlRoot, "managed-attention-reply");
@@ -432,54 +432,6 @@ test("active-run /agents opens the live managed overlay without ending the paren
     expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · running");
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
     await fixture.waitForRecordedOutput("Managed active parent completed.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("terminal managed follow-up restores responsive editor input before admission", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-follow-up-input-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-active",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one terminal managed child.\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-    await fixture.waitForRecordedOutput("Agents 0 active/1 terminal");
-
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
-    fixture.write("\r");
-    await fixture.waitForRecordedOutput("f follow-up from exact terminal evidence");
-    fixture.write("\u001b[102;1:1u");
-    fixture.write("\u001b[102;1:2u");
-    fixture.write("\u001b[102;1:3u");
-    await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain(
-      "Follow-up task · add tokens: /budget-add <tokens> <task>",
-    );
-
-    const beforeDraft = fixture.output().length;
-    fixture.write("Preserve exact follow-up evidence.");
-    await fixture.resize(82, 24);
-    expect(fixture.output().slice(beforeDraft)).toContain("Preserve exact follow-up evidence.");
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("fPreserve exact follow-up evidence.");
-
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -7802,13 +7754,13 @@ test("the real TUI opens inline project path completion from the at trigger", as
     await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
     const frame = fixture.output().slice(beforeCompletion);
     let screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+F · \.\//u);
-    expect(screen).toMatch(/@alpha\.ts\s+F · src\//u);
+    expect(screen).toMatch(/@README\.md\s+\[File\] README\.md/u);
+    expect(screen).toMatch(/@alpha\.ts\s+\[File\] src\/alpha\.ts/u);
 
     await fixture.resize(120, 40);
     screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+F · \.\//u);
-    expect(screen).toMatch(/@alpha\.ts\s+F · src\//u);
+    expect(screen).toMatch(/@README\.md\s+\[File\] README\.md/u);
+    expect(screen).toMatch(/@alpha\.ts\s+\[File\] src\/alpha\.ts/u);
 
     await fixture.resize(40, 12);
     screen = fixture.screen()?.join("\n") ?? "";

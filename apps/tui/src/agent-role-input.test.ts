@@ -50,7 +50,7 @@ test("direct delegation reads only its explicitly attached immutable resource", 
   const h = await startManagedTui(driver, { workspaceRoot, blankDraft: true });
   let cold: Awaited<ReturnType<typeof startManagedTui>> | undefined;
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect this attachment. ", "Inspect this attachment.");
     expect(await h.presentation.dispatch({ type: "stage_input_resource", path })).toMatchObject({
@@ -69,7 +69,7 @@ test("direct delegation reads only its explicitly attached immutable resource", 
     expect(h.presentation.getState().composer.renderedText).toBe("");
     const addedPath = join(workspaceRoot, "added.txt");
     await writeFile(addedPath, "EXPLICIT LATER ATTACHMENT\n");
-    await h.press("@explore-1", "A · Inspect this attachment.");
+    await h.press("@explore-1", "[Agent] @explore-1 · Inspect this attachment.");
     await h.press("\t", "@explore-1");
     await h.press(
       " Read the explicitly added attachment. ",
@@ -215,7 +215,10 @@ test("direct role and exact-thread messages preserve folded pasted evidence", as
       ["@Explore", "INITIAL PASTED EVIDENCE"],
       ["@explore-1", "FOLLOWUP PASTED EVIDENCE"],
     ] as const) {
-      await h.press(mention, mention === "@Explore" ? "A · Explore" : "A · Inspect these logs.");
+      await h.press(
+        mention,
+        mention === "@Explore" ? "New agent · Explore" : "[Agent] @explore-1 · Inspect these logs.",
+      );
       await h.press("\t", mention);
       await h.press(" Inspect these logs.\n", "Inspect these logs.");
       expect(
@@ -328,7 +331,7 @@ test("the direct delegation overlay shares an explicitly selected older message"
     await h.terminal.waitForScreen("provider reported · idle");
     await h.press("UNSELECTED NEWER CONTEXT\r", "Parent or child evidence recorded.");
     await h.terminal.waitForScreen("provider reported · idle");
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect this direct task.", "Inspect this direct task.");
     await h.press("\r", "Delegation");
@@ -520,7 +523,7 @@ test("a lifetime alias restores the exact thread and cannot be rebound after clo
     await h.terminal.waitForScreen("@explore-1 · Explore · Completed");
     const thread = h.presentation.getState().authoritative.managedControl?.threads[0];
     if (thread === undefined) throw new Error("Missing thread.");
-    await h.press("@证据", "A · Alias evidence");
+    await h.press("@证据", "[Agent] @explore-1 · Alias evidence");
     await h.press("\t", "@证");
     await h.press(" Continue explicitly.", "Continue explicitly.");
     await h.stop();
@@ -605,12 +608,12 @@ test.each(["cooperative", "interrupt"] as const)(
       },
     });
     try {
-      await h.press("@Explore", "A · Explore");
+      await h.press("@Explore", "New agent · Explore");
       await h.press("\t", "@Explore");
       await h.press(" Inspect evidence.", "Inspect evidence.");
       await h.press("\r", "Delegation");
       await h.press("\r", "@explore-1 · Explore · Running");
-      await h.press("@explore-1", "A · Inspect evidence.");
+      await h.press("@explore-1", "[Agent] @explore-1 · Inspect evidence.");
       await h.press("\t", "@explore-1");
       await h.press(" Use this explicit later context.", "Use this explicit later context.");
       await h.press("\r", "Send to @explore-1");
@@ -657,14 +660,14 @@ test("a direct handle confirmation rejects a changed turn and retains the draft"
     },
   });
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect evidence.", "Inspect evidence.");
     await h.press("\r", "Delegation");
     await h.press("\r", "Completed");
     const thread = h.presentation.getState().authoritative.managedControl?.threads[0];
     if (thread === undefined) throw new Error("Missing first turn.");
-    await h.press("@explore-1", "A · Inspect evidence.");
+    await h.press("@explore-1", "[Agent] @explore-1 · Inspect evidence.");
     await h.press("\t", "@explore-1");
     await h.press(" Send only to the reviewed turn.", "Send only to the reviewed turn.");
     await h.press("\r", "Delegation");
@@ -706,7 +709,7 @@ test("a selected main atom routes the following task to the existing Main Sessio
     },
   });
   try {
-    await h.press("@main", "A · Main conversation");
+    await h.press("@main", "> [Agent] @main");
     await h.press("\t", "@main");
     await h.press(" Inspect the parent request.", "Inspect the parent request.");
     await h.press("\r", "Main received the selected task.");
@@ -733,14 +736,14 @@ test("a selected exact handle starts a confirmed new turn in that thread", async
     },
   });
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect evidence.", "Inspect evidence.");
     await h.press("\r", "Delegation");
     await h.press("\r", "Completed");
     const first = h.presentation.getState().authoritative.managedControl?.threads[0];
     if (first === undefined) throw new Error("Missing original thread.");
-    await h.press("@explore-1", "A · Inspect evidence.");
+    await h.press("@explore-1", "[Agent] @explore-1 · Inspect evidence.");
     await h.press("\t", "@explore-1");
     await h.press(" Continue only this thread.", "Continue only this thread.");
     await h.press("\r", "Delegation");
@@ -787,7 +790,7 @@ test.each(["default", "plan"] as const)(
       await h.presentation.dispatch({ type: "set_draft_mode", mode });
       expect(h.presentation.getState().authoritative.active).toBeNull();
       await h.press("/thinking off\r", "Thinking Off selected for the next prompt.");
-      await h.press("@Explore", "A · Explore");
+      await h.press("@Explore", "New agent · Explore");
       await h.press("\t", "@Explore");
       await h.press(" Inspect this direct request.", "Inspect this direct request.");
       await h.press("\r", "Delegation");
@@ -866,7 +869,7 @@ test.each(["default", "plan"] as const)(
   },
 );
 
-test("manual and pasted Unicode mentions are atomic literals without role authority", async () => {
+test("manual and pasted Unicode mentions remain character-editable text", async () => {
   const h = await startManagedTui({
     stream() {
       throw new Error("No provider expected.");
@@ -875,49 +878,102 @@ test("manual and pasted Unicode mentions are atomic literals without role author
   try {
     await h.press("mail@example.com @探索🧭 ", "mail@example.com");
     expect(h.presentation.getState().composer.elements).toEqual([
-      expect.objectContaining({ type: "text", text: "mail@example.com " }),
-      expect.objectContaining({ type: "mention", kind: "literal", literal: "@探索🧭" }),
-      expect.objectContaining({ type: "text", text: " " }),
+      expect.objectContaining({ type: "text", text: "mail@example.com @探索🧭 " }),
     ]);
     await h.press("\x7f", "mail@example.com");
     await h.press("\x7f", "mail@example.com");
+    expect(h.presentation.getState().composer.renderedText).toBe("mail@example.com @探索");
+    await h.press("\x1b[200~ @Explore @main \x1b[201~", "@main");
     expect(
-      h.presentation.getState().composer.elements.some((element) => element.type === "mention"),
-    ).toBe(false);
-    await h.press(String.fromCharCode(31), "Draft edit undone.");
-    expect(h.presentation.getState().composer.elements).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "mention", kind: "literal", literal: "@探索🧭" }),
-      ]),
-    );
-    await h.press("\x7f", "Draft element removed.");
-    await h.press("\x1b[200~@Explore @main \x1b[201~", "@main");
-    expect(
-      h.presentation.getState().composer.elements.filter((element) => element.type === "mention"),
-    ).toEqual([
-      expect.objectContaining({ kind: "literal", literal: "@Explore" }),
-      expect.objectContaining({ kind: "literal", literal: "@main" }),
-    ]);
+      h.presentation.getState().composer.elements.every((element) => element.type === "text"),
+    ).toBe(true);
     expect(h.presentation.getState().authoritative.managedControl?.threads).toHaveLength(0);
   } finally {
     await h.close();
   }
 });
 
-test("an unselected trailing Unicode mention deletes as one unit before any whitespace", async () => {
+test.each(["@", "$"])(
+  "an unselected %s Unicode token supports Backspace, Left and Home as text",
+  async (prefix) => {
+    const h = await startManagedTui({
+      stream() {
+        throw new Error("No provider expected.");
+      },
+    });
+    try {
+      await h.press(`Inspect ${prefix}探索🧭`, "Inspect");
+      await h.press("\x7f", "Inspect");
+      expect(h.presentation.getState().composer.renderedText).toBe(`Inspect ${prefix}探索`);
+      await h.press("\x1b[D", "Inspect");
+      await h.press("X", "Inspect");
+      expect(h.presentation.getState().composer.renderedText).toBe(`Inspect ${prefix}探X索`);
+      await h.press("\x1b[H", "Inspect");
+      await h.press("Y", "YInspect");
+      expect(h.presentation.getState().composer.renderedText).toBe(`YInspect ${prefix}探X索`);
+      expect(
+        h.presentation.getState().composer.elements.every((element) => element.type === "text"),
+      ).toBe(true);
+    } finally {
+      await h.close();
+    }
+  },
+);
+
+test("an accepted role remains one exact deletable and undoable reference", async () => {
   const h = await startManagedTui({
     stream() {
       throw new Error("No provider expected.");
     },
   });
   try {
-    await h.press("Inspect @探索🧭", "Inspect");
-    await h.press("\x7f", "Draft element removed.");
-    expect(h.presentation.getState().composer.renderedText).toBe("Inspect ");
+    await h.press("@Explore", "New agent · Explore");
+    await h.press("\t", "@Explore");
+    const selected = h.presentation.getState().composer.elements;
+    expect(selected).toEqual([
+      expect.objectContaining({
+        type: "mention",
+        kind: "role",
+        qualifiedRoleId: "builtin:explore",
+      }),
+    ]);
+    await h.press("\x7f", "Adam · Fleet fixture", "@Explore");
+    expect(h.presentation.getState().composer.renderedText).toBe("");
     await h.press(String.fromCharCode(31), "Draft edit undone.");
-    expect(h.presentation.getState().composer.elements).toEqual(
-      expect.arrayContaining([expect.objectContaining({ kind: "literal", literal: "@探索🧭" })]),
-    );
+    expect(h.presentation.getState().composer.elements).toEqual(selected);
+  } finally {
+    await h.close();
+  }
+});
+
+test("ordinary Enter seals manual recipients as one Main request without child routing", async () => {
+  const requests: ModelRequest[] = [];
+  const h = await startManagedTui({
+    async *stream(request) {
+      requests.push(request);
+      yield { type: "text_delta", text: "Main received literal mentions." };
+      yield { type: "usage", inputTokens: 100, outputTokens: 20 };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  try {
+    const text = "Inspect @探索🧭 @Explore @main";
+    await h.press(text, "Inspect");
+    await h.press("\r", "Main received literal mentions.");
+    expect(requests).toHaveLength(1);
+    expect(JSON.stringify(requests[0]?.messages)).toContain(text);
+    expect(await h.store.read()).toEqual([]);
+    const records = await (await h.sessions.open(h.parent.sessionId))?.read();
+    expect(
+      records?.flatMap((record) =>
+        record.schemaVersion === 3 &&
+        record.record.type === "runtime_event" &&
+        record.record.event.type === "user_message"
+          ? [record.record.event.text]
+          : [],
+      ),
+    ).toEqual([text]);
+    expect(h.presentation.getState().composer.renderedText).toBe("");
   } finally {
     await h.close();
   }
@@ -930,9 +986,9 @@ test("multiple selected recipients require one explicit choice before delegation
     },
   });
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
-    await h.press(" @Research", "A · Research");
+    await h.press(" @Research", "New agent · Research");
     await h.press("\t", "@Research");
     await h.press(" Inspect the evidence.", "Inspect the evidence.");
     await h.press("\r", "Choose recipient");
@@ -950,7 +1006,7 @@ test("multiple selected recipients require one explicit choice before delegation
   }
 });
 
-test("a selected role survives cold restart and copied bytes return as literal mentions", async () => {
+test("a selected role survives cold restart and copied bytes return as ordinary text", async () => {
   const driver = {
     stream() {
       throw new Error("No provider expected.");
@@ -968,7 +1024,7 @@ test("a selected role survives cold restart and copied bytes return as literal m
   });
   let cold: Awaited<ReturnType<typeof startManagedTui>> | undefined;
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect evidence.", "Inspect evidence.");
     await h.stop();
@@ -993,7 +1049,7 @@ test("a selected role survives cold restart and copied bytes return as literal m
     await cold.stop();
     expect(cold.presentation.getState().composer.elements).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: "mention", kind: "literal", literal: "@Explore" }),
+        expect.objectContaining({ type: "text", text: "@Explore Inspect evidence." }),
       ]),
     );
     expect(cold.presentation.getState().authoritative.managedControl?.threads).toHaveLength(0);
@@ -1016,14 +1072,14 @@ test.each(["remove", "literal", "retarget"] as const)(
       },
     });
     try {
-      await h.press("@Explore", "A · Explore");
+      await h.press("@Explore", "New agent · Explore");
       await h.press("\t", "@Explore");
       await h.press(" Inspect evidence.", "Inspect evidence.");
       await h.press("\r", "Delegation");
       await h.press("\r", "Completed");
       const thread = h.presentation.getState().authoritative.managedControl?.threads[0];
       if (thread === undefined) throw new Error("Missing completed thread.");
-      await h.press("@explore-1", "A · Inspect evidence.");
+      await h.press("@explore-1", "[Agent] @explore-1 · Inspect evidence.");
       await h.press("\t", "@explore-1");
       await h.press(" Continue inspecting.", "Continue inspecting.");
       const control = await h.lifecycle[sessionManagedControl](h.parent.sessionId);
@@ -1212,7 +1268,7 @@ test("an Explore continuation retains its activated Skill and resources across a
     { workspaceRoot },
   );
   try {
-    await h.press("@Explore", "A · Explore repository");
+    await h.press("@Explore", "New agent · Explore repository");
     await h.press("\t", "@Explore");
     await h.press(" Inspect origin evidence.", "Inspect origin evidence.");
     await h.press("\r", "Delegation");

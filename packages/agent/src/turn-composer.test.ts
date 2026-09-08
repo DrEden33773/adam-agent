@@ -765,3 +765,21 @@ test("TurnComposer captures and restores one recoverable ordered draft through r
     await composer.close();
   }
 });
+
+test.each(["@探索🧭", "@Explore @main "])(
+  "TurnComposer never promotes unaccepted text %s when editing or sealing",
+  async (text) => {
+    const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+    try {
+      await composer.commitText(text, async () => {});
+      expect(composer.snapshot().elements).toEqual([
+        expect.objectContaining({ type: "text", text }),
+      ]);
+      const sealed = await composer.seal(new AbortController().signal);
+      expect(sealed.elements).toEqual([expect.objectContaining({ type: "text", text })]);
+      expect(sealed.text).toBe(text);
+    } finally {
+      await composer.close();
+    }
+  },
+);

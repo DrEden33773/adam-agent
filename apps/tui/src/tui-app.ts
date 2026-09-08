@@ -106,10 +106,7 @@ import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
-import {
-  completeLiteralMentionAtCursor,
-  createAdamStructuredEditorCompletion,
-} from "./structured-editor-completion.js";
+import { createAdamStructuredEditorCompletion } from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
 import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
@@ -153,7 +150,15 @@ type TuiNotice = {
 
 export async function runTui(options: RunTuiOptions): Promise<void> {
   const physicalTerminal = options.terminal ?? new ProcessTerminal();
-  const terminal = new RightEdgeGuardTerminal(physicalTerminal);
+  const terminal = new RightEdgeGuardTerminal(physicalTerminal, (data) => {
+    // Pi consumes viewport Home/End before component listeners. While the Main
+    // editor owns focus, use its equivalent cursor keys without changing global bindings.
+    if (editor.focused && editor.getText().length > 0 && !isKeyRelease(data)) {
+      if (matchesKey(data, "home")) return "\x01";
+      if (matchesKey(data, "end")) return "\x05";
+    }
+    return data;
+  });
   const deadlineScheduler = options.deadlineScheduler ?? nodeDeadlineScheduler;
   const commandRegistry = options.commandRegistry ?? adamCommandRegistry;
   const startupTargetId =
@@ -310,7 +315,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           options.presentation.getState().authoritative.managedControl?.threads ?? [],
         getMain: () => (options.presentation.getState().agentRoles?.length ?? 0) > 0,
         mention: theme.reference,
-        structuralBadges: () => physicalTerminal.columns < 60 || theme.reference("a") === "a",
         getRoles: () => options.presentation.getState().agentRoles ?? [],
         getAttachmentsAvailable: () => options.presentation.getState().composer.attachmentAvailable,
         getProjectPaths: () =>
@@ -557,7 +561,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | undefined;
   let pendingManagedAgentInput:
     | {
-        readonly action: "message" | "reply" | "follow_up" | "recovery";
+        readonly action: "message" | "reply" | "recovery";
         readonly sessionId: string;
         readonly agentId: string;
         readonly expectedRevision: number;
@@ -568,7 +572,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let attentionOverlay: { readonly close: () => void; readonly hide: () => void } | undefined;
   const dismissedAttention = new Set<string>();
   let readyAgentConversation: (() => void) | undefined;
-  let managedAgentFocusHandoffKey: "c" | "f" | "m" | "r" | null = null;
+  let managedAgentFocusHandoffKey: "c" | "m" | "r" | null = null;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
     | {
@@ -892,14 +896,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
     }
     if (!composer.elements.some((element) => element.type !== "text")) {
-      if (structuredEditorActive && composer.elements.length > 0) {
-        editor.setDocument(
-          composer.elements.map((element) => ({
-            type: "text" as const,
-            id: element.elementId,
-            text: element.type === "text" ? element.text : "",
-          })),
-        );
+      if (
+        structuredEditorActive &&
+        !scopeChanged &&
+        (composer.elements.length > 0 || composer.canUndo)
+      ) {
+        // Removing the last atom must retain canonical undo and edit routing.
+        const parts: readonly EditorDocumentPart[] =
+          composer.elements.length === 0
+            ? [{ type: "text", id: "adam-empty-draft", text: "" }]
+            : composer.elements.map((element) => ({
+                type: "text" as const,
+                id: element.elementId,
+                text: element.type === "text" ? element.text : "",
+              }));
+        editor.setDocument(parts);
+        localStructuredDocument = parts;
       } else if (structuredEditorActive) {
         editor.setText(composer.renderedText);
         structuredEditorActive = false;
@@ -3902,24 +3914,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             editor.setText("");
             showNotice(
               "info",
-              "Enter one bounded message. Delivery occurs only at the child’s next safe boundary and does not imply compliance.",
-              "until_next_action",
-              expectedSessionId,
-            );
-            renderState();
-          },
-          onFollowUp(input) {
-            managedAgentFocusHandoffKey = "f";
-            close();
-            pendingManagedAgentInput = {
-              action: "follow_up",
-              sessionId: expectedSessionId,
-              ...input,
-            };
-            editor.setText("");
-            showNotice(
-              "info",
-              "Follow-up task · add tokens: /budget-add <tokens> <task>",
+              "Enter one bounded message · Esc Main. Delivery occurs only at the child’s next safe boundary and does not imply compliance.",
               "until_next_action",
               expectedSessionId,
             );
@@ -3936,7 +3931,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             editor.setText("");
             showNotice(
               "info",
-              "Enter one bounded recovery task for the exact durable child evidence.",
+              "Enter one bounded recovery task for the exact durable child evidence · Esc Main.",
               "until_next_action",
               expectedSessionId,
             );
@@ -3953,7 +3948,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             editor.setText("");
             showNotice(
               "info",
-              "Enter one bounded reply for the exact managed-child attention request.",
+              "Enter one bounded reply for the exact managed-child attention request · Esc Main.",
               "until_next_action",
               expectedSessionId,
             );
@@ -5363,6 +5358,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     ) {
       return;
     }
+    const earlyParsed = commandRegistry.parse(text);
+    if (earlyParsed.kind === "known") pendingManagedAgentInput = undefined;
     if (pendingManagedAgentInput !== undefined) {
       const managedInput = pendingManagedAgentInput;
       if (active === null || active.session.id !== managedInput.sessionId) {
@@ -5378,18 +5375,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           ? "Sending the exact managed-child message…"
           : managedInput.action === "reply"
             ? "Sending the exact managed-child reply…"
-            : managedInput.action === "follow_up"
-              ? "Starting the exact managed-child follow-up…"
-              : "Recovering the exact managed child…",
+            : "Recovering the exact managed child…",
         "until_replaced",
         active.session.id,
       );
       let followUpInput: ReturnType<typeof parseTaskBudgetFollowUp>;
       try {
         followUpInput =
-          managedInput.action === "follow_up" || managedInput.action === "recovery"
-            ? parseTaskBudgetFollowUp(text)
-            : { task: text };
+          managedInput.action === "recovery" ? parseTaskBudgetFollowUp(text) : { task: text };
       } catch (error) {
         editor.disableSubmit = false;
         showNotice(
@@ -5412,21 +5405,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 : { attentionId: managedInput.attentionId }),
               message: text,
             }
-          : managedInput.action === "follow_up"
-            ? {
-                type: "follow_up_managed_agent",
-                sessionId: active.session.id,
-                agentId: managedInput.agentId,
-                expectedRevision: managedInput.expectedRevision,
-                ...followUpInput,
-              }
-            : {
-                type: "recover_managed_agent",
-                sessionId: active.session.id,
-                agentId: managedInput.agentId,
-                expectedRevision: managedInput.expectedRevision,
-                ...followUpInput,
-              };
+          : {
+              type: "recover_managed_agent",
+              sessionId: active.session.id,
+              agentId: managedInput.agentId,
+              expectedRevision: managedInput.expectedRevision,
+              ...followUpInput,
+            };
       void options.presentation
         .dispatch(command)
         .then((receipt) => {
@@ -5440,9 +5425,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 ? `Managed-child message ${receipt.managedAgentControl?.delivery ?? "accepted"}; delivery occurs only at the next safe boundary and does not imply compliance.`
                 : managedInput.action === "reply"
                   ? "Managed-child reply enqueued for exact delivery."
-                  : managedInput.action === "follow_up"
-                    ? "Managed-child follow-up started from exact terminal evidence."
-                    : "Managed child recovered from exact durable evidence.",
+                  : "Managed child recovered from exact durable evidence.",
               "until_next_action",
               active.session.id,
             );
@@ -5470,7 +5453,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .finally(() => tui.requestRender());
       return;
     }
-    const earlyParsed = commandRegistry.parse(text);
     if (
       active !== null &&
       earlyParsed.kind === "not_command" &&
@@ -6938,39 +6920,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     handleTerminationSignal("SIGTERM");
   }
   tui.addInputListener((data) => {
-    if (
-      permission === undefined &&
-      focusedCloseableOverlay() === undefined &&
-      (matchesKey(data, "backspace") || matchesKey(data, "left") || matchesKey(data, "home")) &&
-      !options.presentation.getState().composer.sealed
-    ) {
-      const visible = editor.getText();
-      const position = editor.getCursor();
-      const lines = editor.getLines();
-      if (position.line === lines.length - 1 && position.col === (lines.at(-1)?.length ?? 0)) {
-        const document: readonly EditorDocumentPart[] =
-          structuredEditorActive && localStructuredDocument !== null
-            ? localStructuredDocument
-            : [{ type: "text", id: "adam-literal-input", text: visible }];
-        const last = document.at(-1);
-        if (last?.type === "text") {
-          const edit = completeLiteralMentionAtCursor(
-            document,
-            { partId: last.id, offset: last.text.length },
-            (atom) => mentionAtoms.set(atom.elementId, atom),
-          );
-          if (edit !== null) {
-            editor.setDocument(edit.document, edit.cursor);
-            editor.onEditIntent?.({
-              type: "replace",
-              range: edit.range,
-              text: edit.text,
-              document: edit.document,
-            });
-          }
-        }
-      }
-    }
     if (managedAgentFocusHandoffKey !== null) {
       if (
         matchesKey(data, managedAgentFocusHandoffKey) &&
@@ -6985,6 +6934,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (commandRegistry.matchesInput(data, "exit")) {
       void stop(true);
+      return { consume: true };
+    }
+    if (
+      pendingManagedAgentInput !== undefined &&
+      permission === undefined &&
+      focusedCloseableOverlay() === undefined &&
+      commandRegistry.matchesInput(data, "back")
+    ) {
+      if (!isKeyRepeat(data) && !isKeyRelease(data)) {
+        pendingManagedAgentInput = undefined;
+        editor.disableSubmit = false;
+        showNotice("info", "Managed-child input cancelled. Main draft retained.", "until_edit");
+        renderState();
+      }
       return { consume: true };
     }
     if (

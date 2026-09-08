@@ -20,6 +20,7 @@ import {
   createExtensionHost,
   createJsonlManagedAgentStore,
   createJsonlOperationStore,
+  createJsonlSessionStoreDirectory,
   createModelTargets,
   createSessionLifecycle,
   createWorkspaceTrust,
@@ -1953,8 +1954,8 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
   }
 });
 
-test("production task budget approval and additive follow-up Enter persist exact JSONL grants", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-budget-enter-"));
+test("production terminal navigation keeps ordinary Enter in Main and preserves the explicit child grant", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-main-enter-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const controlRoot = join(testRoot, "control");
@@ -1975,7 +1976,7 @@ test("production task budget approval and additive follow-up Enter persist exact
       code: "ENOENT",
     });
     fixture.write("\r");
-    await waitForPath(join(controlRoot, "managed-active-child-held"));
+    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     const beforeCompleted = fixture.output().length;
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n");
     await fixture.waitForCompleteFrameAfter("Managed active parent completed.", beforeCompleted);
@@ -1983,37 +1984,54 @@ test("production task budget approval and additive follow-up Enter persist exact
     await fixture.waitForCompleteFrameAfter(" · idle", beforeCompleted);
     fixture.write("/agents\r");
     await fixture.waitForScreen("Agents · 0 active · 1 terminal");
+    let offset = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForRecordedOutput("f follow-up from exact terminal evidence");
-    fixture.write("f");
-    await fixture.waitForScreen("Follow-up task · add tokens:");
-    const beforeFollowUp = fixture.output().length;
-    fixture.write("/budget-add 5000 Continue from exact evidence.\r");
-    await fixture.waitForCompleteFrameAfter(
-      "Managed-child follow-up started from exact terminal evidence.",
-      beforeFollowUp,
-    );
-    await fixture.waitForScreen("Agents 0 active/1 terminal");
+    await fixture.waitForCompleteFrameAfter("Agent detail", offset);
+    fixture.write("\u001b[102;1:1u\u001b[102;1:2u\u001b[102;1:3u");
+    await fixture.resize(81, 24);
+    expect(fixture.screen()?.join("\n")).toContain("Agent detail");
+    expect(fixture.screen()?.join("\n")).not.toContain("f follow-up");
+    for (const visible of ["Agents · 0 active · 1 terminal", " · idle"]) {
+      offset = fixture.output().length;
+      fixture.write("\u001b");
+      await fixture.waitForCompleteFrameAfter(visible, offset);
+    }
+    offset = fixture.output().length;
+    fixture.write("Continue in Main from exact evidence.");
+    await fixture.waitForCompleteFrameAfter("Continue in Main from exact evidence.", offset);
+    await unlink(join(controlRoot, "submit_prompt-settled"));
+    offset = fixture.output().length;
+    fixture.write("\r");
+    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
+    await fixture.waitForCompleteFrameAfter("Managed active parent completed.", offset);
+    await fixture.waitForCompleteFrameAfter(" · idle", offset);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const records = await (await createJsonlManagedAgentStore({ stateRoot, workspaceRoot })).read();
     const admissions = records.filter((record) => record.type === "managed_agent_admitted");
-    expect(admissions).toHaveLength(2);
-    expect(admissions[0]?.taskBudget).toMatchObject({
+    expect(admissions).toHaveLength(1);
+    const admission = admissions[0];
+    if (admission === undefined) throw new Error("Missing child admission.");
+    expect(admission.taskBudget).toMatchObject({
       mode: "limited",
       grants: [{ tokens: 10000 }],
     });
-    expect(admissions[1]?.taskBudget).toMatchObject({
-      mode: "limited",
-      grants: [{ tokens: 10000 }, { tokens: 5000 }],
-    });
-    expect(admissions[1]?.agentId).toBe(admissions[0]?.agentId);
+    const parentStore = await createJsonlSessionStoreDirectory({ stateRoot, workspaceRoot }).open(
+      admission.parentSessionId,
+    );
+    const parentRecords = await parentStore?.read();
     expect(
-      records.find(
-        (record) =>
-          record.type === "managed_agent_terminal" && record.attemptId === admissions[1]?.attemptId,
+      parentRecords?.flatMap((record) =>
+        record.schemaVersion === 3 &&
+        record.record.type === "runtime_event" &&
+        record.record.event.type === "user_message"
+          ? [record.record.event.text]
+          : [],
       ),
-    ).toMatchObject({ status: "completed" });
+    ).toEqual([
+      "Start one child with an explicit budget.",
+      "Continue in Main from exact evidence.",
+    ]);
   } finally {
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n").catch(
       () => undefined,
@@ -2022,3 +2040,93 @@ test("production task budget approval and additive follow-up Enter persist exact
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+test.each(["escape", "command"] as const)(
+  "production pending child reply exits through %s and ordinary Enter persists only in Main",
+  async (exit) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-pending-input-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const controlRoot = join(testRoot, "control");
+    await mkdir(workspaceRoot);
+    await mkdir(controlRoot);
+    const fixture = startFixture({
+      scenario: "managed-attention",
+      workspaceRoot,
+      stateRoot,
+      controlRoot,
+    });
+    try {
+      await fixture.waitForScreen("Adam · New session");
+      fixture.write("Start one managed attention fixture.\r");
+      await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
+      await fixture.waitForScreen(" · idle");
+      let offset = fixture.output().length;
+      fixture.write("/agents\r");
+      await fixture.waitForCompleteFrameAfter("Agents · 1 active · 0 terminal", offset);
+      offset = fixture.output().length;
+      fixture.write("\r");
+      await fixture.waitForCompleteFrameAfter("Which exact fixture source should I use?", offset);
+      offset = fixture.output().length;
+      fixture.write("r");
+      await fixture.waitForCompleteFrameAfter("Enter one bounded reply", offset);
+      const mainText = "Retain this draft in Main.";
+      if (exit === "escape") {
+        offset = fixture.output().length;
+        fixture.write(mainText);
+        await fixture.waitForCompleteFrameAfter(mainText, offset);
+        offset = fixture.output().length;
+        fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
+        await fixture.waitForCompleteFrameAfter(
+          "Managed-child input cancelled. Main draft retained.",
+          offset,
+        );
+        expect(fixture.screen()?.join("\n")).toContain(mainText);
+      } else {
+        offset = fixture.output().length;
+        fixture.write("/help");
+        await fixture.waitForCompleteFrameAfter("/help", offset);
+        offset = fixture.output().length;
+        fixture.write("\r");
+        await fixture.waitForCompleteFrameAfter("Adam Help", offset);
+        offset = fixture.output().length;
+        fixture.write("\u001b");
+        await fixture.waitForCompleteFrameAfter(" · idle", offset);
+        offset = fixture.output().length;
+        fixture.write(mainText);
+        await fixture.waitForCompleteFrameAfter(mainText, offset);
+      }
+      await unlink(join(controlRoot, "submit_prompt-settled"));
+      offset = fixture.output().length;
+      fixture.write("\r");
+      await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
+      await fixture.waitForCompleteFrameAfter("Managed child needs exact input.", offset);
+      await fixture.waitForCompleteFrameAfter(" · idle", offset);
+      fixture.write("\u0011");
+      await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+      const records = await (
+        await createJsonlManagedAgentStore({ stateRoot, workspaceRoot })
+      ).read();
+      expect(
+        records.filter((record) => record.type === "managed_agent_parent_reply_enqueued"),
+      ).toEqual([]);
+      const admission = records.find((record) => record.type === "managed_agent_admitted");
+      if (admission === undefined) throw new Error("Missing child admission.");
+      const parentStore = await createJsonlSessionStoreDirectory({ stateRoot, workspaceRoot }).open(
+        admission.parentSessionId,
+      );
+      expect(
+        (await parentStore?.read())?.flatMap((record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "runtime_event" &&
+          record.record.event.type === "user_message"
+            ? [record.record.event.text]
+            : [],
+        ),
+      ).toEqual(["Start one managed attention fixture.", mainText]);
+    } finally {
+      await fixture.cleanup();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);

@@ -159,30 +159,6 @@ export function createAdamStructuredEditorCompletion(
 
 export const adamStructuredEditorCompletion = createAdamStructuredEditorCompletion();
 
-export function completeLiteralMentionAtCursor(
-  document: readonly EditorDocumentPart[],
-  cursor: EditorDocumentPoint,
-  onMentionAtom: (element: DraftMentionElement) => void,
-): ReturnType<EditorStructuredCompletion["accept"]> {
-  const current = textPartAtCursor(document, cursor);
-  if (current === null || current.offset !== current.part.text.length) return null;
-  const match = /(^|\s)(@[^\s\p{Cc}]+)$/u.exec(current.part.text);
-  const literal = match?.[2];
-  if (literal === undefined || (match?.index === 0 && match[1] === "" && current.index > 0))
-    return null;
-  return acceptMentionAtom(
-    document,
-    cursor,
-    {
-      value: literal,
-      label: literal,
-      adamMention: { type: "mention", kind: "literal", literal },
-    } as Parameters<EditorStructuredCompletion["accept"]>[2],
-    literal,
-    { onMentionAtom },
-  );
-}
-
 function acceptMentionAtom(
   document: readonly EditorDocumentPart[],
   cursor: EditorDocumentPoint,

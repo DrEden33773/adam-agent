@@ -239,6 +239,7 @@ export type TurnComposer = {
     readonly renderedText: string;
     readonly revision: number;
     readonly sealed: boolean;
+    readonly canUndo: boolean;
     readonly resources: readonly TurnComposerResourceSnapshot[];
     readonly pastedTexts: readonly TurnComposerPastedTextSnapshot[];
   };
@@ -446,39 +447,6 @@ export async function createTurnComposer(options: {
             candidateIndex === index ? { ...element, text: nextText } : candidate,
           );
   };
-
-  // A trailing token stays editable until its boundary arrives. Sealing completes it.
-  const promoteLiteralMentions = (
-    source: readonly TurnComposerElementSnapshot[],
-    complete = false,
-  ): TurnComposerElementSnapshot[] =>
-    source.flatMap((element, index) => {
-      if (element.type !== "text") return [element];
-      const result: TurnComposerElementSnapshot[] = [];
-      let end = 0;
-      for (const match of element.text.matchAll(/(^|\s)(@[^\s\p{Cc}]+)(?=\s|$)/gu)) {
-        const literal = match[2];
-        const start = match.index + (match[1]?.length ?? 0);
-        if (
-          literal === undefined ||
-          (start === 0 && index > 0) ||
-          (!complete && start + literal.length === element.text.length)
-        )
-          continue;
-        if (start > end)
-          result.push({
-            ...element,
-            elementId: end === 0 ? element.elementId : randomUUID(),
-            text: element.text.slice(end, start),
-          });
-        result.push({ type: "mention", kind: "literal", elementId: randomUUID(), literal });
-        end = start + literal.length;
-      }
-      if (end === 0) return [element];
-      if (end < element.text.length)
-        result.push({ type: "text", elementId: randomUUID(), text: element.text.slice(end) });
-      return result;
-    });
 
   const insertAtomicElement = (
     element: Exclude<TurnComposerElementSnapshot, { readonly type: "text" }>,
@@ -921,7 +889,7 @@ export async function createTurnComposer(options: {
       const previousText = text;
       const previousRevision = revision;
       const previousUndoStack = [...undoStack];
-      elements = promoteLiteralMentions(nextElements);
+      elements = nextElements;
       text = literalText();
       pushUndo({ previousElements });
       revision += 1;
@@ -1447,7 +1415,6 @@ export async function createTurnComposer(options: {
       if (closed || sealed) {
         throw new TurnComposerError("failed", "The turn composer cannot be sealed.");
       }
-      elements = promoteLiteralMentions(elements, true);
       text = literalText();
       sealed = true;
       publish();
@@ -1751,7 +1718,6 @@ export async function createTurnComposer(options: {
         const previousUndoStack = [...undoStack];
         text = nextText;
         replaceAggregateText(nextText);
-        elements = promoteLiteralMentions(elements);
         text = literalText();
         undoStack.length = 0;
         revision += 1;
@@ -1827,6 +1793,7 @@ export async function createTurnComposer(options: {
         renderedText: renderedText(),
         revision,
         sealed,
+        canUndo: !sealed && undoStack.length > 0,
         resources: [...resources.values()]
           .filter((resource) => resource.state !== "removed")
           .map(

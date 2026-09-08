@@ -16,7 +16,7 @@ test("custom task budgets validate explicit amounts and persist the exact grant"
     },
   });
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect a custom grant.\r", "Delegation");
     await h.press("\x1b[B\x1b[B\x1b[B\r", "Execution and limits");
@@ -59,7 +59,7 @@ test("direct delegation reviews finite execution and token bounds before one exa
     },
   });
   try {
-    await h.press("@Explore", "A · Explore");
+    await h.press("@Explore", "New agent · Explore");
     await h.press("\t", "@Explore");
     await h.press(" Inspect bounded evidence", "Inspect bounded evidence");
     await h.press("\r", "Execution and limits");
@@ -190,7 +190,7 @@ test.each([40, 80, 120])(
       { columns },
     );
     try {
-      await h.press("@Explore", columns === 40 ? "A @Explore" : "A · Explore");
+      await h.press("@Explore", columns === 40 ? "New agent @Explore" : "New agent · Explore");
       await h.press("\t", "@Explore");
       await h.press(" Inspect bounds", "Inspect bounds");
       await h.press("\r", "Delegation");
@@ -274,7 +274,7 @@ test.each([
     );
     try {
       if (source === "direct") {
-        await h.press("@Explore", "A · Explore");
+        await h.press("@Explore", "New agent · Explore");
         await h.press("\t", "@Explore");
         await h.press(" Inspect evidence with $requested", "Inspect requested evidence.");
         await h.press("\t", "$requested");
