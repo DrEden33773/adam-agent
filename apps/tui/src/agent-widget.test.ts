@@ -295,3 +295,60 @@ test.each([
     widget.dispose();
   }
 });
+
+test("Widget animation redraws while linger expiration separately changes membership", () => {
+  const timers = new Map<object, { milliseconds: number; fire: () => void }>();
+  let animations = 0;
+  let changes = 0;
+  const widget = new AgentWidget(createAdamTuiTheme(true), () => 12, {
+    scheduler: {
+      schedule(milliseconds, fire) {
+        const key = {};
+        timers.set(key, { milliseconds, fire });
+        return {
+          cancel() {
+            timers.delete(key);
+          },
+        };
+      },
+    },
+    onAnimation: () => {
+      animations += 1;
+    },
+    onChange: () => {
+      changes += 1;
+    },
+  });
+  const thread = agentViewThread();
+  const snapshot: ManagedWorkspaceSnapshot = {
+    parentSessionId: "parent",
+    revision: 1,
+    status: "ready",
+    completions: [],
+    threads: [thread],
+  };
+  try {
+    widget.setSnapshot(snapshot);
+    const before = widget.render(80);
+    const animation = [...timers.values()].find((timer) => timer.milliseconds === 80);
+    expect(animation).toBeDefined();
+    animation?.fire();
+    expect(widget.render(80)).not.toEqual(before);
+    expect(animations).toBe(1);
+    expect(changes).toBe(0);
+    widget.setSnapshot({
+      ...snapshot,
+      threads: [{ ...thread, turn: { ...thread.turn, phase: "idle", label: "Completed" } }],
+    });
+    expect(widget.visibleThreads()).toHaveLength(1);
+    const linger = [...timers.values()].find((timer) => timer.milliseconds === 4000);
+    expect(linger).toBeDefined();
+    linger?.fire();
+    expect(widget.visibleThreads()).toHaveLength(0);
+    expect(widget.render(80)).toEqual([]);
+    expect(changes).toBe(1);
+    expect([...timers.values()]).toEqual([]);
+  } finally {
+    widget.dispose();
+  }
+});

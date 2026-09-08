@@ -1936,7 +1936,7 @@ test("40×12 child composer visibly distinguishes Accepted from Delivered across
 });
 
 test.each([false, true])(
-  "Fleet reconciles expired selection and retains the open viewer row (viewer=%s)",
+  "Fleet expires selection independently of the open viewer and mode refresh (viewer=%s)",
   async (openViewer) => {
     const firstFinish = Promise.withResolvers<void>();
     const started = Promise.withResolvers<void>();
@@ -1993,7 +1993,12 @@ test.each([false, true])(
       ).toMatchObject({ status: "admitted" });
       await started.promise;
       await h.press("\u001b[B", "Fleet");
-      await h.press("\u001b[B", "● @explore-1");
+      const inputOffset = h.terminal.output().length;
+      h.terminal.input("\u001b[B");
+      // Pi's input frame must run on the next-tick path without waiting for a render timer.
+      await new Promise<void>((resolve) => process.nextTick(resolve));
+      expect(h.terminal.output().slice(inputOffset)).toContain("@explore-1");
+      expect(h.terminal.lines().join("\n")).toContain("● @explore-1");
       if (openViewer) await h.press("\r", "Conversation");
       const first = h.presentation.getState().authoritative.managedControl?.threads[0];
       if (first === undefined) throw new Error("Missing selected thread");
@@ -2018,7 +2023,9 @@ test.each([false, true])(
         return lines.slice(lines.findIndex((line) => line.startsWith("Fleet"))).join("\n");
       };
       if (openViewer) {
-        expect(fleet()).toContain("● @explore-1");
+        expect(fleet()).not.toContain("@explore-1");
+        await h.press("m", "Conversation");
+        expect(fleet()).not.toContain("@explore-1");
         await h.press("\u001b[27u", "● Main");
       }
       expect(fleet()).toContain("● Main");

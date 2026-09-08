@@ -49,6 +49,7 @@ export class AgentWidget implements Component {
       readonly settings?: () => AgentUiSettings;
       readonly scheduler?: DeadlineScheduler;
       readonly onChange?: () => void;
+      readonly onAnimation?: () => void;
     } = {},
   ) {}
   setSnapshot(snapshot: ManagedWorkspaceSnapshot | undefined): void {
@@ -102,7 +103,7 @@ export class AgentWidget implements Component {
       this.#animation = undefined;
       if (this.#disposed) return;
       this.#frame = (this.#frame + 1) % 10;
-      this.options.onChange?.();
+      this.options.onAnimation?.();
       this.synchronizeAnimation();
     });
   }
