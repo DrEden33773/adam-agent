@@ -1672,11 +1672,12 @@ test("Kitty Ctrl+O repeat and release phases expand one tool card only once", as
     await fixture.waitForRecordedOutput("Read complete.");
     const beforeToolView = fixture.output().length;
     fixture.write("\u001b[5~");
-    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeToolView);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("read README.md · Ctrl+O expand");
+    await fixture.waitForCompleteFrameAfter("read README.md · Ctrl+O expand", beforeToolView);
     const beforeToggle = fixture.output().length;
-    fixture.write("\u001b[111;5:1u\u001b[111;5:2u\u001b[111;5:2u\u001b[111;5:3ux");
-    await fixture.waitForRecordedOutput("x", beforeToggle);
+    fixture.write(
+      "\u001b[111;5:1u\u001b[111;5:2u\u001b[111;5:2u\u001b[111;5:3uKITTY_PHASES_PROCESSED",
+    );
+    await fixture.waitForCompleteFrameAfter("KITTY_PHASES_PROCESSED", beforeToggle);
     const screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("read README.md · Ctrl+O fold");
     fixture.write("\u0015\u0011");
