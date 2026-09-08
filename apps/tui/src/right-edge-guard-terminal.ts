@@ -10,9 +10,11 @@ import type { Terminal } from "@earendil-works/pi-tui";
  */
 export class RightEdgeGuardTerminal implements Terminal {
   readonly #terminal: Terminal;
+  readonly #mapInput: (data: string) => string;
 
-  constructor(terminal: Terminal) {
+  constructor(terminal: Terminal, mapInput: (data: string) => string = (data) => data) {
     this.#terminal = terminal;
+    this.#mapInput = mapInput;
   }
 
   get columns(): number {
@@ -28,7 +30,7 @@ export class RightEdgeGuardTerminal implements Terminal {
   }
 
   start(onInput: (data: string) => void, onResize: () => void): void {
-    this.#terminal.start(onInput, onResize);
+    this.#terminal.start((data) => onInput(this.#mapInput(data)), onResize);
   }
 
   stop(): void {

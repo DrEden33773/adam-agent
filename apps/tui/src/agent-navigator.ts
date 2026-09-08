@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { artifactPageRange } from "./artifact-navigator.js";
+import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { reasoningFoldTitle } from "./reasoning-fold.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { type SearchableSelectItem, SearchableSelectList } from "./searchable-select-list.js";
@@ -31,8 +32,12 @@ type ManagedAgentActivity = NonNullable<PresentationDisplayState["managedAgentAc
 export class AgentNavigator implements Component {
   #activity: ManagedAgentActivity = [];
   #artifactGeneration = 0;
-  #artifactView: { readonly artifact: ArtifactReference; readonly chunk: ArtifactChunk } | null =
-    null;
+  #artifactView: {
+    readonly artifact: ArtifactReference;
+    readonly chunk: ArtifactChunk;
+    scrollTop: number;
+    maximumScroll: number;
+  } | null = null;
   #managedAgents: ManagedAgents;
   readonly #maximumContentHeight: () => number;
   readonly #onCancel: (input: {
@@ -41,9 +46,6 @@ export class AgentNavigator implements Component {
   }) => void;
   readonly #onChange: () => void;
   readonly #onClose: () => void;
-  readonly #onFollowUp:
-    | ((input: { readonly agentId: string; readonly expectedRevision: number }) => void)
-    | undefined;
   readonly #onMessage:
     | ((input: { readonly agentId: string; readonly expectedRevision: number }) => void)
     | undefined;
@@ -94,10 +96,6 @@ export class AgentNavigator implements Component {
     }) => void;
     readonly onChange: () => void;
     readonly onClose: () => void;
-    readonly onFollowUp?: (input: {
-      readonly agentId: string;
-      readonly expectedRevision: number;
-    }) => void;
     readonly onMessage?: (input: {
       readonly agentId: string;
       readonly expectedRevision: number;
@@ -133,7 +131,6 @@ export class AgentNavigator implements Component {
     this.#onCancel = options.onCancel;
     this.#onChange = options.onChange;
     this.#onClose = options.onClose;
-    this.#onFollowUp = options.onFollowUp;
     this.#onMessage = options.onMessage;
     this.#onReadArtifact = options.onReadArtifact;
     this.#onReadTranscript = options.onReadTranscript;
@@ -168,6 +165,16 @@ export class AgentNavigator implements Component {
   }
 
   handleInput(data: string): void {
+    const wheel = focusedWheelDirection(data);
+    if (wheel !== null) {
+      if (this.#detail === null) {
+        this.#list.handleInput(wheel < 0 ? "\u001b[A" : "\u001b[B");
+      } else {
+        this.#scrollViewport(wheel * 3);
+      }
+      this.#onChange();
+      return;
+    }
     if (this.#artifactView !== null && getKeybindings().matches(data, "tui.select.cancel")) {
       this.#artifactGeneration += 1;
       this.#artifactView = null;
@@ -186,7 +193,7 @@ export class AgentNavigator implements Component {
     if (this.#detail !== null) {
       if (
         (isKeyRepeat(data) || isKeyRelease(data)) &&
-        (["a", "m", "f", "r", "c"] as const).some((key) => matchesKey(data, key))
+        (["a", "m", "r", "c"] as const).some((key) => matchesKey(data, key))
       ) {
         return;
       }
@@ -194,26 +201,24 @@ export class AgentNavigator implements Component {
         this.#cancelConfirmation = null;
       }
       if (getKeybindings().matches(data, "tui.select.up")) {
-        this.#transcriptFollowingTail = false;
-        this.#transcriptScrollTop = Math.max(0, this.#transcriptScrollTop - 1);
+        this.#scrollViewport(-1);
         this.#onChange();
         return;
       }
       if (getKeybindings().matches(data, "tui.select.down")) {
-        this.#transcriptScrollTop = Math.min(
-          this.#transcriptMaximumScroll,
-          this.#transcriptScrollTop + 1,
-        );
-        this.#transcriptFollowingTail = this.#transcriptScrollTop === this.#transcriptMaximumScroll;
+        this.#scrollViewport(1);
         this.#onChange();
         return;
       }
       if (getKeybindings().matches(data, "tui.select.pageUp")) {
-        if (this.#transcriptScrollTop === 0 && this.#transcript?.olderCursor !== null) {
+        if (
+          this.#artifactView === null &&
+          this.#transcriptScrollTop === 0 &&
+          this.#transcript?.olderCursor !== null
+        ) {
           void this.#loadTranscript(this.#transcript?.olderCursor ?? null);
         } else {
-          this.#transcriptFollowingTail = false;
-          this.#transcriptScrollTop = Math.max(0, this.#transcriptScrollTop - 5);
+          this.#scrollViewport(-5);
           this.#onChange();
         }
         return;
@@ -223,11 +228,7 @@ export class AgentNavigator implements Component {
           void this.#loadArtifact(this.#artifactView.artifact, this.#artifactView.chunk.nextRange);
           return;
         }
-        this.#transcriptScrollTop = Math.min(
-          this.#transcriptMaximumScroll,
-          this.#transcriptScrollTop + 5,
-        );
-        this.#transcriptFollowingTail = this.#transcriptScrollTop === this.#transcriptMaximumScroll;
+        this.#scrollViewport(5);
         this.#onChange();
         return;
       }
@@ -245,13 +246,6 @@ export class AgentNavigator implements Component {
         this.#onMessage !== undefined
       ) {
         this.#onMessage({
-          agentId: this.#detail.agentId,
-          expectedRevision: this.#detail.revision,
-        });
-        return;
-      }
-      if (matchesKey(data, "f") && canFollowUp(this.#detail) && this.#onFollowUp !== undefined) {
-        this.#onFollowUp({
           agentId: this.#detail.agentId,
           expectedRevision: this.#detail.revision,
         });
@@ -390,9 +384,6 @@ export class AgentNavigator implements Component {
             ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
               ? [this.#theme.statusWarning("Press c again to stop this exact child")]
               : []),
-            ...(canFollowUp(detail) && this.#onFollowUp !== undefined
-              ? [this.#theme.muted("f follow-up from exact terminal evidence")]
-              : []),
             ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
               ? [this.#theme.muted("r recover from exact durable evidence")]
               : []),
@@ -449,7 +440,6 @@ export class AgentNavigator implements Component {
         this.#theme.muted(
           compactAgentActions(detail, this.#cancelConfirmation, {
             artifact: hasArtifact && this.#onReadArtifact !== undefined,
-            followUp: this.#onFollowUp !== undefined,
             message: this.#onMessage !== undefined,
             recovery: this.#onRecovery !== undefined,
           }),
@@ -555,7 +545,7 @@ export class AgentNavigator implements Component {
         this.#detail.revision !== detail.revision ||
         this.#detail.transcript.throughSequence !== detail.transcript.throughSequence;
       if (!stale) {
-        this.#artifactView = { artifact, chunk };
+        this.#artifactView = { artifact, chunk, scrollTop: 0, maximumScroll: 0 };
         this.#transcriptNotice = null;
       }
     } catch (error) {
@@ -572,13 +562,31 @@ export class AgentNavigator implements Component {
     if (view === null) {
       return [];
     }
-    return [
+    const lines = [
       `${safeTerminalText(view.artifact.mediaType)} · bytes ${view.chunk.offset}-${view.chunk.offset + view.chunk.byteCount}/${view.chunk.totalByteCount}`,
       ...safeTerminalText(view.chunk.text).split("\n"),
       ...(view.chunk.nextRange === null ? [] : ["PageDown next artifact page"]),
-    ]
-      .slice(0, Math.max(1, maximumVisible))
+    ];
+    const height = Math.max(1, maximumVisible);
+    view.maximumScroll = Math.max(0, lines.length - height);
+    view.scrollTop = Math.min(view.scrollTop, view.maximumScroll);
+    return lines
+      .slice(view.scrollTop, view.scrollTop + height)
       .map((line) => boundedLine(line, width));
+  }
+
+  #scrollViewport(delta: number): void {
+    if (this.#artifactView !== null) {
+      const view = this.#artifactView;
+      view.scrollTop = Math.max(0, Math.min(view.maximumScroll, view.scrollTop + delta));
+      return;
+    }
+    this.#transcriptScrollTop = Math.max(
+      0,
+      Math.min(this.#transcriptMaximumScroll, this.#transcriptScrollTop + delta),
+    );
+    this.#transcriptFollowingTail =
+      delta > 0 && this.#transcriptScrollTop === this.#transcriptMaximumScroll;
   }
 
   #renderTranscriptLines(width: number, maximumVisible = 5): string[] {
@@ -765,10 +773,6 @@ function isActiveManagedAgent(agent: ManagedAgent): boolean {
   );
 }
 
-function canFollowUp(agent: ManagedAgent): boolean {
-  return agent.status === "completed" || agent.status === "failed" || agent.status === "cancelled";
-}
-
 function managedResultLines(agent: ManagedAgent): string[] {
   if (agent.result === undefined) {
     return [];
@@ -800,7 +804,6 @@ function compactAgentActions(
   confirmation: string | null,
   available: {
     readonly artifact: boolean;
-    readonly followUp: boolean;
     readonly message: boolean;
     readonly recovery: boolean;
   },
@@ -821,7 +824,6 @@ function compactAgentActions(
     ].join(" · ");
   }
   return [
-    ...(canFollowUp(agent) && available.followUp ? ["f follow-up"] : []),
     ...(agent.status === "recovery_required" && available.recovery ? ["r recover"] : []),
     ...(available.artifact ? ["a artifact"] : []),
     "↑↓ scroll",

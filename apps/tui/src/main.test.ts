@@ -46,7 +46,10 @@ import {
   outputAfterFinalAltScreenExit,
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
-import { VirtualTerminal } from "./virtual-terminal.test-support.js";
+import {
+  terminalObservationTimeoutMilliseconds,
+  VirtualTerminal,
+} from "./virtual-terminal.test-support.js";
 
 test("cold search interruption exposes recovery and accepts Main input after explicit resume", () =>
   exerciseColdParentRecovery("search_repository", "resume"));
@@ -99,6 +102,7 @@ async function exerciseColdParentRecovery(
   };
   const recovering = Promise.withResolvers<void>();
   const releaseRecovery = Promise.withResolvers<void>();
+  const releaseMainFinish = Promise.withResolvers<void>();
   let calls = 0;
   const modelTargets: ModelTargets = {
     async resolve() {
@@ -132,6 +136,7 @@ async function exerciseColdParentRecovery(
                     ? "Ordinary Main prompt completed."
                     : "Safe search recovered.",
               };
+              if (request.messages.at(-1)?.role === "user") await releaseMainFinish.promise;
               yield { type: "finish", reason: "stop" };
             }
           },
@@ -284,11 +289,40 @@ async function exerciseColdParentRecovery(
       editor: "ready",
     });
     unsubscribe();
-    terminal.input("Ordinary Main prompt\r");
-    await terminal.waitForFrameAfter("Ordinary Main prompt completed.", 0);
-    expect(calls).toBe(action === "resume" ? 4 : 3);
-    expect((await lifecycle.inspect({ sessionId: created.sessionId })).status).toBe("settled");
+    const mainSettled = Promise.withResolvers<void>();
+    let mainRunId: string | undefined;
+    const unsubscribeMain = lifecycle.subscribeSessionEvents((notification) => {
+      if (notification.sessionId !== created.sessionId) return;
+      if (
+        notification.event.type === "user_message" &&
+        notification.event.text === "Ordinary Main prompt"
+      )
+        mainRunId = notification.runId;
+      if (notification.runId === mainRunId && notification.event.type === "session_settled")
+        mainSettled.resolve();
+    });
+    const settlementGuard = setTimeout(
+      () => mainSettled.reject(new Error("The exact ordinary Main run did not settle.")),
+      terminalObservationTimeoutMilliseconds,
+    );
+    const beforeMain = terminal.output().length;
+    try {
+      terminal.input("Ordinary Main prompt\r");
+      // Rendered output precedes provider finish and cannot prove durable settlement.
+      await Promise.all([
+        terminal.waitForFrameAfter("Ordinary Main prompt completed.", beforeMain).then(() => {
+          releaseMainFinish.resolve();
+        }),
+        mainSettled.promise,
+      ]);
+      expect(calls).toBe(action === "resume" ? 4 : 3);
+      expect((await lifecycle.inspect({ sessionId: created.sessionId })).status).toBe("settled");
+    } finally {
+      clearTimeout(settlementGuard);
+      unsubscribeMain();
+    }
   } finally {
+    releaseMainFinish.resolve();
     releaseRecovery.resolve();
     if (terminal.running()) terminal.input("\u0011");
     await running;
@@ -385,7 +419,7 @@ test("/agents replies through one exact attention barrier without starting a par
     await fixture.waitForRecordedOutput("Which exact fixture source should I use?");
     fixture.write("r");
     await fixture.waitForRecordedOutput(
-      "Enter one bounded reply for the exact managed-child attention request.",
+      "Enter one bounded reply for the exact managed-child attention request",
     );
     fixture.write("Use the immutable fixture source.\r");
     const replyPath = join(controlRoot, "managed-attention-reply");
@@ -432,54 +466,6 @@ test("active-run /agents opens the live managed overlay without ending the paren
     expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · running");
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
     await fixture.waitForRecordedOutput("Managed active parent completed.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("terminal managed follow-up restores responsive editor input before admission", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-follow-up-input-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-active",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one terminal managed child.\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-    await fixture.waitForRecordedOutput("Agents 0 active/1 terminal");
-
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
-    fixture.write("\r");
-    await fixture.waitForRecordedOutput("f follow-up from exact terminal evidence");
-    fixture.write("\u001b[102;1:1u");
-    fixture.write("\u001b[102;1:2u");
-    fixture.write("\u001b[102;1:3u");
-    await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain(
-      "Follow-up task · add tokens: /budget-add <tokens> <task>",
-    );
-
-    const beforeDraft = fixture.output().length;
-    fixture.write("Preserve exact follow-up evidence.");
-    await fixture.resize(82, 24);
-    expect(fixture.output().slice(beforeDraft)).toContain("Preserve exact follow-up evidence.");
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("fPreserve exact follow-up evidence.");
-
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -7802,13 +7788,13 @@ test("the real TUI opens inline project path completion from the at trigger", as
     await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
     const frame = fixture.output().slice(beforeCompletion);
     let screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+F · \.\//u);
-    expect(screen).toMatch(/@alpha\.ts\s+F · src\//u);
+    expect(screen).toMatch(/@README\.md\s+\[File\] README\.md/u);
+    expect(screen).toMatch(/@alpha\.ts\s+\[File\] src\/alpha\.ts/u);
 
     await fixture.resize(120, 40);
     screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+F · \.\//u);
-    expect(screen).toMatch(/@alpha\.ts\s+F · src\//u);
+    expect(screen).toMatch(/@README\.md\s+\[File\] README\.md/u);
+    expect(screen).toMatch(/@alpha\.ts\s+\[File\] src\/alpha\.ts/u);
 
     await fixture.resize(40, 12);
     screen = fixture.screen()?.join("\n") ?? "";

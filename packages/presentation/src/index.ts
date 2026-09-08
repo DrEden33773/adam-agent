@@ -909,6 +909,7 @@ export type DraftTextDocumentPart =
 
 export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
+  readonly canUndo: boolean;
   readonly draftRevision: number;
   readonly elements: readonly (
     | DraftMentionElement

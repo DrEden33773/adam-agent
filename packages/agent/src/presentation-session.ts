@@ -677,6 +677,7 @@ export async function createPresentationSession(
             },
       composer: {
         attachmentAvailable,
+        canUndo: false,
         draftRevision: 0,
         elements: [],
         renderedText: "",
@@ -951,6 +952,7 @@ export async function createPresentationSession(
     ): PresentationDisplayState["composer"] => {
       const snapshot = turnComposer?.snapshot() ?? {
         sealed: false,
+        canUndo: false,
         resources: [],
         pastedTexts: [],
       };
@@ -960,6 +962,7 @@ export async function createPresentationSession(
           : skillCatalogOverride;
       return {
         attachmentAvailable,
+        canUndo: snapshot.canUndo,
         draftRevision: snapshot.revision,
         elements: snapshot.elements.map((element) =>
           element.type === "skill"

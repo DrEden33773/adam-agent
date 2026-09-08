@@ -353,20 +353,22 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
   const agent = managedAgentFixture({
     transcript: { childSessionId: "child-surface", throughSequence: 4 },
   });
+  const artifactText = `Bounded artifact.\n${Array.from({ length: 20 }, (_, index) => `artifact-row-${index}`).join("\n")}`;
+  const byteCount = Buffer.byteLength(artifactText, "utf8");
   const artifact = {
     id: "sha256:managed-tool-artifact",
     mediaType: "text/plain",
-    byteCount: 18,
+    byteCount,
     source: "tool_output" as const,
   };
   const onReadArtifact = vi.fn().mockResolvedValue({
     mediaType: "text/plain",
     offset: 0,
-    byteCount: 18,
-    totalByteCount: 18,
+    byteCount,
+    totalByteCount: byteCount,
     eof: true,
     nextRange: null,
-    text: "Bounded artifact.\n",
+    text: artifactText,
   });
   const onReadTranscript = vi.fn().mockResolvedValue({
     type: "managed_agent_transcript_page",
@@ -454,6 +456,17 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
     artifact,
     range: { offset: 0, maximumBytes: 16 * 1024 },
   });
+  navigator.handleInput("\u001b[<65;40;12M");
+  const scrolled = navigator.render(120).join("\n");
+  expect(scrolled).toContain("Artifact · read-only");
+  expect(scrolled).toContain("artifact-row-1");
+  expect(scrolled).not.toContain("Bounded artifact.");
+  navigator.handleInput("\u001b[A");
+  expect(navigator.render(120).join("\n")).toContain("artifact-row-0");
+  navigator.handleInput("\u001b[<64;40;12M");
+  expect(navigator.render(120).join("\n")).toContain("Bounded artifact.");
+  navigator.handleInput("\u001b");
+  expect(navigator.render(120).join("\n")).toContain("tool preview line");
 });
 
 test("AgentNavigator discards a late artifact page when the selected agent attempt changes", async () => {
@@ -584,7 +597,7 @@ test("a stalled Agent detail offers an exact ordinary message with safe-boundary
   expect(onMessage).toHaveBeenCalledWith({ agentId: agent.agentId, expectedRevision: 1 });
 });
 
-test("terminal Agent details expose exact follow-up and recovery intents only for eligible states", () => {
+test("terminal Agent details ignore removed follow-up input and retain eligible recovery", () => {
   const completed = managedAgentFixture({ status: "completed", phase: "terminal", revision: 6 });
   const recovery = managedAgentFixture({
     agentId: "123e4567-e89b-42d3-a456-426614174231",
@@ -592,7 +605,6 @@ test("terminal Agent details expose exact follow-up and recovery intents only fo
     phase: "terminal",
     revision: 8,
   });
-  const onFollowUp = vi.fn();
   const onRecovery = vi.fn();
   const navigator = new AgentNavigator({
     managedAgents: {
@@ -602,19 +614,16 @@ test("terminal Agent details expose exact follow-up and recovery intents only fo
     onCancel: vi.fn(),
     onChange: vi.fn(),
     onClose: vi.fn(),
-    onFollowUp,
     onRecovery,
     onReply: vi.fn(),
     theme: createAdamTuiTheme(true),
   });
 
   navigator.handleInput("\r");
-  expect(navigator.render(80).join("\n")).toContain("f follow-up from exact terminal evidence");
+  const completedFrame = navigator.render(80).join("\n");
+  expect(completedFrame).not.toContain("f follow-up");
   navigator.handleInput("f");
-  expect(onFollowUp).toHaveBeenCalledWith({
-    agentId: completed.agentId,
-    expectedRevision: completed.revision,
-  });
+  expect(navigator.render(80).join("\n")).toBe(completedFrame);
   navigator.handleInput("\u001b[27;1;27~");
   navigator.handleInput("\u001b[B");
   navigator.handleInput("\r");
@@ -837,7 +846,6 @@ test.each(["running", "completed", "recovery_required", "waiting_for_parent"] as
       managedAgents: { counts: { active: 0, terminal: 1, attention: 0 }, agents: [agent] },
       onCancel: onAction,
       onReply: onAction,
-      onFollowUp: onAction,
       onRecovery: onAction,
       onMessage: onAction,
       onChange: () => {},
@@ -854,3 +862,30 @@ test.each(["running", "completed", "recovery_required", "waiting_for_parent"] as
     expect(onAction).not.toHaveBeenCalled();
   },
 );
+
+test("SGR wheel changes the selected agent without inserting search text", () => {
+  const first = managedAgentFixture({ agentId: "first-agent" });
+  const second = managedAgentFixture({ agentId: "second-agent" });
+  let closed = false;
+  const navigator = new AgentNavigator({
+    managedAgents: { counts: { active: 2, terminal: 0, attention: 0 }, agents: [first, second] },
+    onCancel() {},
+    onChange() {},
+    onClose() {
+      closed = true;
+    },
+    onReply() {},
+    theme: createAdamTuiTheme(true),
+  });
+  navigator.render(80);
+  navigator.handleInput("\u001b[<65;40;12M");
+  navigator.handleInput("\r");
+  expect(navigator.render(80).join("\n")).toContain("Agent second-agent");
+  navigator.handleInput("\u001b");
+  navigator.handleInput("\u001b[<64;40;12M");
+  navigator.handleInput("\r");
+  expect(navigator.render(80).join("\n")).toContain("Agent first-agent");
+  navigator.handleInput("\u001b");
+  navigator.handleInput("\u001b");
+  expect(closed).toBe(true);
+});
