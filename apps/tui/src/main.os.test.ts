@@ -2271,52 +2271,76 @@ test("production Main permission preempts and restores the exact child composer 
     stateRoot,
     controlRoot,
   });
+  let completed = false;
+  let waiting = "New session";
   try {
     await fixture.waitForScreen("Adam · New session");
+    const initialRunOffset = fixture.output().length;
     fixture.write("Start child\r");
+    waiting = "Confirm delegation";
     await fixture.waitForScreen("Confirm delegation");
     fixture.write("\r");
+    waiting = "MAIN_READY";
     await fixture.waitForScreen("MAIN_READY");
+    waiting = "child-started file";
     await waitForFileContents(join(controlRoot, "child-started"), "started\n");
+    // Streaming text and child dispatch do not settle the Main run.
+    waiting = "Main idle after initial run";
+    await fixture.waitForCompleteFrameAfter("provider reported · idle", initialRunOffset);
     fixture.write("Trigger Main permission\r");
+    waiting = "main-permission-ready file";
     await waitForFileContents(join(controlRoot, "main-permission-ready"), "ready\n");
     let offset = fixture.output().length;
     fixture.write("/agents\r");
+    waiting = "Agents workspace";
     await fixture.waitForCompleteFrameAfter("Agents workspace", offset);
     offset = fixture.output().length;
     fixture.write("\r");
+    waiting = "Conversation";
     await fixture.waitForCompleteFrameAfter("Conversation", offset);
     offset = fixture.output().length;
     fixture.write("\r");
+    waiting = "Child composer";
     await fixture.waitForCompleteFrameAfter("Cooperative", offset);
     offset = fixture.output().length;
     fixture.write("Kept private child draft");
+    waiting = "Child draft rendered";
     await fixture.waitForCompleteFrameAfter("Kept private child draft", offset);
     offset = fixture.output().length;
     await writeFile(join(controlRoot, "release-main-permission"), "release\n");
+    waiting = "Main permission overlay";
     await fixture.waitForCompleteFrameAfter("Permission required", offset);
     expect(fixture.screen()?.join("\n")).toContain("main-permission.txt");
     await expect(stat(join(workspaceRoot, "main-permission.txt"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+    // The title appears while preview loading still leaves Enter on Deny.
+    waiting = "Main permission Allow enabled";
+    await fixture.waitForCompleteFrameAfter("> Allow", offset, "Loading canonical preview…");
     offset = fixture.output().length;
     fixture.write("\r");
+    waiting = "Restore child draft after Main permission";
     await fixture.waitForCompleteFrameAfter(
       "Kept private child draft",
       offset,
       "Permission required",
     );
+    waiting = "main-permission.txt approved file";
     await waitForFileContents(join(workspaceRoot, "main-permission.txt"), "approved\n");
     offset = fixture.output().length;
     fixture.write(" remains");
+    waiting = "Restored child composer editable";
     await fixture.waitForCompleteFrameAfter("Kept private child draft remains", offset);
     for (const visible of ["Enter compose", "Agents workspace", "↓ navigate"]) {
+      waiting = visible;
       offset = fixture.output().length;
       fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
       await fixture.waitForCompleteFrameAfter(visible, offset);
     }
+    waiting = "MAIN_RESPONDED";
     await fixture.waitForScreen("MAIN_RESPONDED");
     fixture.write("\u0011");
+    waiting = "PTY process close";
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const records = await (
       await createJsonlManagedAgentControlStore({ stateRoot, workspaceRoot })
@@ -2336,7 +2360,12 @@ test("production Main permission preempts and restores the exact child composer 
           : [],
       ),
     ).toEqual(["Start child", "Trigger Main permission"]);
+    completed = true;
   } finally {
+    if (!completed)
+      console.error(
+        `Permission routing failure while waiting for ${waiting}:\n${fixture.screen()?.join("\n")}`,
+      );
     await fixture.cleanup();
     await rm(testRoot, { recursive: true, force: true });
   }

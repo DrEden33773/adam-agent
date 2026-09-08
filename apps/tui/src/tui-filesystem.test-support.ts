@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { observeFilesystemEffect } from "./filesystem-observation.test-support.js";
 import { cleanupActiveTuiFixtures } from "./tui-fixture.test-support.js";
 
-const missingFilesystemEffectFailureMilliseconds = 30_000;
+// Keep missing-effect diagnostics inside the runner deadline, like frame observations.
+const missingFilesystemEffectFailureMilliseconds = 10_000;
 
 export async function removeTuiFixtureRoot(
   path: string,
