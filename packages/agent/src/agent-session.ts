@@ -116,6 +116,7 @@ import {
   loadRepositoryInstructions,
   RepositoryInstructionsError,
 } from "./repository-instructions.js";
+import type { RuntimePhaseDiagnostic } from "./runtime-phase-diagnostics.js";
 import {
   type AgentSessionDurableContext,
   type AgentSessionDurableOutputLimits,
@@ -185,6 +186,7 @@ class InputResourceProjectionError extends Error {
 }
 
 type AgentSessionBaseDependencies = {
+  readonly onPhaseDiagnostic?: (diagnostic: RuntimePhaseDiagnostic) => void;
   readonly artifactStore?: ArtifactStore;
   readonly model: ModelDriver;
   readonly modalityProfile?: ModelModalityProfile;
@@ -231,7 +233,26 @@ export type AgentSessionDependencies = AgentSessionBaseDependencies &
       }
   );
 
+type ToolArgumentObservation = {
+  byteCount: number;
+  fragmentCount: number;
+  firstAt?: number;
+  lastAt?: number;
+  maxGapMilliseconds: number;
+  receptionPublished: boolean;
+};
+
+type AssemblingToolCall = {
+  readonly id: string;
+  readonly name: string;
+  readonly chunks: string[];
+  byteCount: number;
+  lastCodeUnit: number | undefined;
+};
+
 export class AgentSession {
+  readonly #onPhaseDiagnostic: AgentSessionDependencies["onPhaseDiagnostic"];
+  readonly #argumentObservations = new Map<string, ToolArgumentObservation>();
   readonly #runtimeSessionId = randomUUID();
   readonly #listeners = new Set<RuntimeEventListener>();
   readonly #notificationListeners = new Set<RuntimeEventNotificationListener>();
@@ -309,6 +330,7 @@ export class AgentSession {
     | undefined;
 
   constructor(dependencies: AgentSessionDependencies) {
+    this.#onPhaseDiagnostic = dependencies.onPhaseDiagnostic;
     this.#artifactStore = dependencies.artifactStore;
     this.#durableContext = (
       dependencies as AgentSessionDependencies & {
@@ -1067,7 +1089,7 @@ export class AgentSession {
             readonly cacheMissInputTokens?: number;
           }
         | undefined;
-      const assemblingCalls = new Map<string, ToolCall>();
+      const assemblingCalls = new Map<string, AssemblingToolCall>();
       const completedCalls: ToolCall[] = [];
       let activeReasoningModelId: string | undefined;
       let reasoningBlockId: string | undefined;
@@ -1172,8 +1194,17 @@ export class AgentSession {
                 assemblingCalls.set(event.id, {
                   id: event.id,
                   name: event.name,
-                  argumentsJson: "",
+                  chunks: [],
+                  byteCount: 0,
+                  lastCodeUnit: undefined,
                 });
+                if (this.#onPhaseDiagnostic !== undefined)
+                  this.#argumentObservations.set(event.id, {
+                    byteCount: 0,
+                    fragmentCount: 0,
+                    maxGapMilliseconds: 0,
+                    receptionPublished: false,
+                  });
                 this.#pendingToolArguments.set(event.id, event.name);
                 await this.#emit({
                   type: "model_tool_arguments_started",
@@ -1183,33 +1214,68 @@ export class AgentSession {
               }
               break;
             case "tool_call_delta": {
+              const receivedAt =
+                this.#onPhaseDiagnostic === undefined ? undefined : performance.now();
               const call = assemblingCalls.get(event.id);
               if (call === undefined) {
                 protocolError = "The model sent arguments for a tool call that was not started.";
               } else {
-                if (
-                  this.#durableContext !== undefined &&
-                  Buffer.byteLength(call.argumentsJson, "utf8") +
-                    Buffer.byteLength(event.json, "utf8") >
-                    maximumReplayFieldBytes
-                ) {
+                // A high/low surrogate split encodes as four bytes together,
+                // whereas byteLength on the fragments counts two replacements.
+                const first = event.json.charCodeAt(0);
+                const joinedSurrogate =
+                  call.lastCodeUnit !== undefined &&
+                  call.lastCodeUnit >= 0xd800 &&
+                  call.lastCodeUnit <= 0xdbff &&
+                  first >= 0xdc00 &&
+                  first <= 0xdfff;
+                const nextBytes =
+                  call.byteCount +
+                  Buffer.byteLength(event.json, "utf8") -
+                  (joinedSurrogate ? 2 : 0);
+                const observation = this.#argumentObservations.get(event.id);
+                if (observation !== undefined && receivedAt !== undefined) {
+                  const now = receivedAt;
+                  observation.firstAt ??= now;
+                  if (observation.lastAt !== undefined)
+                    observation.maxGapMilliseconds = Math.max(
+                      observation.maxGapMilliseconds,
+                      now - observation.lastAt,
+                    );
+                  observation.lastAt = now;
+                  observation.fragmentCount += 1;
+                  observation.byteCount = nextBytes;
+                }
+                if (this.#durableContext !== undefined && nextBytes > maximumReplayFieldBytes) {
                   replayEnvelopeTooLarge = true;
                   break;
                 }
-                assemblingCalls.set(event.id, {
-                  ...call,
-                  argumentsJson: call.argumentsJson + event.json,
-                });
+                call.byteCount = nextBytes;
+                if (event.json.length > 0) {
+                  call.chunks.push(event.json);
+                  call.lastCodeUnit = event.json.charCodeAt(event.json.length - 1);
+                }
               }
               break;
             }
             case "tool_call_end": {
+              const endedAt = this.#onPhaseDiagnostic === undefined ? undefined : performance.now();
               const call = assemblingCalls.get(event.id);
               if (call === undefined) {
                 protocolError = "The model ended a tool call that was not started.";
               } else {
-                completedCalls.push(call);
+                const argumentsJson = call.chunks.join("");
+                const exactBytes = Buffer.byteLength(argumentsJson, "utf8");
+                const observation = this.#argumentObservations.get(event.id);
+                if (observation !== undefined) observation.byteCount = exactBytes;
+                if (this.#durableContext !== undefined && exactBytes > maximumReplayFieldBytes) {
+                  replayEnvelopeTooLarge = true;
+                  break;
+                }
+                completedCalls.push({ id: call.id, name: call.name, argumentsJson });
                 assemblingCalls.delete(event.id);
+                this.#publishArgumentReception(event.id);
+                this.#observeToolPhase("sdk_end", event.id, endedAt);
                 this.#publish({
                   type: "model_tool_arguments_completed",
                   id: event.id,
@@ -1281,6 +1347,8 @@ export class AgentSession {
             case "finish":
               finishReason = event.reason;
               rawFinishReason = event.rawReason;
+              for (const id of this.#pendingToolArguments.keys())
+                this.#observeToolPhase("provider_finish", id);
               if (this.#pendingToolArguments.size > 0)
                 this.#publish({
                   type: "model_response_processing",
@@ -1496,6 +1564,8 @@ export class AgentSession {
       if (persisted === "replay_envelope_too_large") {
         return this.#settleReplayEnvelopeTooLarge();
       }
+      if (this.#durableContext !== undefined)
+        for (const call of completedCalls) this.#observeToolPhase("response_durable", call.id);
       nextAttemptNumber = 1;
       await this.#emit({ type: "model_message_completed", text: answer });
       if (signal.aborted) {
@@ -4258,9 +4328,48 @@ export class AgentSession {
 
   #settleToolArguments(status: "failed" | "cancelled"): void {
     for (const [id, name] of this.#pendingToolArguments) {
+      this.#publishArgumentReception(id);
       this.#publish({ type: "model_tool_arguments_settled", id, name, status });
     }
     this.#pendingToolArguments.clear();
+    this.#argumentObservations.clear();
+  }
+
+  #publishArgumentReception(id: string): void {
+    const observation = this.#argumentObservations.get(id);
+    if (observation === undefined || observation.receptionPublished) return;
+    observation.receptionPublished = true;
+    if (observation.firstAt !== undefined)
+      this.#observeToolPhase("first_argument", id, observation.firstAt);
+    if (observation.lastAt !== undefined)
+      this.#observeToolPhase("last_argument", id, observation.lastAt);
+  }
+
+  #observeToolPhase(
+    stage: Extract<RuntimePhaseDiagnostic, { readonly toolName: string }>["stage"],
+    id: string,
+    atMilliseconds = performance.now(),
+  ): void {
+    const observation = this.#argumentObservations.get(id);
+    const toolName = this.#pendingToolArguments.get(id);
+    if (
+      observation === undefined ||
+      toolName === undefined ||
+      this.#onPhaseDiagnostic === undefined
+    )
+      return;
+    const diagnostic: RuntimePhaseDiagnostic = {
+      stage,
+      atMilliseconds,
+      sessionId: this.#durableContext?.sessionId ?? null,
+      runId: this.#activeRunId ?? null,
+      callId: id,
+      toolName,
+      byteCount: observation.byteCount,
+      fragmentCount: observation.fragmentCount,
+      maxGapMilliseconds: observation.maxGapMilliseconds,
+    };
+    notifyObserver(() => this.#onPhaseDiagnostic?.(diagnostic));
   }
 
   async #settlePendingReasoningBlock(status: "interrupted" | "failed"): Promise<void> {
@@ -4438,7 +4547,14 @@ export class AgentSession {
   }
 
   #publish(event: RuntimeEvent): void {
-    if (event.type === "tool_requested") this.#pendingToolArguments.delete(event.callId);
+    if (event.type === "model_message_completed" && this.#durableContext === undefined)
+      for (const id of this.#pendingToolArguments.keys())
+        this.#observeToolPhase("response_durable", id);
+    if (event.type === "tool_requested") {
+      this.#observeToolPhase("tool_requested", event.callId);
+      this.#pendingToolArguments.delete(event.callId);
+      this.#argumentObservations.delete(event.callId);
+    }
     for (const listener of this.#listeners) {
       notifyObserver(() => listener(event));
     }
