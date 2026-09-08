@@ -4824,12 +4824,12 @@ test("Ctrl+R recovers only an eligible linked review from durable operation evid
     });
     await fixture.waitForScreen("Adam · New session");
     fixture.write("/review\r");
-    await fixture.waitForRecordedOutput("Ctrl+R recover");
+    await fixture.waitForScreen("Ctrl+R recover");
     const beforeRecovery = fixture.output().length;
     fixture.write("\u0012");
     await waitForPath(join(controlRoot, "operation-recover-submitted"));
     await fixture.waitForCompleteFrameAfter("Completed", beforeRecovery);
-    const frame = latestSynchronizedFrame(fixture.output().slice(beforeRecovery)).join("\n");
+    const frame = fixture.screen()?.join("\n") ?? "";
     expect(frame).toContain("Completed");
     expect(frame).not.toContain("Ctrl+R recover");
     fixture.write("\u0011");

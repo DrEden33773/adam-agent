@@ -940,7 +940,7 @@ test("the production TUI exposes one enabled extension Skill in the first-prompt
   }
 });
 
-test("the production TUI reviews real Git changes through the exact public Eve adapter and survives restart", async () => {
+test("the candidate TUI reviews real Git changes through public Eve and preserves reports and interrupted review across restart", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-eve-registry-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -977,11 +977,11 @@ test("the production TUI reviews real Git changes through the exact public Eve a
   const corePackage = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8"));
   expect(adapterPackage).toMatchObject({
     name: "@eve-reviewer/adam-extension",
-    version: "0.5.0",
-    dependencies: { "@eve-reviewer/core": "0.3.0" },
-    peerDependencies: { "@adam-agent/extension-api": "0.5.0" },
+    version: "0.6.0",
+    dependencies: { "@eve-reviewer/core": "0.4.0" },
+    peerDependencies: { "@adam-agent/extension-api": "0.6.0" },
   });
-  expect(corePackage).toMatchObject({ name: "@eve-reviewer/core", version: "0.3.0" });
+  expect(corePackage).toMatchObject({ name: "@eve-reviewer/core", version: "0.4.0" });
   await mkdir(configDirectory, { recursive: true, mode: 0o700 });
   await chmod(configDirectory, 0o700);
   await writeFile(
@@ -997,11 +997,11 @@ test("the production TUI reviews real Git changes through the exact public Eve a
             { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
             { id: "adam.artifact.publish@1", version: "1.0.0" },
             { id: "adam.storage.records@1", version: "1.0.0" },
-            { id: "adam.managed-session@2", version: "2.0.0" },
+            { id: "adam.managed-review@1", version: "1.0.0" },
           ],
           packageName: "@eve-reviewer/adam-extension",
           packageRoot: adapterRoot,
-          packageVersion: "0.5.0",
+          packageVersion: "0.6.0",
         },
       ],
     }),
@@ -1009,6 +1009,7 @@ test("the production TUI reviews real Git changes through the exact public Eve a
   );
 
   const environment = {
+    ADAM_TEST_CONTROL_REVIEW: "1",
     ADAM_TEST_TERMINAL_PROCESS_MARKER: terminalProcessMarker,
     ADAM_TEST_MODEL_RESPONSE:
       '{"kind":"eve-reviewer.model-review-candidates","schemaVersion":1,"payload":{"candidates":[]}}',
@@ -1043,8 +1044,9 @@ test("the production TUI reviews real Git changes through the exact public Eve a
     await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
     fixture.write("/review\r");
-    await fixture.waitForRecordedOutput("eve-reviewer@0.5.0");
+    await fixture.waitForRecordedOutput("eve-reviewer@0.6.0");
     await fixture.waitForRecordedOutput("Completed");
+    await fixture.waitForScreen("Review · Terminal");
     await fixture.waitForRecordedOutput("Report · eve-reviewer.review-result@1 · application/json");
 
     let beforeResize = fixture.output().length;
@@ -1086,6 +1088,65 @@ test("the production TUI reviews real Git changes through the exact public Eve a
     expect(restartedFrame).toContain("Report · eve-reviewer.review-result@1");
     resumed.write("\u0011");
     await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    await writeFile(join(workspaceRoot, "reviewed.ts"), "export const answer = 3;\n", "utf8");
+    const requestMarker = join(testRoot, "review-requests");
+    const interruptedProgram = {
+      ...program,
+      environment: {
+        ...environment,
+        ADAM_TEST_REVIEW_STREAM: "1",
+        ADAM_TEST_REVIEW_REQUEST_MARKER: requestMarker,
+      },
+    };
+    const interrupted = startFixture({
+      program: interruptedProgram,
+      stateRoot,
+      terminalProcessMarker,
+      workspaceRoot,
+    });
+    await interrupted.waitForScreen("Review · Terminal");
+    await interrupted.resize(120, 40);
+    let offset = interrupted.output().length;
+    interrupted.write("/review\r");
+    await interrupted.waitForCompleteFrameAfter("Review · Running", offset);
+    await waitForFileContents(requestMarker, "request\n");
+    await interrupted.terminate("SIGKILL");
+    await interrupted.closed;
+
+    const recovered = startFixture({
+      program: interruptedProgram,
+      stateRoot,
+      terminalProcessMarker,
+      workspaceRoot,
+    });
+    await recovered.waitForScreen("Recovery required");
+    await recovered.resize(120, 40);
+    await recovered.waitForScreen("Review · Last recorded state: Running");
+    offset = recovered.output().length;
+    recovered.write("\u0012");
+    await recovered.waitForCompleteFrameAfter("Inspection required", offset);
+    expect(await readFile(requestMarker, "utf8")).toBe("request\n");
+    offset = recovered.output().length;
+    recovered.write("/artifacts\r");
+    await recovered.waitForCompleteFrameAfter("Session artifacts", offset);
+    offset = recovered.output().length;
+    recovered.write("\u001b[B");
+    await recovered.waitForCompleteFrameAfter("> Review project changes report", offset);
+    offset = recovered.output().length;
+    recovered.write("\u001b[B");
+    await recovered.waitForCompleteFrameAfter("> Review project changes evidenc", offset);
+    offset = recovered.output().length;
+    recovered.write("\r");
+    await recovered.waitForCompleteFrameAfter("Artifact detail", offset);
+    await recovered.waitForScreen("export const answer = 3");
+    recovered.write("\u0011");
+    const recoveredClose = await recovered.closed;
+    expect(recoveredClose, recoveredClose.stdout.slice(-6000)).toMatchObject({
+      code: 0,
+      signal: null,
+      stderr: "",
+    });
 
     const afterStatus = (
       await execFile("git", ["status", "--porcelain=v1"], { cwd: workspaceRoot })

@@ -12,6 +12,19 @@ export function projectLinkedOperation(snapshot: OperationSnapshot): ProjectedOp
   }
   const base = {
     artifacts: projectOperationArtifacts(snapshot),
+    ...(snapshot.managedReview === undefined
+      ? {}
+      : {
+          managedReview: {
+            reviewRunId: snapshot.managedReview.reviewRunId,
+            ...(snapshot.managedReview.progress === undefined
+              ? {}
+              : { progress: structuredClone(snapshot.managedReview.progress) }),
+            ...(snapshot.managedReview.failure === undefined
+              ? {}
+              : { failure: { ...snapshot.managedReview.failure.error } }),
+          },
+        }),
     operationId: snapshot.operationId,
     origin: snapshot.origin,
     provenance: {

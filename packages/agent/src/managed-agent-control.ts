@@ -3436,6 +3436,7 @@ export function createManagedAgentControl(options: {
           const snapshot = await control.inspect({ parentSessionId: options.parentSessionId });
           if (snapshot.status === "ready" && snapshot.reviewers !== undefined)
             await authorized(async () => {
+              await controlStore.preflight();
               const records = await controlStore.read();
               for (const admission of records) {
                 if (

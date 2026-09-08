@@ -15,6 +15,7 @@ import {
   createWebSearchConfiguration,
   ExtensionConfigurationError,
   type ExtensionContributionSummary,
+  type ExtensionHostOptions,
   loadExtensionConfiguration,
   type ManagedAgentStore,
   ModelTargetError,
@@ -34,7 +35,19 @@ import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 /** Internal candidate entry for conformance. The ordinary production caller never selects it. */
 export const projectRuntimeManagedControl = Symbol("project-runtime-managed-control-testing");
 
+/** External-clock seam for exact consumer deadline conformance; never selected by the CLI. */
+export const projectRuntimeReviewTiming = Symbol("project-runtime-review-timing-testing");
+
 export type ProductionProjectRuntimeOptions = {
+  readonly [projectRuntimeReviewTiming]?: Pick<
+    ExtensionHostOptions,
+    "operationNow" | "operationDeadlineScheduler"
+  > & {
+    readonly review: Pick<
+      NonNullable<ExtensionHostOptions["managedReview"]>,
+      "policy" | "deadlineScheduler"
+    >;
+  };
   readonly [projectRuntimeManagedControl]?: NonNullable<
     Parameters<typeof createSessionLifecycle>[0][typeof sessionManagedControl]
   >;
@@ -144,6 +157,15 @@ export async function createProductionProjectRuntime(
   });
   let lifecycle: ReturnType<typeof createSessionLifecycle> | undefined;
   const host = createExtensionHost({
+    ...(options[projectRuntimeReviewTiming]?.operationNow === undefined
+      ? {}
+      : { operationNow: options[projectRuntimeReviewTiming].operationNow }),
+    ...(options[projectRuntimeReviewTiming]?.operationDeadlineScheduler === undefined
+      ? {}
+      : {
+          operationDeadlineScheduler:
+            options[projectRuntimeReviewTiming].operationDeadlineScheduler,
+        }),
     artifactStore,
     biomeExecution: createBiomeExecutionAdapter(),
     capabilities: [
@@ -173,6 +195,7 @@ export async function createProductionProjectRuntime(
         }
       : {
           managedReview: {
+            ...options[projectRuntimeReviewTiming]?.review,
             async resolveOrigin({ origin, signal }) {
               if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
               try {
