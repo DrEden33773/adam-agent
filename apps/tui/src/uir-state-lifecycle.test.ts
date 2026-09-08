@@ -118,6 +118,7 @@ test("selecting another session clears the old role catalog and reloads the dest
   try {
     expect(h.presentation.getState().agentRoles?.map((role) => role.name)).toContain("Original");
     await writeFile(roleFile, definition("Destination"));
+    const createOffset = h.terminal.output().length;
     expect(
       await h.presentation.dispatch({
         type: "create_session",
@@ -127,7 +128,8 @@ test("selecting another session clears the old role catalog and reloads the dest
     expect(h.presentation.getState().agentRoles?.map((role) => role.name)).not.toContain(
       "Original",
     );
-    await h.press("\x1b", "New session draft");
+    await h.terminal.waitForFrameAfter("Select a project session", createOffset);
+    await h.press("\x1b", "New session draft", "Select a project session");
     await h.press("@Destination", "New agent · Destination evidence.");
     await h.press("\t", "@Destination");
     await h.press(" Inspect evidence.\r", "Delegation");

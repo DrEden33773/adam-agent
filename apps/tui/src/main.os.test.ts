@@ -2273,11 +2273,14 @@ test("production Main permission preempts and restores the exact child composer 
   });
   try {
     await fixture.waitForScreen("Adam · New session");
+    const initialRunOffset = fixture.output().length;
     fixture.write("Start child\r");
     await fixture.waitForScreen("Confirm delegation");
     fixture.write("\r");
     await fixture.waitForScreen("MAIN_READY");
     await waitForFileContents(join(controlRoot, "child-started"), "started\n");
+    // Streaming text and child dispatch do not settle the Main run.
+    await fixture.waitForCompleteFrameAfter("provider reported · idle", initialRunOffset);
     fixture.write("Trigger Main permission\r");
     await waitForFileContents(join(controlRoot, "main-permission-ready"), "ready\n");
     let offset = fixture.output().length;
