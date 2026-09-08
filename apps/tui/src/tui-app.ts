@@ -113,6 +113,7 @@ import { ThinkingPicker } from "./thinking-picker.js";
 import { TodoCompactOverlay } from "./todo-compact-overlay.js";
 import { TodoCompactViewModel } from "./todo-compact-view-model.js";
 import { TodoNavigator } from "./todo-navigator.js";
+import { toolArgumentPhaseLabel } from "./tool-argument-phase.js";
 import { ToolPreview } from "./tool-preview.js";
 import { TranscriptViewport } from "./transcript-viewport.js";
 import { isTuiRunActive } from "./tui-run-state.js";
@@ -2501,7 +2502,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       transcript.addChild(
         new ResponsiveLine(
           theme.toolTitle(
-            `Generating arguments · ${safeTerminalText(state.transient.toolArguments.name)}`,
+            `${toolArgumentPhaseLabel(state.transient.toolArguments.status)} · ${safeTerminalText(state.transient.toolArguments.name)}`,
           ),
         ),
       );
@@ -5076,10 +5077,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return;
       }
       const draftRevision = state.composer.draftRevision;
+      const prepareActionId = showNotice(
+        "progress",
+        `Preparing input for ${first.handle}…`,
+        "until_replaced",
+      );
       void options.presentation
         .dispatch({ type: "direct_agent_input", draftRevision })
         .then((receipt) => {
+          settleNoticeClear(prepareActionId);
           if (receipt.status === "rejected") {
+            editor.disableSubmit = false;
             showNotice("error", receipt.message, "until_edit");
             renderState();
             return;
@@ -5198,9 +5206,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         directTarget,
         selectedThinkingLevel(directTarget),
       );
+      const prepareActionId = showNotice("progress", "Preparing delegation…", "until_replaced");
       void options.presentation
         .dispatch({ type: "direct_delegation", draftRevision, thinkingSelection })
         .then((receipt) => {
+          settleNoticeClear(prepareActionId);
           if (receipt.status === "rejected") {
             if (receipt.code === "stale_interaction") {
               showUnavailableRecipient(first, draftRevision);
@@ -5324,6 +5334,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             },
             onConfirm(selectedEnvelope, context, skills) {
               handle?.hide();
+              const actionId = showNotice("progress", "Admitting agent…", "until_replaced");
+              renderState();
               void options.presentation
                 .dispatch({
                   type: "direct_delegation",
@@ -5335,6 +5347,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                   skills,
                 })
                 .then((result) => {
+                  settleNoticeClear(actionId);
                   if (result.status === "rejected")
                     showNotice("error", result.message, "until_edit");
                   else if (result.draftCleanupFailed)
@@ -6719,11 +6732,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
     }
     editor.disableSubmit = true;
-    showNotice("progress", "Submitting prompt…", "until_replaced");
+    const draftActionId = showNotice("progress", "Submitting prompt…", "until_replaced");
     renderState();
     void draftMutationQueue
       .onIdle()
       .then(() => {
+        settleNoticeClear(draftActionId);
         if (structuredEditorActive) {
           const composer = options.presentation.getState().composer;
           const literalText = composer.elements

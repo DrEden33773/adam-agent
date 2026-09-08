@@ -177,6 +177,10 @@ export class VirtualTerminal implements Terminal {
     return this.#output;
   }
 
+  completeFramesAfter(offset: number): readonly string[] {
+    return this.#frames.filter((frame) => frame.endOffset > offset).map((frame) => frame.text);
+  }
+
   lines(): readonly string[] {
     return this.#viewport.lines();
   }

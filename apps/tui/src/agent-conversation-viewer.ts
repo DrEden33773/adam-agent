@@ -41,6 +41,7 @@ import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import type { AdamTuiTheme } from "./theme.js";
+import { toolArgumentPhaseLabel } from "./tool-argument-phase.js";
 import { ToolPreview } from "./tool-preview.js";
 
 const viewerKeys = {
@@ -1291,12 +1292,16 @@ export class AgentConversationViewer implements Component {
               : []),
           ]),
     ];
+    const argumentPhase =
+      this.#activity?.tool === undefined
+        ? undefined
+        : toolArgumentPhaseLabel(this.#activity.tool.status);
     const header = [
       this.options.theme.primary(`Conversation · ${thread.handle} · ${thread.displayName}`),
       safeTerminalText(thread.description),
       `${thread.turn.label}${agentElapsedLabel(thread)}`,
-      ...(this.#activity?.tool?.status === "generating_arguments"
-        ? [`Generating arguments · ${safeTerminalText(this.#activity.tool.name)}`]
+      ...(argumentPhase !== undefined && this.#activity?.tool !== undefined
+        ? [`${argumentPhase} · ${safeTerminalText(this.#activity.tool.name)}`]
         : []),
       ...(thread.turn.diagnostic === undefined
         ? []

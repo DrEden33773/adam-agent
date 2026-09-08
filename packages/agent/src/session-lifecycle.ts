@@ -5690,7 +5690,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(options[sessionManagedControl] === undefined
             ? {}
             : {
-                agentRoles: await agentRoleCatalog.inspect(),
+                agentRoles: await agentRoleCatalog.reload(),
                 delegationPolicy: resolveFleetPolicy(
                   contextProfile,
                   options[sessionManagedControl].policy,

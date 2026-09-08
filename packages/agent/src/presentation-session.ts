@@ -20,6 +20,7 @@ import type {
   SessionNaming,
   SessionSummary,
   SkillCatalogDisplay,
+  ToolArgumentsDisplay,
   ToolPreviewDisplay,
   TranscriptItem,
 } from "@adam-agent/presentation";
@@ -940,6 +941,7 @@ export async function createPresentationSession(
         return false;
       }
       state = {
+        ...state,
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
@@ -1207,6 +1209,7 @@ export async function createPresentationSession(
       }
       advanceOperationCursor(next.display.operationId, next.throughSequence);
       state = {
+        ...state,
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
@@ -1252,6 +1255,7 @@ export async function createPresentationSession(
       }
       if (active.linkedOperations.length >= 256) {
         state = {
+          ...state,
           revision: state.revision + 1,
           authoritative: {
             ...state.authoritative,
@@ -1294,6 +1298,7 @@ export async function createPresentationSession(
       );
       items.splice(insertionIndex < 0 ? items.length : insertionIndex, 0, link);
       state = {
+        ...state,
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
@@ -1380,6 +1385,7 @@ export async function createPresentationSession(
         const sessionId = active.session.id;
         if (continuity.status === "current") {
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -1412,6 +1418,7 @@ export async function createPresentationSession(
           operationRepairs.delete(projected.display.operationId);
           const latestContinuity = state.authoritative.continuity;
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -1444,6 +1451,7 @@ export async function createPresentationSession(
             return;
           }
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -1488,6 +1496,7 @@ export async function createPresentationSession(
           return;
         }
         state = {
+          ...state,
           revision: state.revision + 1,
           authoritative: {
             ...state.authoritative,
@@ -1600,6 +1609,49 @@ export async function createPresentationSession(
         return { status: "rejected", code: "authority_rejected", message: result.message };
       return undefined;
     };
+    // The canonical message-start sequence distinguishes responses within one Run.
+    // Content is never used as identity during the live-to-durable handoff.
+    let activeModelMessage:
+      | { sessionId: string; runId: string; startedAtSequence: number }
+      | undefined;
+    const durableModelMessageThrough = new Map<string, number>();
+    const consumeDurableModelMessage = (
+      records: readonly SourcedSessionRecord[],
+      items: readonly TranscriptItem[],
+      transient: PresentationDisplayState["transient"],
+    ): PresentationDisplayState["transient"] => {
+      const visibleResponses = new Set(
+        items.flatMap((item) =>
+          item.type === "assistant_message" || item.type === "reasoning_block"
+            ? [`${item.sourceSessionId}:${item.sequence}`]
+            : [],
+        ),
+      );
+      // A durable read can precede queued model_message_started notifications.
+      // Retire its published responses even before a live identity has arrived.
+      for (const { sessionId, entry } of records) {
+        if (
+          entry.schemaVersion !== 3 ||
+          entry.record.type !== "model_response_completed" ||
+          !visibleResponses.has(`${sessionId}:${entry.sequence}`)
+        )
+          continue;
+        const key = `${sessionId}:${entry.record.runId}`;
+        durableModelMessageThrough.set(
+          key,
+          Math.max(durableModelMessageThrough.get(key) ?? 0, entry.sequence),
+        );
+      }
+      const message = activeModelMessage;
+      if (
+        message === undefined ||
+        transient === null ||
+        (durableModelMessageThrough.get(`${message.sessionId}:${message.runId}`) ?? 0) <
+          message.startedAtSequence
+      )
+        return transient;
+      return { ...transient, assistant: null, reasoning: null };
+    };
     let snapshotActivationQueue = Promise.resolve();
     let lastSnapshotActivation =
       created === undefined
@@ -1692,7 +1744,7 @@ export async function createPresentationSession(
       operationRepairs.clear();
       resetOperationCursors(activatedOperations);
       activeSessionThroughSequence = activeSequence;
-      if (snapshot.status === "settled") {
+      if (snapshot.status === "settled" || snapshot.status === "interrupted") {
         settledRuntimeBoundary = {
           sessionId: snapshot.sessionId,
           throughSequence: snapshot.lastSequence,
@@ -1718,6 +1770,16 @@ export async function createPresentationSession(
       ) {
         planRevisionIntent = null;
       }
+      const sameSession = state.authoritative.active?.session.id === snapshot.sessionId;
+      if (!sameSession) {
+        activeModelMessage = undefined;
+        durableModelMessageThrough.clear();
+      }
+      const activatedTransient = consumeDurableModelMessage(
+        activatedRecords,
+        activatedTranscript,
+        sameSession ? state.transient : null,
+      );
       const activatedControl = await options.lifecycle[sessionManagedControl](snapshot.sessionId);
       const activatedControlSnapshot = await activatedControl?.inspect({
         parentSessionId: snapshot.sessionId,
@@ -1727,7 +1789,10 @@ export async function createPresentationSession(
         revision: state.revision + 1,
         ...(activatedControlSnapshot === undefined
           ? {}
-          : { agentRoles: (await activatedControl?.inspectRoles())?.roles ?? [] }),
+          : {
+              agentRoles:
+                (await activatedControl?.inspectRoles({ reload: !sameSession }))?.roles ?? [],
+            }),
         authoritative: {
           ...previousAuthority,
           ...(activatedControlSnapshot === undefined
@@ -1780,7 +1845,7 @@ export async function createPresentationSession(
         transient:
           activeRun === undefined
             ? null
-            : (state.transient ?? { activity: "working", assistant: null, reasoning: null }),
+            : (activatedTransient ?? { activity: "working", assistant: null, reasoning: null }),
       };
       draftTargetIdentity = null;
       await observeManagedControl(snapshot.sessionId);
@@ -1817,6 +1882,7 @@ export async function createPresentationSession(
           return;
         }
         state = {
+          ...state,
           revision: state.revision + 1,
           authoritative: {
             ...state.authoritative,
@@ -1857,6 +1923,7 @@ export async function createPresentationSession(
       advanceSessionCursor(throughSequence);
       const continuity = state.authoritative.continuity;
       state = {
+        ...state,
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
@@ -1898,6 +1965,7 @@ export async function createPresentationSession(
       advanceSessionCursor(Math.max(throughSequence, inspected.lastSequence));
       const continuity = state.authoritative.continuity;
       state = {
+        ...state,
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
@@ -1993,8 +2061,8 @@ export async function createPresentationSession(
         const current = managedAgentActivity.find(
           (activity) => activity.agentId === agentId && activity.attemptId === attemptId,
         );
-        const generatingTool =
-          current?.tool?.status === "generating_arguments" ? current.tool : undefined;
+        const argumentCalls = projectArgumentCalls(current?.argumentCalls ?? [], event);
+        const generatingTool = selectedArgumentCall(argumentCalls);
         let projected = current;
         if (event.type === "model_message_started") {
           projected = {
@@ -2060,35 +2128,62 @@ export async function createPresentationSession(
                   activity: "using_tool",
                   tool: generatingTool,
                 };
-        } else if (
-          event.type === "tool_requested" ||
-          event.type === "tool_started" ||
-          event.type === "model_tool_arguments_started"
-        ) {
+        } else if (isArgumentLifecycleEvent(event)) {
+          const { tool: _previousTool, ...priorActivity } = current ?? {};
           projected = {
+            ...priorActivity,
+            agentId,
+            attemptId,
+            childSessionId,
+            activity: generatingTool === undefined ? "replying" : "using_tool",
+            ...(generatingTool === undefined ? {} : { tool: generatingTool }),
+          };
+        } else if (event.type === "tool_requested" || event.type === "tool_started") {
+          projected = {
+            ...current,
             agentId,
             attemptId,
             childSessionId,
             activity: "using_tool",
             tool: {
-              callId: event.type === "model_tool_arguments_started" ? event.id : event.callId,
+              callId: event.callId,
               name: event.name,
-              status:
-                event.type === "model_tool_arguments_started"
-                  ? "generating_arguments"
-                  : event.type === "tool_started"
-                    ? "running"
-                    : "requested",
+              status: event.type === "tool_started" ? "running" : "requested",
             },
           };
+        } else if (event.type === "model_message_completed") {
+          projected =
+            generatingTool === undefined
+              ? undefined
+              : {
+                  agentId,
+                  attemptId,
+                  childSessionId,
+                  activity: "using_tool",
+                  tool: generatingTool,
+                };
         } else if (
-          event.type === "model_message_completed" ||
           event.type === "tool_completed" ||
           event.type === "tool_failed" ||
-          event.type === "session_settled"
+          event.type === "session_settled" ||
+          event.type === "session_interrupted"
         ) {
-          projected = undefined;
+          projected =
+            generatingTool === undefined
+              ? undefined
+              : {
+                  agentId,
+                  attemptId,
+                  childSessionId,
+                  activity: "using_tool",
+                  tool: generatingTool,
+                };
         }
+        if (
+          projected !== undefined &&
+          (argumentCalls.length > 0 || current?.argumentCalls !== undefined)
+        )
+          projected = { ...projected, argumentCalls };
         if (projected !== current) {
           managedAgentActivity = [
             ...managedAgentActivity.filter(
@@ -2202,15 +2297,42 @@ export async function createPresentationSession(
             )
               return;
             const event = notification.event;
-            if (event.type === "model_tool_arguments_started") {
+            if (
+              notification.throughSequence <=
+                (durableModelMessageThrough.get(
+                  `${notification.sessionId}:${notification.runId}`,
+                ) ?? -1) &&
+              (event.type === "model_message_started" ||
+                event.type === "model_message_delta" ||
+                event.type === "model_reasoning_started" ||
+                event.type === "model_reasoning_updated" ||
+                event.type === "model_reasoning_settled")
+            )
+              return;
+            if (event.type === "model_message_started") {
+              activeModelMessage = {
+                sessionId: notification.sessionId,
+                runId: notification.runId,
+                startedAtSequence: notification.throughSequence,
+              };
+            }
+            if (isArgumentLifecycleEvent(event)) {
+              const argumentCalls = projectArgumentCalls(
+                state.transient?.argumentCalls ?? [],
+                event,
+              );
+              const toolArguments = selectedArgumentCall(argumentCalls);
+              const { toolArguments: _previousTool, ...transient } = state.transient ?? {};
               state = {
                 ...state,
                 revision: state.revision + 1,
                 transient: {
+                  ...transient,
                   activity: "working",
                   assistant: state.transient?.assistant ?? null,
                   reasoning: state.transient?.reasoning ?? null,
-                  toolArguments: { callId: event.id, name: event.name },
+                  argumentCalls,
+                  ...(toolArguments === undefined ? {} : { toolArguments }),
                 },
               };
               publishStateChange();
@@ -2233,6 +2355,7 @@ export async function createPresentationSession(
               | undefined;
             if (event.type === "user_message" || event.type === "model_message_started") {
               state = {
+                ...state,
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
@@ -2241,17 +2364,30 @@ export async function createPresentationSession(
               };
               publishStateChange();
             } else if (event.type === "tool_requested" || event.type === "tool_started") {
+              const argumentCalls = projectArgumentCalls(
+                state.transient?.argumentCalls ?? [],
+                event,
+              );
+              const toolArguments = selectedArgumentCall(argumentCalls);
               state = {
+                ...state,
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
                 composer: state.composer,
-                transient: { activity: "using_tool", assistant: null, reasoning: null },
+                transient: {
+                  activity: "using_tool",
+                  assistant: null,
+                  reasoning: null,
+                  argumentCalls,
+                  ...(toolArguments === undefined ? {} : { toolArguments }),
+                },
               };
               publishStateChange();
             } else if (event.type === "model_reasoning_started") {
               const target = knownTargets.get(active.session.targetId);
               state = {
+                ...state,
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
@@ -2281,6 +2417,7 @@ export async function createPresentationSession(
               );
               if (reasoning?.id === expectedId) {
                 state = {
+                  ...state,
                   revision: state.revision + 1,
                   authoritative: state.authoritative,
                   draft: state.draft,
@@ -2321,7 +2458,7 @@ export async function createPresentationSession(
               }
             }
             if (isModelMessageDelta(event)) {
-              const streamId = `${notification.sessionId}:${notification.runId}`;
+              const streamId = `${notification.sessionId}:${notification.runId}:${activeModelMessage?.startedAtSequence ?? notification.throughSequence}`;
               const existingText =
                 state.transient?.assistant?.streamId === streamId
                   ? state.transient.assistant.text
@@ -2351,6 +2488,7 @@ export async function createPresentationSession(
               const current = state.authoritative.active;
               if (profile !== undefined && current?.session.id === active.session.id) {
                 state = {
+                  ...state,
                   revision: state.revision + 1,
                   authoritative: {
                     ...state.authoritative,
@@ -2424,6 +2562,7 @@ export async function createPresentationSession(
             );
             if (activeSequence < notification.throughSequence) {
               state = {
+                ...state,
                 revision: state.revision + 1,
                 authoritative: {
                   ...state.authoritative,
@@ -2485,7 +2624,19 @@ export async function createPresentationSession(
                 ? state.authoritative.continuity.sessionThroughSequence
                 : 0;
             advanceSessionCursor(Math.max(activeSequence, latestSequence));
+            if (event.type === "session_interrupted" || event.type === "session_settled") {
+              settledRuntimeBoundary = {
+                sessionId: notification.sessionId,
+                throughSequence: notification.throughSequence,
+              };
+            }
+            const refreshedTransient = consumeDurableModelMessage(
+              refreshedRecords,
+              transcript,
+              state.transient,
+            );
             state = {
+              ...state,
               revision: state.revision + 1,
               authoritative: {
                 ...state.authoritative,
@@ -2524,16 +2675,20 @@ export async function createPresentationSession(
               transient: isAssistantTerminalEvent(event)
                 ? activeRun === undefined
                   ? null
-                  : (state.transient ?? {
-                      activity: "working",
-                      assistant: null,
-                      reasoning: null,
-                    })
+                  : event.type === "model_message_completed"
+                    ? {
+                        ...refreshedTransient,
+                        activity: refreshedTransient?.activity ?? "working",
+                        assistant: null,
+                        reasoning: null,
+                      }
+                    : { activity: "working", assistant: null, reasoning: null }
                 : recoveredReasoning === undefined
-                  ? state.transient
+                  ? refreshedTransient
                   : {
-                      activity: state.transient?.activity ?? "working",
-                      assistant: state.transient?.assistant ?? null,
+                      ...refreshedTransient,
+                      activity: refreshedTransient?.activity ?? "working",
+                      assistant: refreshedTransient?.assistant ?? null,
                       reasoning: recoveredReasoning,
                     },
             };
@@ -2548,6 +2703,7 @@ export async function createPresentationSession(
               return;
             }
             state = {
+              ...state,
               revision: state.revision + 1,
               authoritative: {
                 ...state.authoritative,
@@ -2611,6 +2767,7 @@ export async function createPresentationSession(
             return;
           }
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -4253,6 +4410,7 @@ export async function createPresentationSession(
             projectId: command.projectId,
           });
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -4306,6 +4464,7 @@ export async function createPresentationSession(
           await options.preferences.setDefaultTarget(command.targetId);
           const targets = await refreshConfiguredTargets();
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -4341,6 +4500,7 @@ export async function createPresentationSession(
           await options.preferences.setModelPolicy({ field: command.field, value: command.value });
           const targets = await refreshConfiguredTargets();
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: { ...state.authoritative, targets },
             draft: state.draft,
@@ -4398,6 +4558,7 @@ export async function createPresentationSession(
               const targets = await refreshConfiguredTargets();
               if (!closed) {
                 state = {
+                  ...state,
                   revision: state.revision + 1,
                   authoritative: { ...state.authoritative, targets },
                   draft: state.draft,
@@ -4439,6 +4600,7 @@ export async function createPresentationSession(
           await webSearchConfiguration.clear();
           const targets = await refreshConfiguredTargets();
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: { ...state.authoritative, targets },
             draft: state.draft,
@@ -4478,6 +4640,7 @@ export async function createPresentationSession(
           await webSearchConfiguration.setSyntheticDnsRange(command.range);
           const targets = await refreshConfiguredTargets();
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: { ...state.authoritative, targets },
             draft: state.draft,
@@ -5797,6 +5960,7 @@ export async function createPresentationSession(
             } catch {
               if (!closed) {
                 state = {
+                  ...state,
                   revision: state.revision + 1,
                   authoritative: {
                     ...state.authoritative,
@@ -5839,6 +6003,7 @@ export async function createPresentationSession(
         }
         loadedTranscriptStart = Math.max(0, loadedTranscriptStart - historyPageSize);
         state = {
+          ...state,
           revision: state.revision + 1,
           authoritative: {
             ...state.authoritative,
@@ -5883,6 +6048,7 @@ export async function createPresentationSession(
             state.authoritative.sessions.items.map((session) => session.id),
           );
           state = {
+            ...state,
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
@@ -7624,4 +7790,51 @@ function projectWebSearchConfiguration(snapshot: WebSearchConfigurationSnapshot)
     syntheticDnsRange: snapshot.syntheticDnsRange ?? null,
     diagnostic: snapshot.diagnostic,
   };
+}
+
+function isArgumentLifecycleEvent(event: RuntimeEvent): boolean {
+  return (
+    event.type === "model_tool_arguments_started" ||
+    event.type === "model_tool_arguments_completed" ||
+    event.type === "model_response_processing" ||
+    event.type === "model_tool_arguments_settled"
+  );
+}
+
+function projectArgumentCalls(
+  calls: readonly ToolArgumentsDisplay[],
+  event: RuntimeEvent,
+): readonly ToolArgumentsDisplay[] {
+  switch (event.type) {
+    case "model_tool_arguments_started":
+      return [
+        ...calls.filter((call) => call.callId !== event.id),
+        { callId: event.id, name: event.name, status: "generating_arguments" },
+      ];
+    case "model_tool_arguments_completed":
+      return calls.map((call) =>
+        call.callId === event.id ? { ...call, status: "awaiting_model_completion" } : call,
+      );
+    case "model_response_processing":
+      return calls.map((call) =>
+        event.callIds.includes(call.callId) ? { ...call, status: "processing_response" } : call,
+      );
+    case "model_tool_arguments_settled":
+      return calls.filter((call) => call.callId !== event.id);
+    case "tool_requested":
+    case "tool_started":
+      return calls.filter((call) => call.callId !== event.callId);
+    case "model_message_started":
+    case "session_settled":
+    case "session_interrupted":
+      return [];
+    default:
+      return calls;
+  }
+}
+
+function selectedArgumentCall(
+  calls: readonly ToolArgumentsDisplay[],
+): ToolArgumentsDisplay | undefined {
+  return calls.find((call) => call.status === "generating_arguments") ?? calls[0];
 }

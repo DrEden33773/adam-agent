@@ -270,6 +270,7 @@ export class AgentSession {
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
   readonly #activeSkillContents = new Map<string, string>();
+  readonly #pendingToolArguments = new Map<string, string>();
   #pendingReasoningBlock: { readonly id: string } | undefined;
   readonly #repositoryWorkspaceRoot: string | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
@@ -688,6 +689,7 @@ export class AgentSession {
         throw error;
       }
     } catch (error) {
+      this.#settleToolArguments("failed");
       return executionFailureResult(error, this.#durableContext?.sessionId, this.#activeRunId);
     } finally {
       options.signal?.removeEventListener("abort", abortFromCaller);
@@ -1172,6 +1174,7 @@ export class AgentSession {
                   name: event.name,
                   argumentsJson: "",
                 });
+                this.#pendingToolArguments.set(event.id, event.name);
                 await this.#emit({
                   type: "model_tool_arguments_started",
                   id: event.id,
@@ -1207,6 +1210,11 @@ export class AgentSession {
               } else {
                 completedCalls.push(call);
                 assemblingCalls.delete(event.id);
+                this.#publish({
+                  type: "model_tool_arguments_completed",
+                  id: event.id,
+                  name: call.name,
+                });
               }
               break;
             }
@@ -1273,6 +1281,11 @@ export class AgentSession {
             case "finish":
               finishReason = event.reason;
               rawFinishReason = event.rawReason;
+              if (this.#pendingToolArguments.size > 0)
+                this.#publish({
+                  type: "model_response_processing",
+                  callIds: [...this.#pendingToolArguments.keys()],
+                });
               break;
           }
           if (
@@ -4185,6 +4198,7 @@ export class AgentSession {
       return this.#terminalResult;
     }
     this.#terminalResult = result;
+    this.#settleToolArguments(result.status === "cancelled" ? "cancelled" : "failed");
     await this.#settlePendingReasoningBlock(
       result.status === "cancelled" ? "interrupted" : "failed",
     );
@@ -4240,6 +4254,13 @@ export class AgentSession {
       },
     });
     this.#activeProviderAttempt = undefined;
+  }
+
+  #settleToolArguments(status: "failed" | "cancelled"): void {
+    for (const [id, name] of this.#pendingToolArguments) {
+      this.#publish({ type: "model_tool_arguments_settled", id, name, status });
+    }
+    this.#pendingToolArguments.clear();
   }
 
   async #settlePendingReasoningBlock(status: "interrupted" | "failed"): Promise<void> {
@@ -4392,7 +4413,10 @@ export class AgentSession {
     if (
       event.type !== "model_message_delta" &&
       event.type !== "model_reasoning_updated" &&
-      event.type !== "model_tool_arguments_started"
+      event.type !== "model_tool_arguments_started" &&
+      event.type !== "model_tool_arguments_completed" &&
+      event.type !== "model_response_processing" &&
+      event.type !== "model_tool_arguments_settled"
     ) {
       const canonicalEvent: CanonicalRuntimeEvent = event;
       const runId = this.#activeRunId;
@@ -4414,6 +4438,7 @@ export class AgentSession {
   }
 
   #publish(event: RuntimeEvent): void {
+    if (event.type === "tool_requested") this.#pendingToolArguments.delete(event.callId);
     for (const listener of this.#listeners) {
       notifyObserver(() => listener(event));
     }
