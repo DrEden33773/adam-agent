@@ -167,6 +167,7 @@ import {
   createAgentRoleAdministration,
 } from "./role-administration.js";
 import { createAgentRoleCatalog } from "./role-catalog.js";
+import type { RuntimePhaseDiagnostic } from "./runtime-phase-diagnostics.js";
 import {
   createWorkspaceTrust,
   resolveCanonicalWorkspaceIdentity,
@@ -483,6 +484,7 @@ export type ManagedControlComposition = {
 };
 
 export type SessionLifecycleOptions = {
+  readonly onPhaseDiagnostic?: (diagnostic: RuntimePhaseDiagnostic) => void;
   readonly managedControl?: ManagedControlComposition;
   readonly [sessionManagedControl]?: ManagedControlComposition;
   readonly extensionHost?: ExtensionHost;
@@ -1576,6 +1578,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (policy.version === 3 && backgroundRunning !== undefined)
           policy = { ...policy, background: { ...policy.background, running: backgroundRunning } };
         return createManagedAgentControl({
+          ...(options.onPhaseDiagnostic === undefined
+            ? {}
+            : { onPhaseDiagnostic: options.onPhaseDiagnostic }),
           roleCatalog: agentRoleCatalog,
           roleTargets,
           resolveRoleTarget: (input) =>
@@ -4466,6 +4471,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         );
         const managedControl = await resolveManagedControl(input.sessionId);
         const sessionDependencies = {
+          ...(options.onPhaseDiagnostic === undefined
+            ? {}
+            : { onPhaseDiagnostic: options.onPhaseDiagnostic }),
           ...(managedControl === undefined
             ? {}
             : {

@@ -34,6 +34,7 @@ export const projectRuntimeManagedControl = Symbol("project-runtime-managed-cont
 export const projectRuntimeReviewTiming = Symbol("project-runtime-review-timing-testing");
 
 export type ProductionProjectRuntimeOptions = {
+  readonly onPhaseDiagnostic?: Parameters<typeof createSessionLifecycle>[0]["onPhaseDiagnostic"];
   readonly [projectRuntimeReviewTiming]?: Pick<
     ExtensionHostOptions,
     "operationNow" | "operationDeadlineScheduler"
@@ -180,6 +181,9 @@ export async function createProductionProjectRuntime(
     stateRoot: options.stateRoot,
   });
   lifecycle = createSessionLifecycle({
+    ...(options.onPhaseDiagnostic === undefined
+      ? {}
+      : { onPhaseDiagnostic: options.onPhaseDiagnostic }),
     extensionHost: host,
     managedControl,
     modelTargets: options.modelTargets,

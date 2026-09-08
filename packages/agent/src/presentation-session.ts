@@ -702,6 +702,7 @@ export async function createPresentationSession(
       transient: null,
     };
     let managedAgentActivity: NonNullable<PresentationDisplayState["managedAgentActivity"]> = [];
+    const managedAgentPreviews = new Map<string, ManagedAgentPreview>();
     let hydrateManagedDrafts = async (
       _snapshot: NonNullable<PresentationDisplayState["authoritative"]["managedControl"]>,
     ) => {};
@@ -857,6 +858,7 @@ export async function createPresentationSession(
     };
     const observeManagedControl = async (parentSessionId: string) => {
       if (controlObserverParent === parentSessionId) return;
+      managedAgentPreviews.clear();
       controlObserver?.abort();
       const observer = new AbortController();
       controlObserver = observer;
@@ -893,6 +895,14 @@ export async function createPresentationSession(
                 thread.turn.phase !== "idle",
             ),
           );
+          for (const attemptId of managedAgentPreviews.keys()) {
+            if (
+              !frame.snapshot.threads.some(
+                (thread) => thread.turn.attemptId === attemptId && thread.turn.phase !== "idle",
+              )
+            )
+              managedAgentPreviews.delete(attemptId);
+          }
           void hydrateManagedDrafts(frame.snapshot);
           refreshManagedAttention(frame.snapshot);
           publishStateChange();
@@ -2018,6 +2028,14 @@ export async function createPresentationSession(
                   agent.phase !== "terminal",
               ),
             );
+            for (const attemptId of managedAgentPreviews.keys()) {
+              if (
+                !managedAgents.agents.some(
+                  (agent) => agent.attemptId === attemptId && agent.phase !== "terminal",
+                )
+              )
+                managedAgentPreviews.delete(attemptId);
+            }
             state = {
               ...state,
               revision: state.revision + 1,
@@ -2064,7 +2082,14 @@ export async function createPresentationSession(
         const argumentCalls = projectArgumentCalls(current?.argumentCalls ?? [], event);
         const generatingTool = selectedArgumentCall(argumentCalls);
         let projected = current;
+        if (
+          event.type === "model_message_completed" ||
+          event.type === "session_settled" ||
+          event.type === "session_interrupted"
+        )
+          managedAgentPreviews.delete(attemptId);
         if (event.type === "model_message_started") {
+          managedAgentPreviews.set(attemptId, emptyManagedAgentPreview());
           projected = {
             agentId,
             attemptId,
@@ -2074,14 +2099,12 @@ export async function createPresentationSession(
             assistant: { itemId: `${attemptId}:assistant`, text: "" },
           };
         } else if (event.type === "model_message_delta") {
-          const text = boundedManagedAgentActivityText(
-            `${current?.assistant?.text ?? ""}${event.text}`,
+          const preview = appendManagedAgentPreview(
+            managedAgentPreviews.get(attemptId) ?? emptyManagedAgentPreview(),
+            event.text,
             16 * 1024,
           );
-          const totalByteCount =
-            (current?.assistant?.totalByteCount ??
-              Buffer.byteLength(current?.assistant?.text ?? "", "utf8")) +
-            Buffer.byteLength(event.text, "utf8");
+          managedAgentPreviews.set(attemptId, preview);
           projected = {
             agentId,
             attemptId,
@@ -2090,12 +2113,12 @@ export async function createPresentationSession(
             ...(generatingTool === undefined ? {} : { tool: generatingTool }),
             assistant: {
               itemId: current?.assistant?.itemId ?? `${attemptId}:assistant`,
-              text,
+              text: preview.text,
               ...(state.authoritative.managedControl === undefined
                 ? {}
                 : {
-                    totalByteCount,
-                    omittedBytes: totalByteCount - Buffer.byteLength(text, "utf8"),
+                    totalByteCount: preview.totalByteCount,
+                    omittedBytes: preview.totalByteCount - preview.byteCount,
                   }),
             },
           };
@@ -6751,6 +6774,7 @@ export async function createPresentationSession(
         await Promise.all(operationRefreshes);
         listeners.clear();
         managedAgentActivity = [];
+        managedAgentPreviews.clear();
         state = { ...state, transient: null };
         bufferedEvents.length = 0;
         bufferedManagedAgentEvents.length = 0;
@@ -7142,18 +7166,67 @@ function boundedHistoryPageSize(value: number | undefined): number {
     : 100;
 }
 
-function boundedManagedAgentActivityText(value: string, maximumBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maximumBytes) {
-    return value;
-  }
-  let bounded = "";
-  for (const character of value) {
-    if (Buffer.byteLength(bounded + character, "utf8") > maximumBytes) {
-      break;
+type ManagedAgentPreview = {
+  readonly text: string;
+  readonly byteCount: number;
+  readonly totalByteCount: number;
+  readonly truncated: boolean;
+  readonly trailingHighSurrogate: string;
+};
+
+function emptyManagedAgentPreview(): ManagedAgentPreview {
+  return { text: "", byteCount: 0, totalByteCount: 0, truncated: false, trailingHighSurrogate: "" };
+}
+
+function appendManagedAgentPreview(
+  previous: ManagedAgentPreview,
+  delta: string,
+  maximumBytes: number,
+): ManagedAgentPreview {
+  if (delta.length === 0) return previous;
+  const deltaBytes = Buffer.byteLength(delta, "utf8");
+  const firstCodeUnit = delta.charCodeAt(0);
+  const joinsSurrogate =
+    previous.trailingHighSurrogate.length > 0 && firstCodeUnit >= 0xdc00 && firstCodeUnit <= 0xdfff;
+  // Two independently encoded surrogate halves occupy six bytes; the joined scalar uses four.
+  const totalByteCount = previous.totalByteCount + deltaBytes - (joinsSurrogate ? 2 : 0);
+  let { text, byteCount, truncated } = previous;
+  if (!truncated) {
+    let incoming = delta;
+    let incomingBytes = deltaBytes;
+    if (joinsSurrogate) {
+      text = text.slice(0, -1);
+      byteCount -= 3;
+      incoming = previous.trailingHighSurrogate + delta;
+      incomingBytes += 1;
     }
-    bounded += character;
+    if (byteCount + incomingBytes <= maximumBytes) {
+      text += incoming;
+      byteCount += incomingBytes;
+    } else {
+      const accepted: string[] = [];
+      for (const character of incoming) {
+        const bytes = Buffer.byteLength(character, "utf8");
+        if (byteCount + bytes > maximumBytes) {
+          truncated = true;
+          break;
+        }
+        accepted.push(character);
+        byteCount += bytes;
+      }
+      text += accepted.join("");
+    }
   }
-  return bounded;
+  // Once any scalar has been omitted, later fragments cannot fill a gap in the prefix.
+  // Only byte accounting touches those fragments; the saturated prefix is never rescanned.
+  const lastCodeUnit = delta.charCodeAt(delta.length - 1);
+  return {
+    text,
+    byteCount,
+    totalByteCount,
+    truncated,
+    trailingHighSurrogate: lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff ? delta.slice(-1) : "",
+  };
 }
 
 function boundedCatalogPageSize(value: number | undefined): number {

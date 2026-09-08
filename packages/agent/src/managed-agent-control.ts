@@ -22,6 +22,7 @@ import {
   createAgentRoleAdministration,
 } from "./role-administration.js";
 import { type AgentRoleDefinition, agentRoleIdSchema } from "./role-catalog.js";
+import type { RuntimePhaseDiagnostic } from "./runtime-phase-diagnostics.js";
 
 export type { ManagedControlCommand, ManagedControlReceipt } from "@adam-agent/presentation";
 
@@ -439,6 +440,7 @@ export function createManagedAgentControl(options: {
   readonly executionDomain: ProjectExecutionDomain;
   readonly store: ManagedControlStore;
   readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
+  readonly onPhaseDiagnostic?: (diagnostic: RuntimePhaseDiagnostic) => void;
   readonly onChildRuntimeEvent?: (identity: ManagedControlIdentity, event: RuntimeEvent) => void;
   readonly admissionGuard?: <T>(
     operation: () => Promise<T>,
@@ -495,6 +497,26 @@ export function createManagedAgentControl(options: {
   readonly [managedAgentRecordBarrier]?: (record: ManagedControlRecord) => Promise<void>;
   readonly [sessionRecordCommittedBarrier]?: (record: SessionRecord) => Promise<void>;
 }): ManagedAgentControl {
+  const reportPhase = (
+    identity: ManagedControlIdentity,
+    envelope: DelegationEnvelope | undefined,
+    stage: "delegation_admitted" | "first_child_dispatch",
+  ) => {
+    if (options.onPhaseDiagnostic === undefined) return;
+    notifyObserver(() =>
+      options.onPhaseDiagnostic?.({
+        stage,
+        atMilliseconds: performance.now(),
+        sessionId: identity.parentSessionId,
+        runId: envelope?.origin.kind === "main_run" ? envelope.origin.id : null,
+        callId: envelope?.origin.kind === "main_run" ? (envelope.origin.callId ?? null) : null,
+        threadId: identity.threadId,
+        turnId: identity.turnId,
+        attemptId: identity.attemptId,
+        childSessionId: identity.childSessionId,
+      }),
+    );
+  };
   const resolveFrozenTarget = async (frozen: ManagedControlFrozen | undefined) => {
     if (frozen?.roleDefinition !== undefined && options.resolveRoleTarget !== undefined)
       return options.resolveRoleTarget({ role: frozen.roleDefinition, frozen });
@@ -964,6 +986,7 @@ export function createManagedAgentControl(options: {
     )
       throw new SessionLogicalQuotaError();
     const record = await controlStore.appendNext({ ...identity, schemaVersion: 3, event });
+    if (event.type === "admitted") reportPhase(identity, event.envelope, "delegation_admitted");
     if (event.type === "outcome") {
       const admitted = history.find(
         (entry) => entry.turnId === identity.turnId && entry.event.type === "admitted",
@@ -1466,7 +1489,24 @@ export function createManagedAgentControl(options: {
             resetInactivity();
           },
         });
+        let ordinaryDispatched = false;
+        const reportDispatch = (request: Parameters<ModelDriver["stream"]>[0]) => {
+          if (
+            ordinaryDispatched ||
+            (request.purpose !== undefined && request.purpose !== "ordinary")
+          )
+            return;
+          ordinaryDispatched = true;
+          reportPhase(
+            identity,
+            admission?.event.type === "admitted" ? admission.event.envelope : undefined,
+            "first_child_dispatch",
+          );
+        };
         const dependencies = {
+          ...(options.onPhaseDiagnostic === undefined
+            ? {}
+            : { onPhaseDiagnostic: options.onPhaseDiagnostic }),
           [managedAgentPartialOutput]: true as const,
           ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
           [managedAgentInterruptAfterEffect]: async () => {
@@ -1568,6 +1608,7 @@ export function createManagedAgentControl(options: {
           model: {
             async *stream(request) {
               if (admission?.event.type !== "admitted" || admission.event.envelope === undefined) {
+                reportDispatch(request);
                 yield* target.model.stream(request);
                 return;
               }
@@ -1668,6 +1709,7 @@ export function createManagedAgentControl(options: {
                     resetInactivity();
                   }
                 });
+                reportDispatch(request);
                 for await (const event of target.model.stream({
                   ...request,
                   maximumOutputTokens: maximumOutput,
@@ -2352,6 +2394,7 @@ export function createManagedAgentControl(options: {
           )
             throw new SessionLogicalQuotaError();
           const admitted = await controlStore.appendNext(admission);
+          reportPhase(admitted, envelope, "delegation_admitted");
           reviewCallbacks.set(input.reviewRunId, input);
           ready.add(admitted.turnId);
           const admittedSnapshot = await project(
@@ -3891,6 +3934,7 @@ export function createManagedAgentControl(options: {
               "This Main's retained control history and child transcripts leave insufficient storage for this batch and its terminal receipts.",
             );
           const records = await controlStore.appendBatchNext(inputs);
+          for (const record of records) reportPhase(record, envelope, "delegation_admitted");
           const lastAdmission = records.at(-1);
           if (lastAdmission !== undefined)
             await options[managedAgentRecordBarrier]?.(lastAdmission);
