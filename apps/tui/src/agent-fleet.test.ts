@@ -2095,13 +2095,24 @@ test("workspace Attention navigation disarms an earlier exact cancellation", asy
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.waitForAttention((items) => items.length === 1);
+    await h.waitForAttention(
+      (items) =>
+        items.length === 1 &&
+        items[0]?.kind === "permission" &&
+        items[0].interaction !== null &&
+        items[0].available,
+    );
     await h.terminal.waitForScreen("Attention Center");
-    await h.press("\u001b", "Fleet");
+    // Queue a fresh overlay frame before Pi has parsed the following standalone Escape.
+    h.terminal.resize(81, 32);
+    h.terminal.input("\u001b[A");
+    await h.press("\u001b", "Fleet", "Attention Center");
     await h.press("/agents\r", "Agents workspace");
     await h.press("x", "x again to cancel");
     await h.press("a", "Attention Center");
-    await h.press("\u001b", "Agents workspace");
+    h.terminal.resize(80, 32);
+    h.terminal.input("\u001b[A");
+    await h.press("\u001b", "Agents workspace", "Attention Center");
     await h.press("x", "x again to cancel");
     expect(aborts).toBe(0);
     expect(h.presentation.getState().authoritative.managedControl?.threads[0]?.turn.phase).toBe(

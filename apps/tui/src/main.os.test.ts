@@ -18,14 +18,16 @@ import { promisify } from "node:util";
 
 import {
   createExtensionHost,
-  createJsonlManagedAgentStore,
   createJsonlOperationStore,
   createJsonlSessionStoreDirectory,
   createModelTargets,
   createSessionLifecycle,
   createWorkspaceTrust,
 } from "@adam-agent/agent";
-import { createTrustedWorkspaceTrustForTesting } from "@adam-agent/agent/internal-testing";
+import {
+  createJsonlManagedAgentControlStore,
+  createTrustedWorkspaceTrustForTesting,
+} from "@adam-agent/agent/internal-testing";
 import { afterEach, expect, test } from "vitest";
 import {
   removeTuiFixtureRoot as rm,
@@ -798,9 +800,10 @@ test("the TUI --resume path reports the exact invalid session without exposing d
     }
     await writeFile(sessionPath, invalidHistory, "utf8");
     const projectRoot = join(stateRoot, "projects", created.projectId.replace(/^sha256:/u, ""));
-    await unlink(join(projectRoot, "managed-agents", "events-v1.jsonl"));
+    await expect(
+      stat(join(projectRoot, "managed-agents", "events-v1.jsonl")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
     await unlink(join(projectRoot, "lifecycle.lock"));
-    await rmdir(join(projectRoot, "managed-agents"));
     await rmdir(join(stateRoot, "artifacts"));
     const beforeState = await snapshotFileTree(stateRoot);
 
@@ -989,7 +992,7 @@ test("the production TUI exposes one enabled extension Skill in the first-prompt
   }
 });
 
-test("the candidate TUI reviews real Git changes through public Eve and preserves reports and interrupted review across restart", async () => {
+test("the production TUI reviews real Git changes through public Eve and preserves reports and interrupted review across restart", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-eve-registry-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -1058,7 +1061,6 @@ test("the candidate TUI reviews real Git changes through public Eve and preserve
   );
 
   const environment = {
-    ADAM_TEST_CONTROL_REVIEW: "1",
     ADAM_TEST_TERMINAL_PROCESS_MARKER: terminalProcessMarker,
     ADAM_TEST_MODEL_RESPONSE:
       '{"kind":"eve-reviewer.model-review-candidates","schemaVersion":1,"payload":{"candidates":[]}}',
@@ -1967,7 +1969,7 @@ test("the real terminal redraws through 40, 80, 120, and minimum-size layouts", 
   }
 });
 
-test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layered Kitty Esc and settled continuation in a PTY", async () => {
+test("production ProjectRuntime preserves child budget, Main Enter, layered Kitty Esc and settled continuation in a PTY", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-managed-project-pty-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -1991,6 +1993,7 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
     fixture.write("Start child\r");
     waiting = "Delegation permission";
     await fixture.waitForRecordedOutput("Confirm delegation");
+    await grantPtyChildBudget(fixture);
     fixture.write("\r");
     waiting = "MAIN_READY";
     await fixture.waitForRecordedOutput("MAIN_READY");
@@ -2092,179 +2095,136 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
     expectEveryTerminalInputModeRestored(result);
     // biome-ignore lint/suspicious/noControlCharactersInRegex: Inspect actual terminal SGR color sequences.
     expect(result.stdout).not.toMatch(/\u001b\[[0-9;]*(?:3[0-7]|9[0-7]|38;|48;)[0-9;]*m/u);
-    completed = true;
-  } finally {
-    if (!completed)
-      console.error(
-        `Candidate PTY waiting for ${waiting}:\n${fixture.screen()?.join("\n")}\n${fixture.output().slice(-2000)}`,
-      );
-    await fixture.cleanup();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("production terminal navigation keeps ordinary Enter in Main and preserves the explicit child grant", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-main-enter-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-  const fixture = startFixture({
-    scenario: "managed-active",
-    workspaceRoot,
-    stateRoot,
-    controlRoot,
-  });
-  try {
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one child with an explicit budget.\r");
-    await fixture.waitForScreen("10000 task tokens");
-    await fixture.waitForScreen("> Allow");
-    await expect(stat(join(controlRoot, "managed-active-child-held"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    fixture.write("\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    const beforeCompleted = fixture.output().length;
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n");
-    await fixture.waitForCompleteFrameAfter("Managed active parent completed.", beforeCompleted);
-    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-    await fixture.waitForCompleteFrameAfter(" · idle", beforeCompleted);
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
-    let offset = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Agent detail", offset);
-    fixture.write("\u001b[102;1:1u\u001b[102;1:2u\u001b[102;1:3u");
-    await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n")).toContain("Agent detail");
-    expect(fixture.screen()?.join("\n")).not.toContain("f follow-up");
-    for (const visible of ["Agents · 0 active · 1 terminal", " · idle"]) {
-      offset = fixture.output().length;
-      fixture.write("\u001b");
-      await fixture.waitForCompleteFrameAfter(
-        visible,
-        offset,
-        visible === " · idle" ? "type search" : undefined,
-      );
-    }
-    offset = fixture.output().length;
-    fixture.write("Continue in Main from exact evidence.");
-    await fixture.waitForCompleteFrameAfter("Continue in Main from exact evidence.", offset);
-    await unlink(join(controlRoot, "submit_prompt-settled"));
-    offset = fixture.output().length;
-    fixture.write("\r");
-    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-    await fixture.waitForCompleteFrameAfter("Managed active parent completed.", offset);
-    await fixture.waitForCompleteFrameAfter(" · idle", offset);
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    const records = await (await createJsonlManagedAgentStore({ stateRoot, workspaceRoot })).read();
-    const admissions = records.filter((record) => record.type === "managed_agent_admitted");
-    expect(admissions).toHaveLength(1);
-    const admission = admissions[0];
-    if (admission === undefined) throw new Error("Missing child admission.");
-    expect(admission.taskBudget).toMatchObject({
-      mode: "limited",
-      grants: [{ tokens: 10000 }],
-    });
+    const records = await (
+      await createJsonlManagedAgentControlStore({ stateRoot, workspaceRoot })
+    ).read();
+    const admissions = records.filter((record) => record.event.type === "admitted");
+    expect(admissions).toHaveLength(2);
+    const first = admissions[0];
+    const followup = admissions[1];
+    if (first === undefined || followup === undefined)
+      throw new Error("Missing initial or continued Control admission.");
+    expect(followup.threadId).toBe(first.threadId);
+    expect(followup.turnId).not.toBe(first.turnId);
+    for (const admission of admissions)
+      expect(admission.event).toMatchObject({
+        envelope: { taskBudget: { mode: "limited", grants: [{ tokens: 10000 }] } },
+      });
     const parentStore = await createJsonlSessionStoreDirectory({ stateRoot, workspaceRoot }).open(
-      admission.parentSessionId,
+      first.parentSessionId,
     );
-    const parentRecords = await parentStore?.read();
     expect(
-      parentRecords?.flatMap((record) =>
+      (await parentStore?.read())?.flatMap((record) =>
         record.schemaVersion === 3 &&
         record.record.type === "runtime_event" &&
         record.record.event.type === "user_message"
           ? [record.record.event.text]
           : [],
       ),
-    ).toEqual([
-      "Start one child with an explicit budget.",
-      "Continue in Main from exact evidence.",
-    ]);
+    ).toEqual(["Start child", "Main while child runs"]);
+    completed = true;
   } finally {
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n").catch(
-      () => undefined,
-    );
+    if (!completed)
+      console.error(
+        `Production PTY waiting for ${waiting}:\n${fixture.screen()?.join("\n")}\n${fixture.output().slice(-2000)}`,
+      );
     await fixture.cleanup();
     await rm(testRoot, { recursive: true, force: true });
   }
 });
 
 test.each(["escape", "command"] as const)(
-  "production pending child reply exits through %s and ordinary Enter persists only in Main",
+  "production pending child reply exits through %s without routing commands or Main Enter to the child",
   async (exit) => {
-    const testRoot = await mkdtemp(join(tmpdir(), "adam-pending-input-"));
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-control-input-routing-"));
     const workspaceRoot = join(testRoot, "workspace");
     const stateRoot = join(testRoot, "state");
     const controlRoot = join(testRoot, "control");
     await mkdir(workspaceRoot);
     await mkdir(controlRoot);
+    await writeFile(join(controlRoot, "request-parent-input"), "request\n");
+    await writeFile(join(workspaceRoot, "evidence.txt"), "Actual filesystem evidence.\n");
     const fixture = startFixture({
-      scenario: "managed-attention",
+      external: true,
+      scenario: "managed-control",
       workspaceRoot,
       stateRoot,
       controlRoot,
     });
     try {
       await fixture.waitForScreen("Adam · New session");
-      fixture.write("Start one managed attention fixture.\r");
-      await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-      await fixture.waitForScreen(" · idle");
+      fixture.write("Start child\r");
+      await fixture.waitForScreen("Confirm delegation");
+      await grantPtyChildBudget(fixture);
+      fixture.write("\r");
+      await waitForFileContents(join(controlRoot, "child-started"), "started\n");
+      await fixture.waitForScreen("Attention Center");
       let offset = fixture.output().length;
+      fixture.write("\u001b");
+      await fixture.waitForCompleteFrameAfter("MAIN_READY", offset, "Attention Center");
+      offset = fixture.output().length;
       fixture.write("/agents\r");
-      await fixture.waitForCompleteFrameAfter("Agents · 1 active · 0 terminal", offset);
+      await fixture.waitForCompleteFrameAfter("Agents workspace", offset);
       offset = fixture.output().length;
       fixture.write("\r");
-      await fixture.waitForCompleteFrameAfter("Which exact fixture source should I use?", offset);
+      await fixture.waitForCompleteFrameAfter("Conversation", offset);
       offset = fixture.output().length;
-      fixture.write("r");
-      await fixture.waitForCompleteFrameAfter("Enter one bounded reply", offset);
-      const mainText = "Retain this draft in Main.";
-      if (exit === "escape") {
-        offset = fixture.output().length;
-        fixture.write(mainText);
-        await fixture.waitForCompleteFrameAfter(mainText, offset);
-        offset = fixture.output().length;
-        fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
-        await fixture.waitForCompleteFrameAfter(
-          "Managed-child input cancelled. Main draft retained.",
-          offset,
-        );
-        expect(fixture.screen()?.join("\n")).toContain(mainText);
-      } else {
-        offset = fixture.output().length;
-        fixture.write("/help");
-        await fixture.waitForCompleteFrameAfter("/help", offset);
+      fixture.write("\r");
+      await fixture.waitForCompleteFrameAfter("Reply to parent input", offset);
+      const childDraft = exit === "command" ? "/help" : "Private child draft";
+      offset = fixture.output().length;
+      fixture.write(childDraft);
+      await fixture.waitForCompleteFrameAfter(childDraft, offset);
+      if (exit === "command") {
         offset = fixture.output().length;
         fixture.write("\r");
+        await fixture.waitForCompleteFrameAfter(
+          "Run this command in Main. Child draft retained.",
+          offset,
+        );
+      }
+      for (const visible of ["Enter compose", "Agents workspace", "↓ navigate"]) {
+        offset = fixture.output().length;
+        fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
+        await fixture.waitForCompleteFrameAfter(visible, offset);
+      }
+      if (exit === "command") {
+        offset = fixture.output().length;
+        fixture.write("/help\r");
         await fixture.waitForCompleteFrameAfter("Adam Help", offset);
         offset = fixture.output().length;
         fixture.write("\u001b");
-        await fixture.waitForCompleteFrameAfter(" · idle", offset, "Adam Help");
-        offset = fixture.output().length;
-        fixture.write(mainText);
-        await fixture.waitForCompleteFrameAfter(mainText, offset);
+        await fixture.waitForCompleteFrameAfter("MAIN_READY", offset, "Adam Help");
       }
-      await unlink(join(controlRoot, "submit_prompt-settled"));
+      const mainText = "Continue in Main from exact evidence.";
+      offset = fixture.output().length;
+      fixture.write(`${mainText}\r`);
+      await fixture.waitForCompleteFrameAfter("MAIN_RESPONDED", offset);
+      offset = fixture.output().length;
+      fixture.write("/agents\r");
+      await fixture.waitForCompleteFrameAfter("Agents workspace", offset);
       offset = fixture.output().length;
       fixture.write("\r");
-      await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-      await fixture.waitForCompleteFrameAfter("Managed child needs exact input.", offset);
-      await fixture.waitForCompleteFrameAfter(" · idle", offset);
+      await fixture.waitForCompleteFrameAfter("Conversation", offset);
+      offset = fixture.output().length;
+      fixture.write("\r");
+      await fixture.waitForCompleteFrameAfter(childDraft, offset);
       fixture.write("\u0011");
       await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
       const records = await (
-        await createJsonlManagedAgentStore({ stateRoot, workspaceRoot })
+        await createJsonlManagedAgentControlStore({ stateRoot, workspaceRoot })
       ).read();
       expect(
-        records.filter((record) => record.type === "managed_agent_parent_reply_enqueued"),
-      ).toEqual([]);
-      const admission = records.find((record) => record.type === "managed_agent_admitted");
-      if (admission === undefined) throw new Error("Missing child admission.");
+        records.filter((record) => record.event.type === "parent_input_requested"),
+      ).toHaveLength(1);
+      expect(records.filter((record) => record.event.type === "input_accepted")).toEqual([]);
+      const admissions = records.filter((record) => record.event.type === "admitted");
+      expect(admissions).toHaveLength(1);
+      const admission = admissions[0];
+      if (admission === undefined) throw new Error("Missing Control admission.");
+      expect(admission.event).toMatchObject({
+        envelope: { taskBudget: { mode: "limited", grants: [{ tokens: 10000 }] } },
+      });
       const parentStore = await createJsonlSessionStoreDirectory({ stateRoot, workspaceRoot }).open(
         admission.parentSessionId,
       );
@@ -2276,10 +2236,108 @@ test.each(["escape", "command"] as const)(
             ? [record.record.event.text]
             : [],
         ),
-      ).toEqual(["Start one managed attention fixture.", mainText]);
+      ).toEqual(["Start child", mainText]);
     } finally {
       await fixture.cleanup();
       await rm(testRoot, { recursive: true, force: true });
     }
   },
 );
+
+async function grantPtyChildBudget(fixture: ReturnType<typeof startFixture>): Promise<void> {
+  for (const [input, expected] of [
+    ["\u001b[B\u001b[B\u001b[B\r", "Execution and limits"],
+    ["\u001b[A\r", "Custom limits"],
+    ["\r", "Custom task budget tokens"],
+    ["\u0001\u000b10000\r", "10000 task tokens"],
+  ] as const) {
+    const offset = fixture.output().length;
+    fixture.write(input);
+    await fixture.waitForCompleteFrameAfter(expected, offset);
+  }
+}
+
+test("production Main permission preempts and restores the exact child composer without dispatching its draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-control-permission-routing-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const fixture = startFixture({
+    external: true,
+    scenario: "managed-control",
+    workspaceRoot,
+    stateRoot,
+    controlRoot,
+  });
+  try {
+    await fixture.waitForScreen("Adam · New session");
+    fixture.write("Start child\r");
+    await fixture.waitForScreen("Confirm delegation");
+    fixture.write("\r");
+    await fixture.waitForScreen("MAIN_READY");
+    await waitForFileContents(join(controlRoot, "child-started"), "started\n");
+    fixture.write("Trigger Main permission\r");
+    await waitForFileContents(join(controlRoot, "main-permission-ready"), "ready\n");
+    let offset = fixture.output().length;
+    fixture.write("/agents\r");
+    await fixture.waitForCompleteFrameAfter("Agents workspace", offset);
+    offset = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Conversation", offset);
+    offset = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Cooperative", offset);
+    offset = fixture.output().length;
+    fixture.write("Kept private child draft");
+    await fixture.waitForCompleteFrameAfter("Kept private child draft", offset);
+    offset = fixture.output().length;
+    await writeFile(join(controlRoot, "release-main-permission"), "release\n");
+    await fixture.waitForCompleteFrameAfter("Permission required", offset);
+    expect(fixture.screen()?.join("\n")).toContain("main-permission.txt");
+    await expect(stat(join(workspaceRoot, "main-permission.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    offset = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter(
+      "Kept private child draft",
+      offset,
+      "Permission required",
+    );
+    await waitForFileContents(join(workspaceRoot, "main-permission.txt"), "approved\n");
+    offset = fixture.output().length;
+    fixture.write(" remains");
+    await fixture.waitForCompleteFrameAfter("Kept private child draft remains", offset);
+    for (const visible of ["Enter compose", "Agents workspace", "↓ navigate"]) {
+      offset = fixture.output().length;
+      fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
+      await fixture.waitForCompleteFrameAfter(visible, offset);
+    }
+    await fixture.waitForScreen("MAIN_RESPONDED");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const records = await (
+      await createJsonlManagedAgentControlStore({ stateRoot, workspaceRoot })
+    ).read();
+    expect(records.filter((record) => record.event.type === "input_accepted")).toEqual([]);
+    const admission = records.find((record) => record.event.type === "admitted");
+    if (admission === undefined) throw new Error("Missing Control admission.");
+    const parentStore = await createJsonlSessionStoreDirectory({ stateRoot, workspaceRoot }).open(
+      admission.parentSessionId,
+    );
+    expect(
+      (await parentStore?.read())?.flatMap((record) =>
+        record.schemaVersion === 3 &&
+        record.record.type === "runtime_event" &&
+        record.record.event.type === "user_message"
+          ? [record.record.event.text]
+          : [],
+      ),
+    ).toEqual(["Start child", "Trigger Main permission"]);
+  } finally {
+    await fixture.cleanup();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});

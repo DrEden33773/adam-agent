@@ -12,7 +12,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  createJsonlManagedAgentStore,
   createJsonlSessionStore,
   createPermissionPolicy,
   createPresentationSession,
@@ -387,359 +386,6 @@ test("minimum-size rendering preserves the draft and returns to the supported la
   }
 });
 
-test("/agents replies through one exact attention barrier without starting a parent turn", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-attention-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-attention",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one managed attention fixture.\r");
-    await waitForPath(join(controlRoot, "managed-attention-parent-settled"));
-    const beforeIdle = fixture.output().length;
-    await fixture.waitForRecordedOutput("Managed child needs exact input.");
-    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-    await fixture.waitForCompleteFrameAfter(" · idle", beforeIdle);
-    fixture.write("\u0015");
-    const beforeAgents = fixture.output().length;
-    fixture.write("/agents");
-    await fixture.waitForCompleteFrameAfter("/agents", beforeAgents);
-    fixture.write("\r\r");
-    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
-    fixture.write("\r");
-    await fixture.waitForRecordedOutput("Which exact fixture source should I use?");
-    fixture.write("r");
-    await fixture.waitForRecordedOutput(
-      "Enter one bounded reply for the exact managed-child attention request",
-    );
-    fixture.write("Use the immutable fixture source.\r");
-    const replyPath = join(controlRoot, "managed-attention-reply");
-    await waitForPath(replyPath);
-    await expect(readFile(replyPath, "utf8")).resolves.toContain(
-      '"reply":"Use the immutable fixture source."',
-    );
-    expect(fixture.output()).not.toContain("automatic parent continuation");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("active-run /agents opens the live managed overlay without ending the parent or child", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-active-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-active",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one held managed child.\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await fixture.waitForRecordedOutput("Agents 1 active/0 terminal");
-
-    const beforeAgents = fixture.output().length;
-    fixture.write("/agents\r");
-    await fixture.waitForCompleteFrameAfter("Agents · 1 active · 0 terminal", beforeAgents);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · running");
-
-    fixture.write("\u001b[27;1;27~");
-    await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · running");
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("active managed viewer sends one exact ordinary message without a Main turn", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-message-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-active",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one messageable managed child.\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await fixture.waitForRecordedOutput("Agents 1 active/0 terminal");
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
-    fixture.write("\r");
-    await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Agent detail");
-    fixture.write("m");
-    await fixture.resize(82, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Enter one bounded message");
-    fixture.write("Preserve the exact active evidence.\r");
-    const settlement = join(controlRoot, "send_managed_agent_message-settled");
-    await expect(waitForFileContents(settlement, "admitted\n")).resolves.toBe("admitted\n");
-
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("active managed viewer requires two exact cancel inputs before causal settlement", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-cancel-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-active",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one cancellable managed child.\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await fixture.waitForRecordedOutput("Agents 1 active/0 terminal");
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
-    fixture.write("\r");
-    await fixture.resize(81, 24);
-    fixture.write("\u001b[99;1:1u");
-    await fixture.resize(82, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Press c again to stop this exact child");
-
-    fixture.write("\u001b[99;1:2u");
-    fixture.write("\u001b[99;1:3u");
-    await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Press c again to stop this exact child");
-
-    fixture.write("\u001b[99;1:1u");
-    await fixture.waitForRecordedOutput("Managed child cancelled after causal settlement.");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-
-    fixture.write("\u001b[99;1:2u");
-    fixture.write("\u001b[99;1:3u");
-    const beforeDraft = fixture.output().length;
-    fixture.write("CANCEL_HANDOFF_DRAFT");
-    await fixture.resize(82, 24);
-    expect(fixture.output().slice(beforeDraft)).toContain("CANCEL_HANDOFF_DRAFT");
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("cCANCEL_HANDOFF_DRAFT");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("managed viewer reads a bounded artifact through exact child transcript authority", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-artifact-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ scenario: "managed-artifact", stateRoot, workspaceRoot });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Create one managed artifact fixture.\r");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-    await fixture.waitForRecordedOutput("Agents 0 active/1 terminal");
-
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
-    fixture.write("\r");
-    await fixture.waitForRecordedOutput("a read artifact");
-    fixture.write("a");
-    await fixture.waitForRecordedOutput("Managed artifact production evidence.");
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Artifact · read-only");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("stalled managed viewer preserves controls at 40 and full truth at 120 without color", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-stalled-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      noColor: true,
-      scenario: "managed-stalled",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one causally stalled managed child.\r");
-    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await writeFile(join(controlRoot, "trigger-managed-stall"), "trigger\n", "utf8");
-    await fixture.waitForRecordedOutput("research.v3 · stalled");
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
-    fixture.write("\r");
-
-    const beforeNarrow = fixture.output().length;
-    await fixture.resize(40, 12);
-    await fixture.waitForCompleteFrameAfter("Agent detail", beforeNarrow);
-    const narrow = fixture.screen()?.join("\n") ?? "";
-    expect(narrow).toContain("stalled");
-    expect(narrow).toContain("m message");
-    expect(narrow).toContain("Transcript · read-only");
-    expect((fixture.screen() ?? []).every((line) => visibleWidth(line) <= 40)).toBe(true);
-
-    const beforeWide = fixture.output().length;
-    await fixture.resize(120, 30);
-    await fixture.waitForCompleteFrameAfter("Agent detail", beforeWide);
-    const wide = fixture.screen()?.join("\n") ?? "";
-    expect(wide).toContain("Watchdog stalled · 300000 ms");
-    expect(wide).toContain("fake-local");
-    expect(containsColorSgrSequence(fixture.output().slice(beforeNarrow))).toBe(false);
-
-    fixture.write("\u001b[27;1;27~");
-    fixture.write("\u001b[27;1;27~");
-    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitForRecordedOutput("Managed active parent completed.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("managed viewer pauses live-tail following until the reader returns to the bottom", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-live-scroll-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-live-scroll",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one managed live-scroll fixture.\r");
-    await waitForFileContents(join(controlRoot, "managed-live-ready"), "ready\n");
-    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
-    fixture.write("\r");
-    await fixture.waitForRecordedOutput("live-7");
-
-    fixture.write("\u001b[A");
-    await fixture.waitForRecordedOutput("reading paused");
-    const beforeGrowth = fixture.output().length;
-    await writeFile(join(controlRoot, "release-managed-live-growth"), "release\n", "utf8");
-    await waitForFileContents(join(controlRoot, "managed-live-grown"), "grown\n");
-    await fixture.waitForCompleteFrameAfter("reading paused", beforeGrowth);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("live-2");
-    expect(fixture.screen()?.join("\n") ?? "").toContain("live-6");
-
-    const beforeResume = fixture.output().length;
-    fixture.write("\u001b[6~");
-    await fixture.waitForCompleteFrameAfter("following live tail", beforeResume);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("live-8");
-
-    await writeFile(join(controlRoot, "release-managed-live-completion"), "release\n", "utf8");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("managed viewer regains exact focus after a parent permission preempts it", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-permission-focus-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "managed-parent-permission",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitForScreen("Adam · New session");
-    fixture.write("Start one managed permission focus fixture.\r");
-    await waitForFileContents(join(controlRoot, "managed-parent-permission-child-held"), "held\n");
-    await waitForFileContents(join(controlRoot, "managed-parent-permission-ready"), "ready\n");
-    fixture.write("/agents\r");
-    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
-    fixture.write("\r");
-    await fixture.waitForRecordedOutput("Agent detail");
-    await writeFile(
-      join(controlRoot, "release-managed-parent-permission-call"),
-      "release\n",
-      "utf8",
-    );
-    await fixture.waitForRecordedOutput("Permission required");
-    const beforeRestore = fixture.output().length;
-    fixture.write("\u001b[27;1;27~");
-    await fixture.waitForCompleteFrameAfter("m message at next safe boundary", beforeRestore);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · background · running");
-    fixture.write("m");
-    await fixture.waitForRecordedOutput("Enter one bounded message");
-
-    await writeFile(
-      join(controlRoot, "release-managed-parent-permission-child"),
-      "release\n",
-      "utf8",
-    );
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("minimum-size mode consumes ordinary editor input while preserving safe exit", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-minimum-input-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1038,87 +684,7 @@ test("slash exit durably cancels a held run and its exact cold restart stays res
     );
     await expectColdRestartResponsive({
       expectCancelledNotice: true,
-      expectedTerminalAgentCount: 0,
       responsiveDraft: "Cold restart editor remains responsive",
-      sessionId,
-      stateRoot,
-      workspaceRoot,
-    });
-  } finally {
-    if (firstTerminal.running()) {
-      firstTerminal.input("\u0011");
-    }
-    await firstExecution?.catch(() => undefined);
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("slash exit terminalizes an attention child before the exact cold session reopens", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-exit-child-restart-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  const firstTerminal = new VirtualTerminal();
-  let firstExecution: Promise<void> | undefined;
-  let sessionId: string | undefined;
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    firstExecution = runTuiFixture({
-      controlRoot,
-      onPresentationReady(presentation) {
-        sessionId = presentation.getState().authoritative.active?.session.id;
-      },
-      scenario: "managed-attention",
-      stateRoot,
-      terminal: firstTerminal,
-      workspaceRoot,
-    });
-    await firstTerminal.whenStarted();
-    firstTerminal.input("Start one managed child before exit\r");
-    await waitForFileContents(join(controlRoot, "managed-attention-parent-settled"), "settled\n");
-    const beforeIdle = firstTerminal.output().length;
-    await firstTerminal.waitForScreen("Managed child needs exact input.");
-    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-    await firstTerminal.waitForFrameAfter(" · idle", beforeIdle);
-    firstTerminal.input("/exit\r");
-    await expect(firstExecution).resolves.toBeUndefined();
-    expect(firstTerminal.lifecycle()).toEqual(["started", "stopped"]);
-    if (sessionId === undefined) {
-      throw new Error("The managed fixture did not expose its authoritative parent identity.");
-    }
-    const closedSession = await openJsonlSessionStore({ sessionId, stateRoot, workspaceRoot });
-    expect(await closedSession.read()).toContainEqual(
-      expect.objectContaining({
-        record: expect.objectContaining({
-          type: "runtime_event",
-          event: expect.objectContaining({
-            type: "session_settled",
-            result: expect.objectContaining({ status: "completed" }),
-          }),
-        }),
-      }),
-    );
-    const managedStore = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
-    const managedRecords = await managedStore.read();
-    const admission = managedRecords.find(
-      (record) => record.type === "managed_agent_admitted" && record.parentSessionId === sessionId,
-    );
-    expect(admission).toBeDefined();
-    const terminal = managedRecords.find(
-      (record) => record.type === "managed_agent_terminal" && record.agentId === admission?.agentId,
-    );
-    if (terminal?.type !== "managed_agent_terminal") {
-      throw new Error("The managed child did not publish a terminal record before TUI exit.");
-    }
-    expect(terminal.status).toMatch(/^(?:cancelled|recovery_required)$/u);
-    await expectColdRestartResponsive({
-      controlRoot,
-      expectCancelledNotice: false,
-      expectedTerminalAgentCount: 1,
-      responsiveDraft: "Cold child restart editor remains responsive",
-      scenario: "managed-attention",
       sessionId,
       stateRoot,
       workspaceRoot,
@@ -1859,9 +1425,7 @@ test("startup and cleanup failures preserve both causal errors", async () => {
 async function expectColdRestartResponsive(input: {
   readonly controlRoot?: string;
   readonly expectCancelledNotice: boolean;
-  readonly expectedTerminalAgentCount: 0 | 1;
   readonly responsiveDraft: string;
-  readonly scenario?: "managed-attention";
   readonly sessionId: string;
   readonly stateRoot: string;
   readonly workspaceRoot: string;
@@ -1876,7 +1440,6 @@ async function expectColdRestartResponsive(input: {
       onPresentationReady(value) {
         presentation = value;
       },
-      ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
       sessionId: input.sessionId,
       stateRoot: input.stateRoot,
       terminal,
@@ -1917,17 +1480,14 @@ async function expectColdRestartResponsive(input: {
 
     const beforeAgents = terminal.output().length;
     terminal.input("/agents\r");
-    await terminal.waitForFrameAfter("Agents ·", beforeAgents);
+    await terminal.waitForFrameAfter("Agent history ·", beforeAgents);
     const managedAgents = coldPresentation.getState().authoritative.managedAgents;
     expect(managedAgents.counts.active).toBe(0);
-    expect(managedAgents.agents).toHaveLength(input.expectedTerminalAgentCount);
-    if (input.expectedTerminalAgentCount === 1) {
-      expect(managedAgents.agents[0]?.status).toMatch(/^(?:cancelled|recovery_required)$/u);
-    }
+    expect(managedAgents.agents).toEqual([]);
     const beforeAgentsClose = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
     await terminal.waitForFrameAfter("fake.local · Certified", beforeAgentsClose);
-    expect(terminal.lines().join("\n")).not.toContain("Agents ·");
+    expect(terminal.lines().join("\n")).not.toContain("Agent history ·");
 
     const beforeDraft = terminal.output().length;
     terminal.input(input.responsiveDraft);

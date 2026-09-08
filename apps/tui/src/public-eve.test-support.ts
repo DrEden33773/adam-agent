@@ -103,6 +103,7 @@ export type EveProviderStream = {
   readonly aborted: Promise<void>;
   text(value: string): void;
   finish(value?: string): void;
+  tool(name: string, input: unknown): void;
 };
 
 export type PublicEveFixture = {
@@ -128,6 +129,7 @@ export type PublicEveFixture = {
 /** Only the external HTTP provider is controlled; all Adam/Eve owners and stores are real. */
 export async function createPublicEveFixture(
   options: {
+    readonly coexistence?: boolean;
     readonly clock?: EveReviewClock;
     readonly controlClock?: EveReviewClock;
     readonly totalMilliseconds?: number;
@@ -226,7 +228,34 @@ export async function createPublicEveFixture(
           abort.resolve();
         },
       });
+      let toolCall = false;
       const provider: EveProviderStream = {
+        tool(name, input) {
+          toolCall = true;
+          send({
+            id: "fixture",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: `call-${requests.length}`,
+                      type: "function",
+                      function: { name, arguments: JSON.stringify(input) },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+            model: "fixture",
+            created: 1,
+            object: "chat.completion.chunk",
+          });
+          provider.finish();
+        },
         request,
         aborted: abort.promise,
         text(value) {
@@ -246,7 +275,7 @@ export async function createPublicEveFixture(
           if (value !== undefined) provider.text(value);
           send({
             id: "fixture",
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            choices: [{ index: 0, delta: {}, finish_reason: toolCall ? "tool_calls" : "stop" }],
             model: "fixture",
             created: 1,
             object: "chat.completion.chunk",
@@ -281,6 +310,24 @@ export async function createPublicEveFixture(
       } else if (isChild) {
         startReceipt(childStarts, children.length).resolve(provider);
         children.push(provider);
+      } else if (
+        options.coexistence &&
+        request.messages.at(-1)?.role === "user" &&
+        String(request.messages.at(-1)?.content).includes("Initialize public")
+      ) {
+        provider.tool("create_todo", {
+          title: "Verify production coexistence",
+          activeForm: "Verifying coexistence",
+        });
+      } else if (
+        options.coexistence &&
+        request.messages.at(-1)?.role === "user" &&
+        String(request.messages.at(-1)?.content).includes("Prepare coexistence Plan")
+      ) {
+        provider.tool("submit_plan", {
+          title: "Coexistence Plan",
+          markdown: "# Coexistence Plan\n\n1. Inspect evidence.\n2. Verify controls.\n",
+        });
       } else provider.finish("Origin ready");
       return new Response(stream, { headers: { "content-type": "text/event-stream" } });
     },
@@ -289,19 +336,24 @@ export async function createPublicEveFixture(
   const operationStore = await createJsonlOperationStore({ workspaceRoot, stateRoot });
   const childSessionStores = createJsonlSessionStoreDirectory<SessionRecord>({
     workspaceRoot,
-    stateRoot: join(stateRoot, "children"),
+    stateRoot: join(stateRoot, "managed-agent-sessions"),
   });
   const preferences = createPresentationPreferences({ environment });
   const runtimeOptions = {
-    [projectRuntimeManagedControl]: {
-      store: controlStore,
-      childSessionStores,
-      userRoleDirectory: join(root, "roles"),
-      ...(options.controlClock === undefined ? {} : { inactivityScheduler: options.controlClock }),
-      ...(options.settlementBarrier === undefined
-        ? {}
-        : { [managedAgentSettlementBarrier]: options.settlementBarrier }),
-    },
+    ...(options.controlClock === undefined && options.settlementBarrier === undefined
+      ? {}
+      : {
+          [projectRuntimeManagedControl]: {
+            store: controlStore,
+            childSessionStores,
+            ...(options.controlClock === undefined
+              ? {}
+              : { inactivityScheduler: options.controlClock }),
+            ...(options.settlementBarrier === undefined
+              ? {}
+              : { [managedAgentSettlementBarrier]: options.settlementBarrier }),
+          },
+        }),
     ...(options.clock === undefined
       ? {}
       : {
@@ -326,7 +378,11 @@ export async function createPublicEveFixture(
     preferences,
     projectLabel: "Public Eve fixture",
     reservedCommandNames: [],
-    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    permissions: createPermissionPolicy(
+      options.coexistence
+        ? { allowedEffects: ["write", "delegate"], askedEffects: ["read", "network"] }
+        : { allowedEffects: ["read", "delegate"] },
+    ),
     extensionPermissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
   };
   let runtime = await createProductionProjectRuntime(runtimeOptions);

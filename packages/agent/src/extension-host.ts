@@ -98,7 +98,6 @@ export type ExtensionHostOptions = {
   readonly operationDisableGraceMs?: number;
   readonly operationOriginAuthority?: OperationOriginAuthority;
   readonly operationStore?: OperationStore;
-  readonly managedSession?: Parameters<typeof createOperationHost>[0]["managedSession"];
   readonly managedReview?: Parameters<typeof createOperationHost>[0]["managedReview"];
   readonly permissions?: PermissionPolicy;
   readonly projectChangeMaterializer?: ProjectChangeMaterializer;
@@ -421,12 +420,11 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       options.artifactStore === undefined) ||
     (options.capabilities.some((capability) => capability.id === EXTENSION_BIOME_CAPABILITY_ID) &&
       (options.biomeExecution === undefined || options.permissions === undefined)) ||
-    (options.capabilities.some(
+    options.capabilities.some(
       (capability) =>
         capability.id === EXTENSION_MANAGED_SESSION_CAPABILITY_ID ||
         capability.id === EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
-    ) &&
-      options.managedSession === undefined) ||
+    ) ||
     (options.capabilities.some(
       (capability) => capability.id === EXTENSION_MANAGED_REVIEW_CAPABILITY_ID,
     ) &&
@@ -490,7 +488,6 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       ? {}
       : { originAuthority: options.operationOriginAuthority }),
     ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
-    ...(options.managedSession === undefined ? {} : { managedSession: options.managedSession }),
     ...(options.managedReview === undefined ? {} : { managedReview: options.managedReview }),
     recordStore,
     resolveOperation: (contributionId) => registeredOperations.get(contributionId),

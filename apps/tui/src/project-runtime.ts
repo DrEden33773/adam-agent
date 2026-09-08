@@ -7,32 +7,27 @@ import {
   createBiomeExecutionAdapter,
   createExtensionHost,
   createFileArtifactStore,
-  createJsonlManagedAgentStore,
   createJsonlOperationStore,
-  createJsonlSessionStoreDirectory,
   createPresentationSession,
+  createProductionManagedControlComposition,
   createSessionLifecycle,
+  createSessionManagedReviewRuntime,
   createWebSearchConfiguration,
   ExtensionConfigurationError,
   type ExtensionContributionSummary,
   type ExtensionHostOptions,
   loadExtensionConfiguration,
-  type ManagedAgentStore,
-  ModelTargetError,
   type ModelTargets,
   type OperationStore,
   type PermissionPolicy,
   type PresentationPreferences,
-  SessionLifecycleError,
-  type SessionRecord,
   type SessionSnapshot,
   type WorkspaceTrustController,
 } from "@adam-agent/agent";
-import { sessionManagedControl } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 
-/** Internal candidate entry for conformance. The ordinary production caller never selects it. */
+/** External storage and barrier overrides for conformance; execution always uses Control. */
 export const projectRuntimeManagedControl = Symbol("project-runtime-managed-control-testing");
 
 /** External-clock seam for exact consumer deadline conformance; never selected by the CLI. */
@@ -49,7 +44,7 @@ export type ProductionProjectRuntimeOptions = {
     >;
   };
   readonly [projectRuntimeManagedControl]?: NonNullable<
-    Parameters<typeof createSessionLifecycle>[0][typeof sessionManagedControl]
+    Parameters<typeof createSessionLifecycle>[0]["managedControl"]
   >;
   readonly environment: NodeJS.ProcessEnv;
   readonly extensionPermissions: PermissionPolicy;
@@ -135,26 +130,12 @@ export async function createProductionProjectRuntime(
       return (await resolveOperationStore()).read(operationId);
     },
   };
-  let managedStorePromise: Promise<ManagedAgentStore> | undefined;
-  const resolveManagedStore = () => {
-    managedStorePromise ??= createJsonlManagedAgentStore({
-      stateRoot: options.stateRoot,
+  const managedControl =
+    options[projectRuntimeManagedControl] ??
+    (await createProductionManagedControlComposition({
       workspaceRoot: options.workspaceRoot,
-    });
-    return managedStorePromise;
-  };
-  const managedStore: ManagedAgentStore = {
-    async append(record) {
-      return (await resolveManagedStore()).append(record);
-    },
-    async read() {
-      return (await resolveManagedStore()).read();
-    },
-  };
-  const managedChildSessionStores = createJsonlSessionStoreDirectory<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    stateRoot: join(options.stateRoot, "managed-review-sessions"),
-  });
+      stateRoot: options.stateRoot,
+    }));
   let lifecycle: ReturnType<typeof createSessionLifecycle> | undefined;
   const host = createExtensionHost({
     ...(options[projectRuntimeReviewTiming]?.operationNow === undefined
@@ -172,58 +153,13 @@ export async function createProductionProjectRuntime(
       { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
       { id: "adam.artifact.publish@1", version: "1.0.0" },
       { id: "adam.storage.records@1", version: "1.0.0" },
-      ...(options[projectRuntimeManagedControl] === undefined
-        ? [
-            { id: "adam.managed-session@1", version: "1.0.0" },
-            { id: "adam.managed-session@2", version: "2.0.0" },
-          ]
-        : [{ id: "adam.managed-review@1", version: "1.0.0" }]),
+      { id: "adam.managed-review@1", version: "1.0.0" },
     ],
     extensions,
-    ...(options[projectRuntimeManagedControl] === undefined
-      ? {
-          managedSession: {
-            childSessionStores: managedChildSessionStores,
-            managedStore,
-            parentPermissions: options.permissions,
-            async resolveOrigin({ origin, signal }) {
-              if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
-              return lifecycle.resolveManagedSessionOrigin({ origin, signal });
-            },
-            workspaceRoot: options.workspaceRoot,
-          },
-        }
-      : {
-          managedReview: {
-            ...options[projectRuntimeReviewTiming]?.review,
-            async resolveOrigin({ origin, signal }) {
-              if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
-              try {
-                const resolved = await lifecycle.resolveManagedSessionOrigin({ origin, signal });
-                const control = await lifecycle[sessionManagedControl](origin.sessionId);
-                if (control === undefined) return { status: "policy_denied" as const };
-                return {
-                  status: "ready" as const,
-                  control,
-                  model: resolved.childModel,
-                  targetIdentity: resolved.targetIdentity,
-                  contextProfile: resolved.childContextProfile,
-                  ...(resolved.thinkingPolicy === undefined
-                    ? {}
-                    : { thinkingPolicy: resolved.thinkingPolicy }),
-                };
-              } catch (error) {
-                if (
-                  error instanceof ModelTargetError ||
-                  (error instanceof SessionLifecycleError &&
-                    error.code === "session_model_target_incompatible")
-                )
-                  return { status: "target_unavailable" as const };
-                throw error;
-              }
-            },
-          },
-        }),
+    managedReview: {
+      ...createSessionManagedReviewRuntime(() => lifecycle),
+      ...options[projectRuntimeReviewTiming]?.review,
+    },
     operationOriginAuthority: {
       async validateBoundary({ origin, projectId }) {
         if (lifecycle === undefined) {
@@ -245,9 +181,7 @@ export async function createProductionProjectRuntime(
   });
   lifecycle = createSessionLifecycle({
     extensionHost: host,
-    ...(options[projectRuntimeManagedControl] === undefined
-      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v3" as const }
-      : { [sessionManagedControl]: options[projectRuntimeManagedControl] }),
+    managedControl,
     modelTargets: options.modelTargets,
     permissions: options.permissions,
     preferences: options.preferences,
@@ -263,7 +197,6 @@ export async function createProductionProjectRuntime(
     }
     await resolveArtifactStore();
     await resolveOperationStore();
-    await resolveManagedStore();
     extensionSnapshot = await host.loadConfiguredExtensions();
   } catch (error) {
     await closeProjectRuntime(undefined, lifecycle);

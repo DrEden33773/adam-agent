@@ -1,17 +1,4 @@
 import { appendFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import {
-  createJsonlSessionStoreDirectory,
-  createModelTargets,
-  createPermissionPolicy,
-  createPresentationPreferences,
-  createWorkspaceTrust,
-  type SessionRecord,
-} from "@adam-agent/agent";
-import { createJsonlManagedAgentControlStore } from "@adam-agent/agent/internal-testing";
-import { createAdamCommandRegistryFromContributions } from "./command-registry.js";
-import { createProductionProjectRuntime, projectRuntimeManagedControl } from "./project-runtime.js";
-import { runTui } from "./tui-app.js";
 
 const { ADAM_TEST_TERMINAL_PROCESS_MARKER: marker } = process.env;
 if (marker === undefined) {
@@ -60,50 +47,4 @@ if (modelResponse !== undefined) {
     );
   };
 }
-const { ADAM_TEST_CONTROL_REVIEW: candidate } = process.env;
-if (candidate !== "1") await import("./main.js");
-else {
-  // The candidate uses the same production owners; only this fixture can select it before cutover.
-  const arguments_ = process.argv.slice(2);
-  const stateRoot = arguments_[arguments_.indexOf("--state-root") + 1];
-  const sessionId = arguments_[arguments_.indexOf("--resume") + 1];
-  if (stateRoot === undefined || sessionId === undefined)
-    throw new Error("Missing candidate fixture identity");
-  const workspaceRoot = process.cwd();
-  const environment = process.env;
-  const runtime = await createProductionProjectRuntime({
-    [projectRuntimeManagedControl]: {
-      store: await createJsonlManagedAgentControlStore({ workspaceRoot, stateRoot }),
-      childSessionStores: createJsonlSessionStoreDirectory<SessionRecord>({
-        workspaceRoot,
-        stateRoot: join(stateRoot, "managed-agent-sessions"),
-      }),
-      userRoleDirectory: join(stateRoot, "roles"),
-    },
-    environment,
-    workspaceRoot,
-    stateRoot,
-    modelTargets: createModelTargets({ environment }),
-    preferences: createPresentationPreferences({ environment }),
-    workspaceTrust: createWorkspaceTrust({ environment, workspaceRoot }),
-    permissions: createPermissionPolicy({
-      allowedEffects: ["read"],
-      askedEffects: ["write", "execute", "network", "delegate", "administrative"],
-    }),
-    extensionPermissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
-    projectLabel: "Public Eve PTY",
-    reservedCommandNames: [],
-    resumeSessionId: sessionId,
-  });
-  try {
-    const presentation = await runtime.createPresentation({ sessionId });
-    await runTui({
-      presentation,
-      mouse: true,
-      commandRegistry: createAdamCommandRegistryFromContributions(runtime.contributions),
-      closeRuntime: () => runtime.close(),
-    });
-  } finally {
-    await runtime.close();
-  }
-}
+await import("./main.js");

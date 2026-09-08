@@ -68,6 +68,11 @@ export {
 export type { ManagedAgentStore } from "./managed-agent.js";
 export { createJsonlManagedAgentStore } from "./managed-agent-store.js";
 export {
+  createProductionManagedControlComposition,
+  createSessionManagedReviewRuntime,
+  type ProductionManagedControlComposition,
+} from "./managed-control-runtime.js";
+export {
   type ModelDriverDiagnosticCode,
   ModelDriverError,
   type ModelDriverErrorCategory,

@@ -4,7 +4,6 @@ import type {
   ArtifactReference,
   AuthoritativePresentationSnapshot,
   ManagedAgentTranscriptPageResource,
-  PresentationDisplayState,
   TranscriptItem,
 } from "@adam-agent/presentation";
 import {
@@ -27,10 +26,8 @@ import { ToolPreview } from "./tool-preview.js";
 
 type ManagedAgents = AuthoritativePresentationSnapshot["managedAgents"];
 type ManagedAgent = ManagedAgents["agents"][number];
-type ManagedAgentActivity = NonNullable<PresentationDisplayState["managedAgentActivity"]>;
 
-export class AgentNavigator implements Component {
-  #activity: ManagedAgentActivity = [];
+export class LegacyAgentHistory implements Component {
   #artifactGeneration = 0;
   #artifactView: {
     readonly artifact: ArtifactReference;
@@ -40,15 +37,8 @@ export class AgentNavigator implements Component {
   } | null = null;
   #managedAgents: ManagedAgents;
   readonly #maximumContentHeight: () => number;
-  readonly #onCancel: (input: {
-    readonly agentId: string;
-    readonly expectedRevision: number;
-  }) => void;
   readonly #onChange: () => void;
   readonly #onClose: () => void;
-  readonly #onMessage:
-    | ((input: { readonly agentId: string; readonly expectedRevision: number }) => void)
-    | undefined;
   readonly #onReadArtifact:
     | ((input: {
         readonly agentId: string;
@@ -59,11 +49,6 @@ export class AgentNavigator implements Component {
         readonly range: ArtifactRange;
       }) => Promise<ArtifactChunk>)
     | undefined;
-  readonly #onReply: (input: {
-    readonly agentId: string;
-    readonly expectedRevision: number;
-    readonly attentionId: string;
-  }) => void;
   readonly #onReadTranscript:
     | ((input: {
         readonly agentId: string;
@@ -73,11 +58,7 @@ export class AgentNavigator implements Component {
         readonly cursor: string | null;
       }) => Promise<ManagedAgentTranscriptPageResource>)
     | undefined;
-  readonly #onRecovery:
-    | ((input: { readonly agentId: string; readonly expectedRevision: number }) => void)
-    | undefined;
   readonly #theme: AdamTuiTheme;
-  #cancelConfirmation: string | null = null;
   #detail: ManagedAgent | null = null;
   readonly #list: SearchableSelectList;
   #transcript: ManagedAgentTranscriptPageResource | null = null;
@@ -90,16 +71,8 @@ export class AgentNavigator implements Component {
   constructor(options: {
     readonly managedAgents: ManagedAgents;
     readonly maximumContentHeight?: () => number;
-    readonly onCancel: (input: {
-      readonly agentId: string;
-      readonly expectedRevision: number;
-    }) => void;
     readonly onChange: () => void;
     readonly onClose: () => void;
-    readonly onMessage?: (input: {
-      readonly agentId: string;
-      readonly expectedRevision: number;
-    }) => void;
     readonly onReadArtifact?: (input: {
       readonly agentId: string;
       readonly attemptId: string;
@@ -115,27 +88,14 @@ export class AgentNavigator implements Component {
       readonly expectedThroughSequence: number;
       readonly cursor: string | null;
     }) => Promise<ManagedAgentTranscriptPageResource>;
-    readonly onRecovery?: (input: {
-      readonly agentId: string;
-      readonly expectedRevision: number;
-    }) => void;
-    readonly onReply: (input: {
-      readonly agentId: string;
-      readonly expectedRevision: number;
-      readonly attentionId: string;
-    }) => void;
     readonly theme: AdamTuiTheme;
   }) {
     this.#managedAgents = options.managedAgents;
     this.#maximumContentHeight = options.maximumContentHeight ?? (() => 22);
-    this.#onCancel = options.onCancel;
     this.#onChange = options.onChange;
     this.#onClose = options.onClose;
-    this.#onMessage = options.onMessage;
     this.#onReadArtifact = options.onReadArtifact;
     this.#onReadTranscript = options.onReadTranscript;
-    this.#onRecovery = options.onRecovery;
-    this.#onReply = options.onReply;
     this.#theme = options.theme;
     const items: SearchableSelectItem[] = options.managedAgents.agents.map((agent) => ({
       item: {
@@ -185,20 +145,13 @@ export class AgentNavigator implements Component {
       this.#transcriptGeneration += 1;
       this.#artifactGeneration += 1;
       this.#artifactView = null;
-      this.#cancelConfirmation = null;
       this.#detail = null;
       this.#onChange();
       return;
     }
     if (this.#detail !== null) {
-      if (
-        (isKeyRepeat(data) || isKeyRelease(data)) &&
-        (["a", "m", "r", "c"] as const).some((key) => matchesKey(data, key))
-      ) {
+      if ((isKeyRepeat(data) || isKeyRelease(data)) && matchesKey(data, "a")) {
         return;
-      }
-      if (!matchesKey(data, "c")) {
-        this.#cancelConfirmation = null;
       }
       if (getKeybindings().matches(data, "tui.select.up")) {
         this.#scrollViewport(-1);
@@ -239,54 +192,6 @@ export class AgentNavigator implements Component {
         }
         return;
       }
-      if (this.#detail.readOnly) return;
-      if (
-        matchesKey(data, "m") &&
-        isActiveManagedAgent(this.#detail) &&
-        this.#onMessage !== undefined
-      ) {
-        this.#onMessage({
-          agentId: this.#detail.agentId,
-          expectedRevision: this.#detail.revision,
-        });
-        return;
-      }
-      if (
-        matchesKey(data, "r") &&
-        this.#detail.status === "recovery_required" &&
-        this.#onRecovery !== undefined
-      ) {
-        this.#onRecovery({
-          agentId: this.#detail.agentId,
-          expectedRevision: this.#detail.revision,
-        });
-        return;
-      }
-      if (matchesKey(data, "c") && isActiveManagedAgent(this.#detail)) {
-        const confirmation = `${this.#detail.agentId}:${this.#detail.revision}`;
-        if (this.#cancelConfirmation === confirmation) {
-          this.#cancelConfirmation = null;
-          this.#onCancel({
-            agentId: this.#detail.agentId,
-            expectedRevision: this.#detail.revision,
-          });
-        } else {
-          this.#cancelConfirmation = confirmation;
-          this.#onChange();
-        }
-        return;
-      }
-      if (
-        matchesKey(data, "r") &&
-        this.#detail.status === "waiting_for_parent" &&
-        this.#detail.attention !== undefined
-      ) {
-        this.#onReply({
-          agentId: this.#detail.agentId,
-          expectedRevision: this.#detail.revision,
-          attentionId: this.#detail.attention.attentionId,
-        });
-      }
       return;
     }
     this.#list.handleInput(data);
@@ -296,11 +201,10 @@ export class AgentNavigator implements Component {
     this.#list.invalidate();
   }
 
-  setManagedAgents(managedAgents: ManagedAgents, activity: ManagedAgentActivity = []): void {
+  setManagedAgents(managedAgents: ManagedAgents): void {
     const previousDetail = this.#detail;
     const detailAgentId = previousDetail?.agentId;
     this.#managedAgents = managedAgents;
-    this.#activity = activity;
     this.#list.setItems(agentSelectItems(managedAgents));
     if (detailAgentId !== undefined) {
       this.#detail = managedAgents.agents.find((agent) => agent.agentId === detailAgentId) ?? null;
@@ -315,19 +219,11 @@ export class AgentNavigator implements Component {
         this.#transcriptNotice = null;
         this.#transcriptScrollTop = 0;
         this.#transcriptFollowingTail = true;
-        this.#cancelConfirmation = null;
         void this.#loadTranscript(null);
       } else if (this.#detail !== null && transcriptChanged) {
         this.#artifactGeneration += 1;
         this.#artifactView = null;
-        this.#cancelConfirmation = null;
         void this.#loadTranscript(null);
-      }
-      if (
-        this.#detail === null ||
-        this.#cancelConfirmation !== `${this.#detail.agentId}:${this.#detail.revision}`
-      ) {
-        this.#cancelConfirmation = null;
       }
     }
   }
@@ -337,17 +233,6 @@ export class AgentNavigator implements Component {
       const detail = this.#detail;
       const maximumContentHeight = Math.max(8, Math.floor(this.#maximumContentHeight()));
       const hasArtifact = managedTranscriptArtifacts(this.#transcript).length > 0;
-      const rosterLines =
-        width < 80 || this.#managedAgents.counts.active === 0
-          ? []
-          : [
-              this.#theme.toolTitle(
-                `Agents · ${this.#managedAgents.counts.active} active · ${this.#managedAgents.counts.terminal} terminal`,
-              ),
-              ...new ManagedAgentRoster({ managedAgents: this.#managedAgents, theme: this.#theme })
-                .render(width)
-                .slice(0, 3),
-            ];
       const allEvidenceLines = [
         ...(detail.attention === undefined
           ? []
@@ -365,41 +250,15 @@ export class AgentNavigator implements Component {
               `${report.kind} r${report.revision} · ${safeTerminalText(report.message)}${report.messageTruncated ? ` · ${report.messageByteCount} bytes total` : ""}`,
           ),
       ];
-      const fullActionLines = detail.readOnly
-        ? [
-            this.#theme.muted("Read-only history · Esc back"),
-            ...(hasArtifact && this.#onReadArtifact !== undefined
-              ? [this.#theme.muted("a read artifact")]
-              : []),
-            this.#theme.muted("↑↓ scroll · PgUp older · Ctrl+Q exit"),
-          ]
-        : [
-            ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
-              ? [
-                  this.#theme.muted(
-                    "m message at next safe boundary; delivery does not imply compliance",
-                  ),
-                ]
-              : []),
-            ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
-              ? [this.#theme.statusWarning("Press c again to stop this exact child")]
-              : []),
-            ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
-              ? [this.#theme.muted("r recover from exact durable evidence")]
-              : []),
-            ...(hasArtifact && this.#onReadArtifact !== undefined
-              ? [this.#theme.muted("a read artifact")]
-              : []),
-            this.#theme.muted(
-              isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
-                ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
-                : detail.status === "waiting_for_parent"
-                  ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
-                  : "Terminal child · Esc back · Ctrl+Q exit",
-            ),
-          ];
+      const fullActionLines = [
+        this.#theme.muted("Read-only history · Esc back"),
+        ...(hasArtifact && this.#onReadArtifact !== undefined
+          ? [this.#theme.muted("a read artifact")]
+          : []),
+        this.#theme.muted("↑↓ scroll · PgUp older · Ctrl+Q exit"),
+      ];
       const fullHeaderLines = [
-        this.#theme.toolTitle("Agent detail"),
+        this.#theme.toolTitle("Agent history detail"),
         `${detail.profile} · ${detail.mode} · ${detail.status} · revision ${detail.revision} · ${detail.phase}${detail.activeTool === undefined ? "" : ` · ${detail.activeTool.name} ${detail.activeTool.status}`}`,
         `${safeTerminalText(detail.targetIdentity.targetId)} · ${safeTerminalText(detail.targetIdentity.modelId)} · ${safeTerminalText(detail.targetIdentity.route)}${detail.thinkingPolicy === undefined ? "" : ` · thinking ${safeTerminalText(detail.thinkingPolicy.effectiveLevelId)}`}`,
         `Context ${detail.context?.contextWindowTokens ?? "unknown"} capacity · ${managedContextOccupancy(detail)}`,
@@ -425,7 +284,6 @@ export class AgentNavigator implements Component {
         this.#artifactView === null ? "Transcript · read-only" : "Artifact · read-only",
       );
       const fullPrefixLines = [
-        ...rosterLines,
         ...fullHeaderLines,
         ...allEvidenceLines.slice(0, 2),
         ...fullActionLines,
@@ -433,16 +291,12 @@ export class AgentNavigator implements Component {
         transcriptTitle,
       ];
       const compactPrefixLines = [
-        this.#theme.toolTitle("Agent detail"),
+        this.#theme.toolTitle("Agent history detail"),
         `${detail.profile} · ${detail.status} · revision ${detail.revision} · ${detail.phase}`,
         `${safeTerminalText(detail.targetIdentity.modelId)} · ${detail.context?.contextWindowTokens ?? "unknown"} context · ${managedContextOccupancy(detail)}`,
         ...allEvidenceLines.slice(0, 1),
         this.#theme.muted(
-          compactAgentActions(detail, this.#cancelConfirmation, {
-            artifact: hasArtifact && this.#onReadArtifact !== undefined,
-            message: this.#onMessage !== undefined,
-            recovery: this.#onRecovery !== undefined,
-          }),
+          `Read-only history${hasArtifact && this.#onReadArtifact !== undefined ? " · a artifact" : ""} · Esc back`,
         ),
         "",
         transcriptTitle,
@@ -461,9 +315,7 @@ export class AgentNavigator implements Component {
     const listHeight = Math.max(1, maximumContentHeight - 2);
     this.#list.setMaximumVisible(Math.min(8, Math.max(1, listHeight - 3)));
     return [
-      this.#theme.toolTitle(
-        `Agents · ${this.#managedAgents.counts.active} active · ${this.#managedAgents.counts.terminal} terminal`,
-      ),
+      this.#theme.toolTitle(`Agent history · ${this.#managedAgents.agents.length} records`),
       this.#theme.muted("type search · Enter detail · Esc close · Ctrl+Q exit"),
       ...this.#list.render(width, listHeight),
     ]
@@ -596,23 +448,13 @@ export class AgentNavigator implements Component {
     if (this.#transcript === null) {
       return ["Transcript is unavailable for this viewer."];
     }
-    const liveLines = this.#activity
-      .filter(
-        (activity) =>
-          activity.agentId === this.#detail?.agentId &&
-          activity.attemptId === this.#detail.attemptId,
-      )
-      .flatMap(managedActivityLines);
-    const lines = [
-      ...this.#transcript.items.flatMap((item) => transcriptItemLines(item, width, this.#theme)),
-      ...liveLines,
-    ];
+    const lines = this.#transcript.items.flatMap((item) =>
+      transcriptItemLines(item, width, this.#theme),
+    );
     const contentHeight = Math.max(1, maximumVisible);
     const markers = [
       ...(this.#transcript.olderCursor === null ? [] : ["Older transcript available"]),
-      ...(liveLines.length === 0
-        ? []
-        : [this.#transcriptFollowingTail ? "following live tail" : "reading paused"]),
+      ...(this.#transcriptFollowingTail ? [] : ["reading paused"]),
       ...(this.#transcriptNotice === null ? [] : [this.#transcriptNotice]),
     ];
     const visibleHeight = Math.max(1, contentHeight - markers.length);
@@ -635,40 +477,6 @@ export class AgentNavigator implements Component {
     ]
       .slice(0, contentHeight)
       .map((line) => boundedLine(line, width));
-  }
-}
-
-export class ManagedAgentRoster implements Component {
-  #managedAgents: ManagedAgents;
-  readonly #theme: AdamTuiTheme;
-
-  constructor(options: { readonly managedAgents: ManagedAgents; readonly theme: AdamTuiTheme }) {
-    this.#managedAgents = options.managedAgents;
-    this.#theme = options.theme;
-  }
-
-  invalidate(): void {}
-
-  setManagedAgents(managedAgents: ManagedAgents): void {
-    this.#managedAgents = managedAgents;
-  }
-
-  render(width: number): string[] {
-    const active = this.#managedAgents.agents.filter(isActiveManagedAgent);
-    const visible = active.slice(0, 3);
-    return visible.map((agent, index) => {
-      const hidden = index === visible.length - 1 ? active.length - visible.length : 0;
-      const tool = agent.activeTool === undefined ? "" : ` · ${agent.activeTool.name}`;
-      const attention =
-        agent.status === "waiting_for_parent" || agent.status === "permission_required"
-          ? " · attention"
-          : "";
-      const overflow = hidden === 0 ? "" : ` · +${hidden} active`;
-      return boundedLine(
-        `${this.#theme.toolTitle(agent.profile)} · ${agent.status}${tool}${attention}${overflow}`,
-        width,
-      );
-    });
   }
 }
 
@@ -744,35 +552,6 @@ function mergeTranscriptItems(
   );
 }
 
-function managedActivityLines(activity: ManagedAgentActivity[number]): string[] {
-  if (activity.tool?.status === "generating_arguments") {
-    return [`Live tool · ${safeTerminalText(activity.tool.name)} · generating arguments`];
-  }
-  if (activity.assistant !== undefined) {
-    return safeTerminalText(activity.assistant.text)
-      .split("\n")
-      .map((line) => `Live assistant · ${line}`);
-  }
-  if (activity.reasoning !== undefined) {
-    return [
-      `Live reasoning · ${activity.reasoning.status} · ${activity.reasoning.hasContent ? "content undisclosed" : "waiting"}`,
-    ];
-  }
-  if (activity.tool !== undefined) {
-    return [`Live tool · ${safeTerminalText(activity.tool.name)} · ${activity.tool.status}`];
-  }
-  return [`Live child · ${activity.activity}`];
-}
-
-function isActiveManagedAgent(agent: ManagedAgent): boolean {
-  return (
-    agent.status === "running" ||
-    agent.status === "permission_required" ||
-    agent.status === "stalled" ||
-    agent.status === "waiting_for_parent"
-  );
-}
-
 function managedResultLines(agent: ManagedAgent): string[] {
   if (agent.result === undefined) {
     return [];
@@ -797,38 +576,6 @@ function managedContextOccupancy(agent: ManagedAgent): string {
   return occupancy.source === "unknown"
     ? "occupancy unknown"
     : `occupancy ${occupancy.tokens} · ${occupancy.source}`;
-}
-
-function compactAgentActions(
-  agent: ManagedAgent,
-  confirmation: string | null,
-  available: {
-    readonly artifact: boolean;
-    readonly message: boolean;
-    readonly recovery: boolean;
-  },
-): string {
-  if (agent.readOnly)
-    return `Read-only history${available.artifact ? " · a artifact" : ""} · Esc back`;
-  if (confirmation === `${agent.agentId}:${agent.revision}`) {
-    return "c again cancel · Esc back";
-  }
-  if (isActiveManagedAgent(agent)) {
-    return [
-      ...(available.message ? ["m message"] : []),
-      ...(agent.status === "waiting_for_parent" ? ["r reply"] : []),
-      ...(available.artifact ? ["a artifact"] : []),
-      "c twice cancel",
-      "↑↓ scroll",
-      "Esc back",
-    ].join(" · ");
-  }
-  return [
-    ...(agent.status === "recovery_required" && available.recovery ? ["r recover"] : []),
-    ...(available.artifact ? ["a artifact"] : []),
-    "↑↓ scroll",
-    "Esc back",
-  ].join(" · ");
 }
 
 function managedTranscriptArtifacts(

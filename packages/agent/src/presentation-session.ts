@@ -93,7 +93,6 @@ import {
 import {
   type CurrentSessionSnapshot,
   effectiveSessionStateRoot,
-  type ManagedAgentControlReceipt,
   type ManagedAgentNotification,
   type ManagedAgentTranscriptRecords,
   type SessionContextUsageSnapshot,
@@ -347,6 +346,10 @@ export async function createPresentationSession(
       }
     };
     let activeSessionThroughSequence = created?.lastSequence ?? 0;
+    let settledRuntimeBoundary =
+      created?.status === "settled"
+        ? { sessionId: created.sessionId, throughSequence: created.lastSequence }
+        : undefined;
     const advanceSessionCursor = (sequence: number): void => {
       activeSessionThroughSequence = Math.max(activeSessionThroughSequence, sequence);
     };
@@ -1689,6 +1692,14 @@ export async function createPresentationSession(
       operationRepairs.clear();
       resetOperationCursors(activatedOperations);
       activeSessionThroughSequence = activeSequence;
+      if (snapshot.status === "settled") {
+        settledRuntimeBoundary = {
+          sessionId: snapshot.sessionId,
+          throughSequence: snapshot.lastSequence,
+        };
+      } else if (settledRuntimeBoundary?.sessionId !== snapshot.sessionId) {
+        settledRuntimeBoundary = undefined;
+      }
       transcript = activatedTranscript;
       loadedTranscriptStart = activatedLoadedTranscriptStart;
       attachmentAvailable = sessionSupportsInputResources(snapshot);
@@ -2183,6 +2194,13 @@ export async function createPresentationSession(
             if (closed || active === null || notification.sessionId !== active.session.id) {
               return;
             }
+            // A final snapshot may read ahead of the notification queue. Its
+            // settled prefix must not recreate a live tool, answer or reasoning.
+            if (
+              settledRuntimeBoundary?.sessionId === notification.sessionId &&
+              notification.throughSequence <= settledRuntimeBoundary.throughSequence
+            )
+              return;
             const event = notification.event;
             if (event.type === "model_tool_arguments_started") {
               state = {
@@ -2289,7 +2307,13 @@ export async function createPresentationSession(
               } else {
                 state = reconcilePresentationUpdate(state, {
                   type: "reasoning_snapshot",
-                  afterSequence: notification.throughSequence,
+                  afterSequence:
+                    state.authoritative.continuity.status === "current"
+                      ? Math.max(
+                          notification.throughSequence,
+                          state.authoritative.continuity.sessionThroughSequence,
+                        )
+                      : notification.throughSequence,
                   reasoning: { ...reasoning, text: event.text },
                 });
                 publishStateChange();
@@ -2305,7 +2329,13 @@ export async function createPresentationSession(
               state = reconcilePresentationUpdate(state, {
                 type: "assistant_delta",
                 streamId,
-                afterSequence: notification.throughSequence,
+                afterSequence:
+                  state.authoritative.continuity.status === "current"
+                    ? Math.max(
+                        notification.throughSequence,
+                        state.authoritative.continuity.sessionThroughSequence,
+                      )
+                    : notification.throughSequence,
                 text: `${existingText}${event.text}`,
               });
               publishStateChange();
@@ -2355,19 +2385,8 @@ export async function createPresentationSession(
             ) {
               return;
             }
-            if (previousSequence !== null && notification.throughSequence < previousSequence) {
-              state = {
-                revision: state.revision + 1,
-                authoritative: {
-                  ...state.authoritative,
-                  continuity: { status: "repairing", reason: "gap" },
-                },
-                draft: state.draft,
-                composer: state.composer,
-                transient: null,
-              };
-              publishStateChange();
-            }
+            // A durable read may already cover this notification. Older anchors do not
+            // invalidate that proven prefix; genuinely missing future records still repair below.
             await options[presentationRuntimeRefreshBarrier]?.beforeRead(notification);
             const refreshedRecords = await readActiveBranchRecords(options, active.session.id);
             const refreshedOperationProjection = await projectLinkedOperations(
@@ -3840,12 +3859,18 @@ export async function createPresentationSession(
         }
       }
       if (
-        command.type === "refresh_managed_agents" ||
         command.type === "cancel_managed_agent" ||
         command.type === "send_managed_agent_message" ||
         command.type === "follow_up_managed_agent" ||
         command.type === "recover_managed_agent"
-      ) {
+      )
+        return {
+          status: "rejected",
+          code: "action_unavailable",
+          message:
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+        };
+      if (command.type === "refresh_managed_agents") {
         if (state.authoritative.active?.session.id !== command.sessionId) {
           return {
             status: "rejected",
@@ -3857,40 +3882,9 @@ export async function createPresentationSession(
           const commandId = `presentation:${createHash("sha256")
             .update(JSON.stringify(command))
             .digest("hex")}`;
-          let managedAgents: AuthoritativePresentationSnapshot["managedAgents"];
-          let managedAgentControl: ManagedAgentControlReceipt | undefined;
-          if (command.type === "refresh_managed_agents") {
-            managedAgents = await options.lifecycle.inspectManagedAgents({
-              sessionId: command.sessionId,
-            });
-          } else if (command.type === "cancel_managed_agent") {
-            const result = await options.lifecycle.cancelManagedAgent(command);
-            managedAgents = result.snapshot;
-            managedAgentControl = result.receipt;
-          } else if (command.type === "send_managed_agent_message") {
-            const result = await options.lifecycle.sendManagedAgentMessage({
-              ...command,
-              callId: commandId,
-            });
-            managedAgents = result.snapshot;
-            managedAgentControl = result.receipt;
-          } else if (command.type === "follow_up_managed_agent") {
-            const result = await options.lifecycle.followUpManagedAgent({
-              ...command,
-              callId: commandId,
-              signal: new AbortController().signal,
-            });
-            managedAgents = result.snapshot;
-            managedAgentControl = result.receipt;
-          } else {
-            const result = await options.lifecycle.recoverManagedAgent({
-              ...command,
-              callId: commandId,
-              signal: new AbortController().signal,
-            });
-            managedAgents = result.snapshot;
-            managedAgentControl = result.receipt;
-          }
+          const managedAgents = await options.lifecycle.inspectManagedAgents({
+            sessionId: command.sessionId,
+          });
           state = {
             ...state,
             revision: state.revision + 1,
@@ -3901,7 +3895,6 @@ export async function createPresentationSession(
             status: "admitted",
             commandId,
             resource: null,
-            ...(managedAgentControl === undefined ? {} : { managedAgentControl }),
           };
         } catch (error) {
           if (

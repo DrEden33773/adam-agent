@@ -2,10 +2,10 @@ import type { AuthoritativePresentationSnapshot } from "@adam-agent/presentation
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { expect, test, vi } from "vitest";
 
-import { AgentNavigator, ManagedAgentRoster } from "./agent-navigator.js";
+import { LegacyAgentHistory } from "./legacy-agent-history.js";
 import { createAdamTuiTheme } from "./theme.js";
 
-test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel intent", () => {
+test("LegacyAgentHistory renders responsive NO_COLOR list and detail with inert execution keys", () => {
   const managedAgents: AuthoritativePresentationSnapshot["managedAgents"] = {
     counts: { active: 1, terminal: 1, attention: 0 },
     agents: [
@@ -73,46 +73,34 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
       },
     ],
   };
-  const onCancel = vi.fn();
-  const navigator = new AgentNavigator({
+  const navigator = new LegacyAgentHistory({
     managedAgents,
-    onCancel,
+
     onChange: vi.fn(),
     onClose: vi.fn(),
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
 
   const listed = navigator.render(80).join("\n");
-  expect(listed).toContain("Agents · 1 active · 1 terminal");
+  expect(listed).toContain("Agent history · 2 records");
   expect(listed).toContain("scout.v1 · running");
   expect(navigator.render(40).join("\n")).not.toContain("\u001b[");
   navigator.handleInput("\r");
   const detail = navigator.render(80).join("\n");
-  expect(detail).toContain("Agent detail");
+  expect(detail).toContain("Agent history detail");
   expect(detail).toContain("revision 1");
   for (const width of [40, 80, 120]) {
     expect(navigator.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
     expect(navigator.render(width).join("\n")).not.toContain("\u001b[");
   }
-  navigator.handleInput("\u001b[99;1:1u");
-  expect(onCancel).not.toHaveBeenCalled();
-  expect(navigator.render(80).join("\n")).toContain("Press c again to stop this exact child");
-  navigator.handleInput("\u001b[99;1:2u");
-  navigator.handleInput("\u001b[99;1:3u");
-  expect(onCancel).not.toHaveBeenCalled();
-  expect(navigator.render(80).join("\n")).toContain("Press c again to stop this exact child");
-  navigator.handleInput("\u001b[99;1:1u");
-  expect(onCancel).toHaveBeenCalledWith({
-    agentId: "123e4567-e89b-42d3-a456-426614174201",
-    expectedRevision: 1,
-  });
+  for (const key of ["c", "c", "m", "r", "\u001b[99;1:1u", "\u001b[99;1:2u", "\u001b[99;1:3u"])
+    navigator.handleInput(key);
+  expect(navigator.render(80).join("\n")).toBe(detail);
 });
 
-test("AgentNavigator renders one bounded attention question and emits its exact reply intent", () => {
-  const onReply = vi.fn();
-  const onCancel = vi.fn();
-  const navigator = new AgentNavigator({
+test("LegacyAgentHistory renders one bounded historical attention question without a reply action", () => {
+  const navigator = new LegacyAgentHistory({
     managedAgents: {
       counts: { active: 1, terminal: 0, attention: 1 },
       agents: [
@@ -154,34 +142,23 @@ test("AgentNavigator renders one bounded attention question and emits its exact 
         },
       ],
     },
-    onCancel,
+
     onChange: vi.fn(),
     onClose: vi.fn(),
-    onReply,
+
     theme: createAdamTuiTheme(true),
   });
 
   navigator.handleInput("\r");
   const detail = navigator.render(48).join("\n");
   expect(detail).toContain("Parent input requested · Which exact source");
-  expect(detail).toContain("r reply exact attention");
+  expect(detail).toContain("Read-only history");
   expect(navigator.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
-  navigator.handleInput("r");
-  expect(onReply).toHaveBeenCalledWith({
-    agentId: "123e4567-e89b-42d3-a456-426614174211",
-    expectedRevision: 3,
-    attentionId: "123e4567-e89b-42d3-a456-426614174213",
-  });
-  navigator.handleInput("c");
-  expect(onCancel).not.toHaveBeenCalled();
-  navigator.handleInput("c");
-  expect(onCancel).toHaveBeenCalledWith({
-    agentId: "123e4567-e89b-42d3-a456-426614174211",
-    expectedRevision: 3,
-  });
+  for (const key of ["r", "c", "c"]) navigator.handleInput(key);
+  expect(navigator.render(48).join("\n")).toBe(detail);
 });
 
-test("causal managed updates preserve exact detail identity and bound the active roster to three rows", () => {
+test("historical snapshot updates preserve the exact selected detail identity", () => {
   const first = managedAgentFixture();
   const terminal = managedAgentFixture({
     agentId: "123e4567-e89b-42d3-a456-426614174203",
@@ -201,12 +178,12 @@ test("causal managed updates preserve exact detail identity and bound the active
     status: "stalled" as const,
     revision: 4,
   };
-  const navigator = new AgentNavigator({
+  const navigator = new LegacyAgentHistory({
     managedAgents,
-    onCancel: vi.fn(),
+
     onChange: vi.fn(),
     onClose: vi.fn(),
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
   navigator.handleInput("\u001b[B");
@@ -225,27 +202,9 @@ test("causal managed updates preserve exact detail identity and bound the active
   const updatedDetail = navigator.render(80).join("\n");
   expect(updatedDetail).toContain(terminal.agentId);
   expect(updatedDetail).toContain("recovery_required · revision 5");
-
-  const roster = new ManagedAgentRoster({
-    managedAgents: {
-      counts: { active: 4, terminal: 1, attention: 1 },
-      agents: [
-        first,
-        { ...first, agentId: "123e4567-e89b-42d3-a456-426614174209", revision: 3 },
-        fourth,
-        { ...first, agentId: "123e4567-e89b-42d3-a456-426614174210", revision: 5 },
-        terminal,
-      ],
-    },
-    theme: createAdamTuiTheme(true),
-  });
-  const rosterLines = roster.render(80);
-  expect(rosterLines).toHaveLength(3);
-  expect(rosterLines.join("\n")).toContain("+1 active");
-  expect(rosterLines.join("\n")).not.toContain(terminal.agentId);
 });
 
-test("AgentNavigator reads one bounded sanitized transcript page and renders exact capacity truth", async () => {
+test("LegacyAgentHistory reads one bounded sanitized transcript page and renders exact capacity truth", async () => {
   const agent = managedAgentFixture({
     context: {
       contextWindowTokens: 1_000_000,
@@ -306,10 +265,10 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
       olderCursor: "older-1",
     };
   });
-  let navigator!: AgentNavigator;
-  navigator = new AgentNavigator({
+  let navigator!: LegacyAgentHistory;
+  navigator = new LegacyAgentHistory({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
-    onCancel: vi.fn(),
+
     onChange() {
       if (navigator.render(120).join("\n").includes("Bounded child evidence.")) {
         firstPageLoaded.resolve();
@@ -317,7 +276,7 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
     },
     onClose: vi.fn(),
     onReadTranscript,
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
 
@@ -349,7 +308,7 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
   });
 });
 
-test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifact surfaces", async () => {
+test("LegacyAgentHistory reuses sanitized reasoning, tool preview and bounded artifact surfaces", async () => {
   const agent = managedAgentFixture({
     transcript: { childSessionId: "child-surface", throughSequence: 4 },
   });
@@ -422,10 +381,10 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
   });
   const transcriptLoaded = Promise.withResolvers<void>();
   const artifactLoaded = Promise.withResolvers<void>();
-  let navigator!: AgentNavigator;
-  navigator = new AgentNavigator({
+  let navigator!: LegacyAgentHistory;
+  navigator = new LegacyAgentHistory({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
-    onCancel: vi.fn(),
+
     onChange() {
       const rendered = navigator.render(120).join("\n");
       if (rendered.includes("tool preview line")) transcriptLoaded.resolve();
@@ -434,7 +393,7 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
     onClose: vi.fn(),
     onReadArtifact,
     onReadTranscript,
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
   navigator.handleInput("\r");
@@ -469,7 +428,7 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
   expect(navigator.render(120).join("\n")).toContain("tool preview line");
 });
 
-test("AgentNavigator discards a late artifact page when the selected agent attempt changes", async () => {
+test("LegacyAgentHistory discards a late artifact page when the selected agent attempt changes", async () => {
   const oldAgent = managedAgentFixture({
     transcript: { childSessionId: "child-old", throughSequence: 4 },
   });
@@ -539,10 +498,10 @@ test("AgentNavigator discards a late artifact page when the selected agent attem
       olderCursor: null,
     }),
   );
-  let navigator!: AgentNavigator;
-  navigator = new AgentNavigator({
+  let navigator!: LegacyAgentHistory;
+  navigator = new LegacyAgentHistory({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [oldAgent] },
-    onCancel: vi.fn(),
+
     onChange() {
       const rendered = navigator.render(120).join("\n");
       if (rendered.includes("a read artifact")) oldTranscriptLoaded.resolve();
@@ -551,7 +510,7 @@ test("AgentNavigator discards a late artifact page when the selected agent attem
     onClose: vi.fn(),
     onReadArtifact,
     onReadTranscript,
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
 
@@ -559,10 +518,10 @@ test("AgentNavigator discards a late artifact page when the selected agent attem
   await oldTranscriptLoaded.promise;
   navigator.handleInput("a");
   await artifactStarted.promise;
-  navigator.setManagedAgents(
-    { counts: { active: 1, terminal: 0, attention: 0 }, agents: [newAgent] },
-    [],
-  );
+  navigator.setManagedAgents({
+    counts: { active: 1, terminal: 0, attention: 0 },
+    agents: [newAgent],
+  });
   releaseArtifact.resolve();
   await staleArtifactSettled.promise;
 
@@ -572,174 +531,72 @@ test("AgentNavigator discards a late artifact page when the selected agent attem
   expect(rendered).not.toContain("stale artifact body");
 });
 
-test("a stalled Agent detail offers an exact ordinary message with safe-boundary delivery copy", () => {
+test("manual historical transcript scroll preserves the reading position across a refreshed page", async () => {
   const agent = managedAgentFixture({
-    status: "stalled",
-    phase: "stalled",
-    watchdog: { state: "stalled", maximumInactivityMilliseconds: 300_000 },
+    transcript: { childSessionId: "child-history", throughSequence: 12 },
   });
-  const onMessage = vi.fn();
-  const navigator = new AgentNavigator({
-    managedAgents: { counts: { active: 1, terminal: 0, attention: 1 }, agents: [agent] },
-    onCancel: vi.fn(),
-    onChange: vi.fn(),
-    onClose: vi.fn(),
-    onMessage,
-    onReply: vi.fn(),
-    theme: createAdamTuiTheme(true),
-  });
-
-  navigator.handleInput("\r");
-  const detail = navigator.render(80).join("\n");
-  expect(detail).toContain("stalled · revision 1 · stalled");
-  expect(detail).toContain("m message at next safe boundary; delivery does not imply compliance");
-  navigator.handleInput("m");
-  expect(onMessage).toHaveBeenCalledWith({ agentId: agent.agentId, expectedRevision: 1 });
-});
-
-test("terminal Agent details ignore removed follow-up input and retain eligible recovery", () => {
-  const completed = managedAgentFixture({ status: "completed", phase: "terminal", revision: 6 });
-  const recovery = managedAgentFixture({
-    agentId: "123e4567-e89b-42d3-a456-426614174231",
-    status: "recovery_required",
-    phase: "terminal",
-    revision: 8,
-  });
-  const onRecovery = vi.fn();
-  const navigator = new AgentNavigator({
-    managedAgents: {
-      counts: { active: 0, terminal: 2, attention: 0 },
-      agents: [completed, recovery],
-    },
-    onCancel: vi.fn(),
-    onChange: vi.fn(),
-    onClose: vi.fn(),
-    onRecovery,
-    onReply: vi.fn(),
-    theme: createAdamTuiTheme(true),
-  });
-
-  navigator.handleInput("\r");
-  const completedFrame = navigator.render(80).join("\n");
-  expect(completedFrame).not.toContain("f follow-up");
-  navigator.handleInput("f");
-  expect(navigator.render(80).join("\n")).toBe(completedFrame);
-  navigator.handleInput("\u001b[27;1;27~");
-  navigator.handleInput("\u001b[B");
-  navigator.handleInput("\r");
-  expect(navigator.render(80).join("\n")).toContain("r recover from exact durable evidence");
-  navigator.handleInput("r");
-  expect(onRecovery).toHaveBeenCalledWith({
-    agentId: recovery.agentId,
-    expectedRevision: recovery.revision,
-  });
-});
-
-test("manual managed transcript scroll pauses live-tail following and PageDown resumes it", async () => {
-  const agent = managedAgentFixture({
-    transcript: { childSessionId: "child-live", throughSequence: 9 },
-  });
-  const initialPage = {
-    type: "managed_agent_transcript_page",
-    agentId: agent.agentId,
-    attemptId: agent.attemptId,
-    childSessionId: agent.transcript.childSessionId,
-    throughSequence: agent.transcript.throughSequence,
-    items: Array.from({ length: 8 }, (_, index) => ({
-      type: "assistant_message" as const,
-      id: `assistant-${index}`,
-      sequence: index + 1,
-      sourceSessionId: agent.transcript.childSessionId,
-      branchBoundary: null,
-      text: `durable-${index}`,
-      artifact: null,
-    })),
-    olderCursor: null,
-  } as const;
-  let refreshReadStarted = false;
-  const onReadTranscript = vi.fn(async (input: { readonly expectedThroughSequence: number }) => {
-    if (input.expectedThroughSequence !== 10) {
-      return initialPage;
-    }
-    refreshReadStarted = true;
-    return {
-      ...initialPage,
-      throughSequence: 10,
-      items: Array.from({ length: 5 }, (_, index) => ({
-        type: "assistant_message" as const,
-        id: `assistant-${index + 5}`,
-        sequence: index + 6,
-        sourceSessionId: agent.transcript.childSessionId,
-        branchBoundary: null,
-        text: `durable-${index + 5}`,
-        artifact: null,
-      })),
-    };
-  });
-  const transcriptLoaded = Promise.withResolvers<void>();
-  const transcriptRefreshed = Promise.withResolvers<void>();
-  let navigator!: AgentNavigator;
-  navigator = new AgentNavigator({
-    managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
-    onCancel: vi.fn(),
+  const loaded = Promise.withResolvers<void>();
+  const refreshed = Promise.withResolvers<void>();
+  let readingRefresh = false;
+  let history!: LegacyAgentHistory;
+  history = new LegacyAgentHistory({
+    managedAgents: { counts: { active: 0, terminal: 1, attention: 0 }, agents: [agent] },
+    maximumContentHeight: () => 12,
     onChange() {
-      const rendered = navigator.render(80).join("\n");
-      if (rendered.includes("durable-7")) transcriptLoaded.resolve();
-      if (
-        refreshReadStarted &&
-        rendered.includes("reading paused") &&
-        rendered.includes("durable-2") &&
-        rendered.includes("durable-6")
-      ) {
-        transcriptRefreshed.resolve();
-      }
+      const text = history.render(80).join("\n");
+      if (text.includes("durable-11")) loaded.resolve();
+      if (readingRefresh && text.includes("reading paused") && !text.includes("Loading"))
+        refreshed.resolve();
     },
-    onClose: vi.fn(),
-    onReadTranscript,
-    onReply: vi.fn(),
-    theme: createAdamTuiTheme(true),
-  });
-  navigator.handleInput("\r");
-  await transcriptLoaded.promise;
-  expect(navigator.render(80).join("\n")).toContain("durable-7");
-  navigator.handleInput("\u001b[A");
-  const updatedAgent = {
-    ...agent,
-    transcript: { ...agent.transcript, throughSequence: 10 },
-  };
-  navigator.setManagedAgents(
-    { counts: { active: 1, terminal: 0, attention: 0 }, agents: [updatedAgent] },
-    [
-      {
+    onClose() {},
+    async onReadTranscript(input) {
+      readingRefresh = input.expectedThroughSequence === 13;
+      return {
+        type: "managed_agent_transcript_page",
         agentId: agent.agentId,
         attemptId: agent.attemptId,
         childSessionId: agent.transcript.childSessionId,
-        activity: "replying",
-        assistant: { itemId: "live-1", text: "live child tail" },
-      },
-    ],
-  );
-  await transcriptRefreshed.promise;
-  const paused = navigator.render(80).join("\n");
-  expect(paused).toContain("reading paused");
-  expect(paused).toContain("durable-2");
-  navigator.handleInput("\u001b[6~");
-  const resumed = navigator.render(80).join("\n");
-  expect(resumed).toContain("following live tail");
-  expect(resumed).toContain("live child tail");
+        throughSequence: input.expectedThroughSequence,
+        olderCursor: null,
+        items: Array.from({ length: input.expectedThroughSequence }, (_, index) => ({
+          type: "assistant_message" as const,
+          id: `assistant-${index}`,
+          sequence: index + 1,
+          sourceSessionId: agent.transcript.childSessionId,
+          branchBoundary: null,
+          text: `durable-${index}`,
+          artifact: null,
+        })),
+      };
+    },
+    theme: createAdamTuiTheme(true),
+  });
+  history.handleInput("\r");
+  await loaded.promise;
+  history.handleInput("\u001b[A");
+  history.handleInput("\u001b[A");
+  const before = history.render(80).filter((line) => line.startsWith("durable-"));
+  expect(before.length).toBeGreaterThan(0);
+  history.setManagedAgents({
+    counts: { active: 0, terminal: 1, attention: 0 },
+    agents: [{ ...agent, transcript: { ...agent.transcript, throughSequence: 13 } }],
+  });
+  await refreshed.promise;
+  expect(history.render(80).filter((line) => line.startsWith("durable-"))).toEqual(before);
+  history.handleInput("\u001b[6~");
+  expect(history.render(80).join("\n")).toContain("durable-12");
 });
 
-test("Agent detail preserves controls and one transcript row inside the minimum overlay height", () => {
+test("Agent history detail preserves read navigation and one transcript row inside the minimum overlay height", () => {
   const agent = managedAgentFixture({ status: "stalled", phase: "stalled" });
   let height = 8;
-  const navigator = new AgentNavigator({
+  const navigator = new LegacyAgentHistory({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 1 }, agents: [agent] },
     maximumContentHeight: () => height,
-    onCancel: vi.fn(),
+
     onChange: vi.fn(),
     onClose: vi.fn(),
-    onMessage: vi.fn(),
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
   navigator.handleInput("\r");
@@ -748,15 +605,15 @@ test("Agent detail preserves controls and one transcript row inside the minimum 
     const lines = navigator.render(104);
     const rendered = lines.join("\n");
     expect(lines.length, `height ${height}`).toBeLessThanOrEqual(height);
-    expect(rendered, `height ${height}`).toContain("Agent detail");
-    expect(rendered, `height ${height}`).toContain("m message");
+    expect(rendered, `height ${height}`).toContain("Agent history detail");
+    expect(rendered, `height ${height}`).toContain("Read-only history");
     expect(rendered, `height ${height}`).toContain("Esc back");
     expect(rendered, `height ${height}`).toContain("Transcript · read-only");
     expect(rendered, `height ${height}`).toContain("Transcript is unavailable");
   }
 });
 
-test("Agent roster keeps the focused child visible inside the minimum overlay height", () => {
+test("Agent history list keeps the focused child visible inside the minimum overlay height", () => {
   const agents = Array.from({ length: 6 }, (_, index) =>
     managedAgentFixture({
       agentId: `123e4567-e89b-42d3-a456-${String(index + 1).padStart(12, "0")}`,
@@ -764,13 +621,13 @@ test("Agent roster keeps the focused child visible inside the minimum overlay he
       profile: index === 5 ? "research.v2" : "scout.v1",
     }),
   );
-  const navigator = new AgentNavigator({
+  const navigator = new LegacyAgentHistory({
     managedAgents: { counts: { active: 6, terminal: 0, attention: 0 }, agents },
     maximumContentHeight: () => 8,
-    onCancel: vi.fn(),
+
     onChange: vi.fn(),
     onClose: vi.fn(),
-    onReply: vi.fn(),
+
     theme: createAdamTuiTheme(true),
   });
 
@@ -832,8 +689,7 @@ function managedAgentFixture(
 test.each(["running", "completed", "recovery_required", "waiting_for_parent"] as const)(
   "historical read-only %s child exposes inspection without legacy control shortcuts",
   (status) => {
-    const agent = managedAgentFixture({
-      readOnly: true,
+    const { readOnly: _readOnly, ...agent } = managedAgentFixture({
       status,
       attention: {
         attentionId: "historical-attention",
@@ -841,13 +697,9 @@ test.each(["running", "completed", "recovery_required", "waiting_for_parent"] as
         question: "Historical question",
       },
     });
-    const onAction = vi.fn();
-    const navigator = new AgentNavigator({
+    const navigator = new LegacyAgentHistory({
       managedAgents: { counts: { active: 0, terminal: 1, attention: 0 }, agents: [agent] },
-      onCancel: onAction,
-      onReply: onAction,
-      onRecovery: onAction,
-      onMessage: onAction,
+
       onChange: () => {},
       onClose: () => {},
       theme: createAdamTuiTheme(true),
@@ -858,8 +710,9 @@ test.each(["running", "completed", "recovery_required", "waiting_for_parent"] as
       expect(text).toContain("Read-only history");
       expect(text).not.toMatch(/f follow-up|r recover|r reply|c cancel|c twice cancel|m message/u);
     }
+    const before = navigator.render(80).join("\n");
     for (const key of ["f", "r", "m", "c", "c"]) navigator.handleInput(key);
-    expect(onAction).not.toHaveBeenCalled();
+    expect(navigator.render(80).join("\n")).toBe(before);
   },
 );
 
@@ -867,14 +720,14 @@ test("SGR wheel changes the selected agent without inserting search text", () =>
   const first = managedAgentFixture({ agentId: "first-agent" });
   const second = managedAgentFixture({ agentId: "second-agent" });
   let closed = false;
-  const navigator = new AgentNavigator({
+  const navigator = new LegacyAgentHistory({
     managedAgents: { counts: { active: 2, terminal: 0, attention: 0 }, agents: [first, second] },
-    onCancel() {},
+
     onChange() {},
     onClose() {
       closed = true;
     },
-    onReply() {},
+
     theme: createAdamTuiTheme(true),
   });
   navigator.render(80);

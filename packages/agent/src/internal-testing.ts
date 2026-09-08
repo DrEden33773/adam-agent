@@ -16,14 +16,15 @@ export { digestContextRecordPrefix } from "./durable-context.js";
 export { projectExecutionDomainForExtensionHost } from "./extension-host.js";
 export { createInputResourceUserMessageV1 } from "./input-resources.js";
 export {
-  createAgentManager,
-  createManagedAgentToolRegistry,
+  createHistoricalManagedAgentToolRegistry,
   type ManagedAgentDeadlineScheduler,
   type ManagedAgentInactivityScheduler,
   type ManagedAgentRecord,
   type ManagedAgentStore,
   ManagedAgentStoreError,
-  recoverInterruptedManagedAgents,
+  managedAgentSnapshotFromRecords,
+  managedAgentSnapshotWithChildHistories,
+  validateHistoricalManagedAgentChildHistory,
 } from "./managed-agent.js";
 export { createManagedAgentCapacityConfiguration } from "./managed-agent-capacity.js";
 export {
@@ -155,7 +156,6 @@ export {
   sessionAutomaticTitlesEnabled,
   sessionCloseDrainBarrier,
   sessionLogicalRunStartedBarrier,
-  sessionManagedAgentInactivityScheduler,
   sessionManagedControl,
   sessionManagedTransition,
   sessionProjectLifecycleOwner,

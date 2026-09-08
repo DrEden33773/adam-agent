@@ -1,8 +1,8 @@
-# Managed-control candidate
+# Managed agents
 
-The internal managed-control composition exercises ordinary child threads through `ManagedAgentControl`, the existing `AgentSession` loop, and shared Lifecycle/Presentation owners. It is selected by the internal test composition. The default product entry retains its existing managed-session consumer integration.
+Ordinary TUI and CLI sessions run child threads through `ManagedAgentControl`, the existing `AgentSession` loop, and shared Lifecycle/Presentation owners. The production composition owns one durable Control store and separate child session records.
 
-The same candidate composition provides the public `adam.managed-review@1` contract through OperationHost and the shared reserved Control lane. The Host owns immutable invocation identity, origin resolution, no-tool execution, total deadline, cancellation and settlement. Reviewers expose aggregate lane counts to ordinary Fleet inspection and remain outside Agent handles, controls and Main completion delivery. The [Extension API contract](../packages/extension-api/README.md) documents the wire bounds and failure outcomes; consumer migration and the default production cutover remain separate.
+The same composition provides the public `adam.managed-review@1` contract through OperationHost and the shared reserved Control lane. The Host owns immutable invocation identity, origin resolution, no-tool execution, total deadline, cancellation and settlement. Reviewers expose aggregate lane counts to ordinary Fleet inspection and remain outside Agent handles, controls and Main completion delivery. The [Extension API contract](../packages/extension-api/README.md) documents the wire bounds and failure outcomes.
 
 ## Roles and authority
 
@@ -10,7 +10,7 @@ Explore receives repository reads, explicitly selected immutable input resources
 
 Each new thread freezes its role definition, exact certified target, effective context and thinking policy, initial context, permissions and budget. Unconfigured roles inherit Main's effective target and limits. A configured but unavailable target requires an explicit Use inherited, Update, or Cancel choice. Reloading definitions or the parent Skill catalog affects future threads. Existing threads retain their frozen definitions and independently activated Skills.
 
-The candidate Plan policy, `plan-policy.hybrid-delegation-v1`, admits only the registered non-mutating role/control and Main/Research Web families under their ordinary permissions. Current Plan and permission ceilings remain enforceable at execution, queued work and recovery boundaries. Compatible work can continue while Plan is active. Plan approval is never delegated to a child.
+The current Plan policy, `plan-policy.hybrid-delegation-v1`, admits only the registered non-mutating role/control and Main/Research Web families under their ordinary permissions. Current Plan and permission ceilings remain enforceable at execution, queued work and recovery boundaries. Compatible work can continue while Plan is active. Plan approval is never delegated to a child.
 
 ## Custom definitions
 
@@ -44,10 +44,18 @@ Task only, Current request and Selected messages govern initial text sharing. Co
 
 New version-2 envelopes explicitly use an unbudgeted task policy by default. They do not derive cumulative thread, batch or Session ceilings from a model context window. Choosing a task budget in delegation review creates one immutable grant shared by every member and its continuations, including compaction. The new-turn composer accepts `/budget-add <tokens> <task>` as explicit Owner authorization for an additive grant. It never rewrites the original grant or changes a historical envelope into an unbudgeted one. Current context/output capabilities and explicitly frozen role/reviewer restrictions remain distinct.
 
-Provider reservations bind exact child transcript boundaries. Missing usage retains spending uncertainty; a late receipt settles once, and a missing accounting link requires inspection rather than a refund. A still-affordable closing request has no tools and reports retained evidence and unfinished work. If no request fits, the outcome retains available evidence and explains the budget stop. These budget semantics are also used by the default managed-session consumer; this does not activate the complete Control-path production cutover.
+Provider reservations bind exact child transcript boundaries. Missing usage retains spending uncertainty; a late receipt settles once, and a missing accounting link requires inspection rather than a refund. A still-affordable closing request has no tools and reports retained evidence and unfinished work. If no request fits, the outcome retains available evidence and explains the budget stop.
+
+## Capacity and navigation
+
+Background `spawn_agents` admits 1–32 entries atomically, with eight running per Main session by default and overflow queued. Additional batches may exceed the old queue-count boundary; ordinary history and turn identities have no lifetime count ceiling. Explicit task grants, role constraints and durable storage capacity remain enforced. Foreground accepts one entry and shares one reserved running slot with review; four further reserved requests may wait. Waiting permissions release running capacity, and an accepted decision must reacquire a slot before the next effect proceeds.
+
+The startup card shows the admitted identity and `Ctrl+O` expands its tool details. Persistent Agent activity summarizes running, waiting, queued and finished work, with hidden counts under compression. `/agents` opens the workspace; `d` opens exact details, Enter opens a conversation, and layered Escape returns to Main. Mouse wheel and End control the conversation viewport. From an empty Main composer, Down enters Fleet navigation. Selected `@` handles preserve exact identity and the child composer keeps its own draft.
+
+Todo, Plan, Attention, Operation/Review, Main input and the target footer coexist at supported terminal sizes of at least 40 columns and 12 rows. Small layouts retain summaries before optional detail. Main permission takes focus above child views and returns to the prior view after resolution. Dismissed Plan review remains dismissed until explicitly opened or its exact subject changes. `/exit` and Ctrl+Q use the same authoritative cleanup path; terminal modes are restored after settlement.
 
 ## Recovery and verification
 
-Recovery reconstructs frozen Prompt/Skill/resource context and resource usage from canonical records. It validates the child admission link and exact resource occurrences, preserves exact task grants and historical budget policies, and never resends an acknowledged unfinished provider request. Historical control formats remain readable without becoming executable through the candidate.
+Recovery reconstructs frozen Prompt/Skill/resource context and resource usage from canonical records. It validates the child admission link and exact resource occurrences, preserves exact task grants and historical budget policies, and never resends an acknowledged unfinished provider request. Historical control formats remain readable. Their old execution tools and managed-session capability requests are explicitly refused, and historical inspection never writes recovery or cancellation into the old manager log.
 
-Focused tests cover role discovery and administration, target recovery, direct input, editable grants, Skills/Web, selected artifacts and cold recovery. The candidate ProjectRuntime PTY spine verifies real JSONL child input, layered Escape handling, Main responsiveness and settled continuation. Full Linux Quality and the historical compatibility suites remain required before publication; deterministic tests alone do not establish model quality or production readiness.
+Focused tests cover role discovery and administration, target recovery, direct input, editable grants, Skills/Web, selected artifacts and cold recovery. The ordinary ProjectRuntime PTY spine verifies real JSONL child input, layered Escape handling, Main responsiveness and settled continuation. Full Linux Quality and the historical compatibility suites remain required before publication; deterministic tests alone do not establish model quality or production readiness.

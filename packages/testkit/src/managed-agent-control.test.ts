@@ -5,11 +5,11 @@ import {
   ModelDriverError,
 } from "@adam-agent/agent";
 import {
+  createHistoricalManagedAgentToolRegistry,
   createInMemoryManagedAgentControlStore,
   createInMemorySessionStore,
   createInMemorySessionStoreDirectory,
   createManagedAgentControl,
-  createManagedAgentToolRegistry,
   createProjectExecutionDomain,
   managedAgentRecordBarrier,
   managedAgentSettlementBarrier,
@@ -1114,7 +1114,7 @@ test("ManagedAgentControl reports a cleanup deadline and incomplete close while 
 test.each(["managed-agent-tools.a1.v1", "managed-agent-tools.a1.v2"] as const)(
   "Historical %s decodes its exact schema and refuses new execution without a manager",
   (profile) => {
-    const registry = createManagedAgentToolRegistry({ readOnly: true, profile });
+    const registry = createHistoricalManagedAgentToolRegistry({ profile });
     expect(registry.resolve("spawn_agents")).toBeUndefined();
     expect(registry.resolve("spawn_agent")?.prepare('{"task":"Inspect evidence."}')).toMatchObject({
       status: "failed",
