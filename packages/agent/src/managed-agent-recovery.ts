@@ -370,7 +370,12 @@ export function validateFleetTaskProviderReceipts(
   controlRecords: readonly ManagedControlRecord[],
   allowPendingSource = false,
 ): void {
-  if (admission.event.type !== "admitted" || admission.event.envelope?.version !== 2) return;
+  if (
+    admission.event.type !== "admitted" ||
+    admission.event.envelope === undefined ||
+    admission.event.envelope.version === 1
+  )
+    return;
   const receipts = controlRecords.flatMap((record) =>
     record.turnId !== admission.turnId
       ? []

@@ -72,13 +72,24 @@ const contextProfile = {
   estimatorVersion: 1,
 } as const;
 
-test("AgentSession atomically spawns four running and twenty-eight queued children while Main completes", async () => {
-  const fourStarted = Promise.withResolvers<void>();
+const currentFleetPolicy = {
+  version: 3,
+  background: { running: 8, queued: "unlimited" },
+  reserved: { running: 1, queued: 4 },
+  maximumAttempts: "unlimited",
+  threadTokens: null,
+  batchTokens: null,
+  sessionTokens: null,
+  storageBytes: 32 * 1024 * 1024,
+} as const;
+
+test("AgentSession atomically spawns eight running and twenty-four queued children while Main completes", async () => {
+  const eightStarted = Promise.withResolvers<void>();
   let childCalls = 0;
   const childModel: ModelDriver = {
     async *stream(request) {
       childCalls += 1;
-      if (childCalls === 4) fourStarted.resolve();
+      if (childCalls === 8) eightStarted.resolve();
       await new Promise<void>((resolve) => {
         if (request.signal.aborted) resolve();
         else request.signal.addEventListener("abort", () => resolve(), { once: true });
@@ -157,15 +168,15 @@ test("AgentSession atomically spawns four running and twenty-eight queued childr
       name: "spawn_agents",
       result: { status: "completed", output: { status: "admitted" } },
     });
-    await withManagedFailureGuard(fourStarted.promise, "four actual child provider starts");
+    await withManagedFailureGuard(eightStarted.promise, "eight actual child provider starts");
     const snapshot = await control.inspect({ parentSessionId });
     expect(snapshot.threads).toHaveLength(32);
-    expect(snapshot.threads.filter((thread) => thread.turn.phase === "executing")).toHaveLength(4);
-    expect(snapshot.threads.filter((thread) => thread.turn.phase === "queued")).toHaveLength(28);
+    expect(snapshot.threads.filter((thread) => thread.turn.phase === "executing")).toHaveLength(8);
+    expect(snapshot.threads.filter((thread) => thread.turn.phase === "queued")).toHaveLength(24);
     expect(snapshot.threads.map((thread) => thread.description)).toEqual(
       entries.map((entry) => entry.description),
     );
-    expect(childCalls).toBe(4);
+    expect(childCalls).toBe(8);
   } finally {
     confirmation();
     await control.dispatch({ type: "close", parentSessionId });
@@ -305,14 +316,14 @@ test("cold queued admission resumes exact protected context without adopting lat
     const admitted = await first.dispatch({
       type: "spawn_agents",
       parentSessionId,
-      entries: Array.from({ length: 5 }, (_, i) => ({
+      entries: Array.from({ length: 9 }, (_, i) => ({
         role: "builtin:explore",
         task: `Exact bytes ${i}\n中文`,
         description: `Evidence ${i}`,
       })),
     });
     if (admitted.status !== "admitted") throw new Error("Expected batch admission");
-    const queued = admitted.turns[4];
+    const queued = admitted.turns[8];
     if (queued === undefined) throw new Error("Missing queued identity");
     await first.dispatch({ type: "close", parentSessionId });
     expect(await children.open(queued.childSessionId)).toBeUndefined();
@@ -331,7 +342,7 @@ test("cold queued admission resumes exact protected context without adopting lat
         },
       },
     });
-    expect((await cold.inspect({ parentSessionId })).threads[4]?.turn).toMatchObject({
+    expect((await cold.inspect({ parentSessionId })).threads[8]?.turn).toMatchObject({
       phase: "waiting",
       waitReason: "suspended",
     });
@@ -351,7 +362,7 @@ test("cold queued admission resumes exact protected context without adopting lat
     } finally {
       observer.abort();
     }
-    expect(restarted?.messages).toContainEqual({ role: "user", content: "Exact bytes 4\n中文" });
+    expect(restarted?.messages).toContainEqual({ role: "user", content: "Exact bytes 8\n中文" });
     expect(JSON.stringify(restarted?.messages)).toContain("Original selected parent request.");
     expect(JSON.stringify(restarted?.messages)).not.toContain("Later private text");
   } finally {
@@ -389,6 +400,17 @@ async function schedulerFixture(
     executionDomain: domain,
     store,
     childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    // These original scheduler tracers retain their persisted v2 limits.
+    policy: {
+      version: 2,
+      background: { running: 4, queued: 32 },
+      reserved: { running: 1, queued: 4 },
+      maximumAttempts: 4,
+      threadTokens: null,
+      batchTokens: null,
+      sessionTokens: null,
+      storageBytes: 32 * 1024 * 1024,
+    },
     ...additions,
   });
   return {
@@ -501,73 +523,83 @@ test("lane reservations cap nonterminal admission and preserve FIFO without borr
   }
 });
 
-test("permission waits retain admission, release running capacity and reacquire before the effect with resumption priority", async () => {
-  const release = Promise.withResolvers<void>();
-  const f = await schedulerFixture(
-    {
-      async *stream(request) {
-        const task = request.messages.find((message) => message.role === "user");
-        if (task?.role !== "user" || typeof task.content !== "string")
-          throw new Error("Missing task");
-        if (
-          task.content === "Ask 0" &&
-          !request.messages.some((message) => message.role === "tool")
-        ) {
-          yield { type: "tool_call_start", id: "read-evidence", name: "read_file" };
-          yield { type: "tool_call_delta", id: "read-evidence", json: '{"path":"package.json"}' };
-          yield { type: "tool_call_end", id: "read-evidence" };
+test.each([4, 8])(
+  "permission waits release %s-slot capacity and reacquire with resumption priority",
+  async (capacity) => {
+    const release = Promise.withResolvers<void>();
+    const f = await schedulerFixture(
+      {
+        async *stream(request) {
+          const task = request.messages.find((message) => message.role === "user");
+          if (task?.role !== "user" || typeof task.content !== "string")
+            throw new Error("Missing task");
+          if (
+            task.content === "Ask 0" &&
+            !request.messages.some((message) => message.role === "tool")
+          ) {
+            yield { type: "tool_call_start", id: "read-evidence", name: "read_file" };
+            yield { type: "tool_call_delta", id: "read-evidence", json: '{"path":"package.json"}' };
+            yield { type: "tool_call_end", id: "read-evidence" };
+            yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          if (task.content !== "Ask 0") {
+            const abort = Promise.withResolvers<void>();
+            if (request.signal.aborted) abort.resolve();
+            else request.signal.addEventListener("abort", () => abort.resolve(), { once: true });
+            await Promise.race([release.promise, abort.promise]);
+          }
+          yield { type: "text_delta", text: task.content };
           yield { type: "usage", inputTokens: 20, outputTokens: 10 };
-          yield { type: "finish", reason: "tool_calls" };
-          return;
-        }
-        if (task.content !== "Ask 0") {
-          const abort = Promise.withResolvers<void>();
-          if (request.signal.aborted) abort.resolve();
-          else request.signal.addEventListener("abort", () => abort.resolve(), { once: true });
-          await Promise.race([release.promise, abort.promise]);
-        }
-        yield { type: "text_delta", text: task.content };
-        yield { type: "usage", inputTokens: 20, outputTokens: 10 };
-        yield { type: "finish", reason: "stop" };
+          yield { type: "finish", reason: "stop" };
+        },
       },
-    },
-    { permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }) },
-  );
-  try {
-    const result = await f.control.dispatch(batch(6, "Ask"));
-    expect(result.status).toBe("admitted");
-    await observeUntil(
-      f.control,
-      (snapshot) =>
-        snapshot.threads[0]?.turn.waitReason === "permission" &&
-        snapshot.threads[4]?.turn.phase === "executing",
+      {
+        permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+        ...(capacity === 8 ? { policy: currentFleetPolicy } : {}),
+      },
     );
-    const snapshot = await f.control.inspect({ parentSessionId });
-    const thread = snapshot.threads[0];
-    if (thread?.turn.attention === undefined) throw new Error("Missing exact permission request");
-    expect(snapshot.threads.filter((entry) => entry.turn.phase === "executing")).toHaveLength(4);
-    const decision = await f.control.dispatch({
-      type: "decide_permission",
-      parentSessionId,
-      threadId: thread.threadId,
-      expectedTurnId: thread.turn.turnId,
-      requestId: thread.turn.attention.id,
-      decision: "allow",
-    });
-    expect(decision).toMatchObject({ status: "accepted" });
-    await observeUntil(f.control, (state) => state.threads[0]?.turn.waitReason === "capacity");
-    expect((await f.control.inspect({ parentSessionId })).threads[5]?.turn.phase).toBe("queued");
-    release.resolve();
-    await observeUntil(f.control, (state) => state.completions.length === 6);
-    const resumed = (await f.store.read()).filter(
-      (record) => record.event.type === "capacity_acquired",
-    );
-    expect(resumed[0]?.threadId).toBe(thread.threadId);
-  } finally {
-    release.resolve();
-    await f.close();
-  }
-});
+    try {
+      const result = await f.control.dispatch(batch(capacity + 2, "Ask"));
+      expect(result.status).toBe("admitted");
+      await observeUntil(
+        f.control,
+        (snapshot) =>
+          snapshot.threads[0]?.turn.waitReason === "permission" &&
+          snapshot.threads[capacity]?.turn.phase === "executing",
+      );
+      const snapshot = await f.control.inspect({ parentSessionId });
+      const thread = snapshot.threads[0];
+      if (thread?.turn.attention === undefined) throw new Error("Missing exact permission request");
+      expect(snapshot.threads.filter((entry) => entry.turn.phase === "executing")).toHaveLength(
+        capacity,
+      );
+      const decision = await f.control.dispatch({
+        type: "decide_permission",
+        parentSessionId,
+        threadId: thread.threadId,
+        expectedTurnId: thread.turn.turnId,
+        requestId: thread.turn.attention.id,
+        decision: "allow",
+      });
+      expect(decision).toMatchObject({ status: "accepted" });
+      await observeUntil(f.control, (state) => state.threads[0]?.turn.waitReason === "capacity");
+      expect((await f.control.inspect({ parentSessionId })).threads[capacity + 1]?.turn.phase).toBe(
+        "queued",
+      );
+      release.resolve();
+      await observeUntil(f.control, (state) => state.completions.length === capacity + 2);
+      const resumed = (await f.store.read()).filter(
+        (record) => record.event.type === "capacity_acquired",
+      );
+      expect(resumed[0]?.threadId).toBe(thread.threadId);
+    } finally {
+      release.resolve();
+      await f.close();
+    }
+  },
+);
 
 test("immutable grants share one Session ceiling and unknown provider usage retains capacity until exact settlement", async () => {
   let calls = 0;
@@ -1506,6 +1538,16 @@ test.each([1, 4])(
     const cold = await schedulerFixture(model, {
       store: first.store,
       childSessionStores: children,
+      policy: {
+        version: 3,
+        background: { running: 8, queued: "unlimited" },
+        reserved: { running: 1, queued: 4 },
+        maximumAttempts: "unlimited",
+        threadTokens: null,
+        batchTokens: null,
+        sessionTokens: null,
+        storageBytes: 32 * 1024 * 1024,
+      },
     });
     try {
       const continuation = await cold.control.dispatch({
@@ -2110,7 +2152,7 @@ test.each(["wait", "suspend"] as const)(
   async (choice) => {
     const h = createInMemorySessionLifecycleHarness();
     const store = createInMemoryManagedAgentControlStore();
-    const fourStarted = Promise.withResolvers<void>();
+    const eightStarted = Promise.withResolvers<void>();
     const finish = Promise.withResolvers<void>();
     let calls = 0;
     const driver: ModelDriver = {
@@ -2126,7 +2168,7 @@ test.each(["wait", "suspend"] as const)(
           yield { type: "finish", reason: "stop" };
           return;
         }
-        if (++calls === 4) fourStarted.resolve();
+        if (++calls === 8) eightStarted.resolve();
         await Promise.race([
           finish.promise,
           new Promise<void>((resolve) => {
@@ -2178,8 +2220,8 @@ test.each(["wait", "suspend"] as const)(
     try {
       const control = await lifecycle[sessionManagedControl](a.sessionId);
       if (control === undefined) throw new Error("No source Control");
-      await control.dispatch({ ...batch(5), parentSessionId: a.sessionId });
-      await fourStarted.promise;
+      await control.dispatch({ ...batch(9), parentSessionId: a.sessionId });
+      await eightStarted.promise;
       expect(
         await presentation.dispatch({ type: "select_session", sessionId: b.sessionId }),
       ).toMatchObject({ status: "rejected", code: "transition_required" });
@@ -2222,14 +2264,14 @@ test.each(["wait", "suspend"] as const)(
       expect(await switching).toMatchObject({ status: "admitted" });
       expect(presentation.getState().authoritative.active?.session.id).toBe(b.sessionId);
       expect(presentation.getState().authoritative.managedControl?.threads).toEqual([]);
-      expect((await control.inspect({ parentSessionId: a.sessionId })).threads[4]?.turn.phase).toBe(
+      expect((await control.inspect({ parentSessionId: a.sessionId })).threads[8]?.turn.phase).toBe(
         choice === "suspend" ? "waiting" : "idle",
       );
       expect(
         await control.dispatch({ ...batch(1, "Stale source"), parentSessionId: a.sessionId }),
       ).toMatchObject({ status: "rejected", code: "authority_busy" });
       const sourceSnapshot = await control.inspect({ parentSessionId: a.sessionId });
-      const last = sourceSnapshot.threads[4];
+      const last = sourceSnapshot.threads[8];
       if (last === undefined) throw new Error("Missing original target");
       expect(
         await control.dispatch({
@@ -2241,7 +2283,7 @@ test.each(["wait", "suspend"] as const)(
         status: "resumed",
         results: [{ status: "rejected", code: "authority_busy" }],
       });
-      expect(calls).toBe(choice === "suspend" ? 4 : 5);
+      expect(calls).toBe(choice === "suspend" ? 8 : 9);
       const source = await lifecycle.inspect({ sessionId: a.sessionId });
       if (source.schemaVersion !== 3) throw new Error("Missing source");
       const branch = await lifecycle.branch({

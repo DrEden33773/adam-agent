@@ -271,11 +271,11 @@ test.each([{}, { columns: 40, rows: 12 }])(
   async (viewport) => {
     let stopping = false;
     let calls = 0;
-    const four = Promise.withResolvers<void>();
+    const eight = Promise.withResolvers<void>();
     const driver: ModelDriver = {
       async *stream(request) {
         calls += 1;
-        if (calls === 4) four.resolve();
+        if (calls === 8) eight.resolve();
         if (!stopping)
           await new Promise<void>((resolve) =>
             request.signal.addEventListener("abort", () => resolve(), { once: true }),
@@ -294,25 +294,25 @@ test.each([{}, { columns: 40, rows: 12 }])(
         command: {
           type: "spawn_agents",
           parentSessionId: h.parent.sessionId,
-          entries: Array.from({ length: 7 }, (_, index) => ({
+          entries: Array.from({ length: 11 }, (_, index) => ({
             role: "builtin:explore" as const,
             task: `Inspect item ${index}`,
             description: `Cold item ${index}`,
           })),
         },
       });
-      await four.promise;
+      await eight.promise;
       stopping = true;
       await h.stop();
       cold = await startManagedTui(driver, { restore: h.storage, ...viewport });
       expect(cold.terminal.lines().join("\n")).not.toContain("3 running");
       await cold.press("/agents\r", "Agents workspace");
-      expect(calls).toBe(4);
-      await cold.press("\u001b[F", "@explore-7");
-      await cold.press("u", "@explore-7");
+      expect(calls).toBe(8);
+      await cold.press("\u001b[F", "@explore-11");
+      await cold.press("u", "@explore-11");
       expect(cold.terminal.lines().join("\n")).toContain("u again to resume 1");
       await cold.press("u", "Completed");
-      expect(calls).toBe(5);
+      expect(calls).toBe(9);
       await cold.press("U", "u again to resume 2");
       await cold.press("u", "Resumed 2");
       const restarted = cold;
@@ -332,7 +332,7 @@ test.each([{}, { columns: 40, rows: 12 }])(
         const unsubscribe = restarted.presentation.subscribe(check);
         check();
       });
-      expect(calls).toBe(7);
+      expect(calls).toBe(11);
       expect(
         cold.presentation
           .getState()

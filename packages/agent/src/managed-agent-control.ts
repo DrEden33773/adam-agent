@@ -56,6 +56,7 @@ import {
   type FleetPolicy,
   type FleetUsage,
   fleetBudget,
+  fleetLimit,
   fleetSessionCeiling,
   fleetStorage,
   fleetTaskBudget,
@@ -73,6 +74,7 @@ import {
   ManagedAgentStoreError,
   nodeManagedAgentDeadlineScheduler,
 } from "./managed-agent.js";
+import { type BackgroundCapacity, backgroundCapacitySchema } from "./managed-agent-capacity.js";
 import {
   foldManagedControl,
   type ManagedControlEvent,
@@ -186,6 +188,11 @@ export type ManagedWorkspaceFrame = {
 };
 
 export type ManagedAgentControl = AgentRoleAdministration & {
+  /** Owner-only execution policy update; never exposed in the model tool registry. */
+  configureBackgroundCapacity(input: {
+    readonly parentSessionId: string;
+    readonly running: BackgroundCapacity;
+  }): Promise<ManagedWorkspaceSnapshot>;
   [managedReviewAdmission](input: ReviewAdmissionInput): Promise<ManagedControlRecord>;
   [managedReviewRecovery](input: {
     readonly reviewRunId: string;
@@ -446,6 +453,7 @@ export function createManagedAgentControl(options: {
     }[]
   >;
   readonly policy?: FleetPolicy;
+  readonly persistBackgroundCapacity?: (running: BackgroundCapacity) => Promise<void>;
   readonly readPlan?: () => Promise<PlanCycleSnapshot | undefined>;
   readonly webTools?: ToolRegistry;
   readonly resolveRoleTarget?: (input: {
@@ -510,7 +518,9 @@ export function createManagedAgentControl(options: {
       return false;
     }
   };
-  const policy = resolveFleetPolicy(options.contextProfile, options.policy);
+  let policy = resolveFleetPolicy(options.contextProfile, options.policy);
+  const continuationPolicyFor = (original: DelegationEnvelope): FleetPolicy =>
+    original.version === 3 && policy.version === 3 ? policy : original.policy;
   const controlStore = options.store.forParent(options.parentSessionId);
   let serial = Promise.resolve();
   let closing = false;
@@ -770,8 +780,11 @@ export function createManagedAgentControl(options: {
               origin.event.frozen !== undefined &&
               origin.event.envelope !== undefined &&
               attempts <
-                Math.min(policy.maximumAttempts, origin.event.envelope.policy.maximumAttempts) &&
-              (origin.event.envelope.version === 2 ||
+                Math.min(
+                  fleetLimit(policy.maximumAttempts),
+                  fleetLimit(origin.event.envelope.policy.maximumAttempts),
+                ) &&
+              (origin.event.envelope.version !== 1 ||
                 inspected.budget?.available === null ||
                 (inspected.budget?.available ?? 0) > 0)
             )
@@ -874,6 +887,7 @@ export function createManagedAgentControl(options: {
     );
     return {
       ...snapshot,
+      policy: structuredClone(policy),
       threads,
       storage: await storageUsage(records, undefined, true),
       budget: fleetBudget(
@@ -1927,7 +1941,8 @@ export function createManagedAgentControl(options: {
         });
         const runTokenLimit =
           admission?.event.type === "admitted" &&
-          admission.event.envelope?.version === 2 &&
+          admission.event.envelope !== undefined &&
+          admission.event.envelope.version !== 1 &&
           frozen?.review === undefined
             ? frozen?.roleDefinition?.limits?.maxTokens
             : Math.min(
@@ -2152,6 +2167,25 @@ export function createManagedAgentControl(options: {
     message: string,
   ): ManagedControlReceipt => ({ status: "rejected", code, message });
   const control: ManagedAgentControl = {
+    async configureBackgroundCapacity(input) {
+      const running = backgroundCapacitySchema.parse(input.running);
+      if (input.parentSessionId !== options.parentSessionId)
+        throw new TypeError("This control belongs to another parent Session.");
+      const configure = () =>
+        authorized(async () => {
+          if (closing || policy.version !== 3)
+            throw new TypeError("Only an open current-policy Main can change background capacity.");
+          if (options.persistBackgroundCapacity === undefined)
+            throw new TypeError("Owner capacity configuration is unavailable.");
+          await options.persistBackgroundCapacity(running);
+          policy = { ...policy, background: { ...policy.background, running } };
+          await startReady();
+          const snapshot = await project(await controlStore.read(), options.parentSessionId);
+          for (const subscriber of subscribers) subscriber({ type: "reset", snapshot });
+          return snapshot;
+        });
+      return options.admissionGuard === undefined ? configure() : options.admissionGuard(configure);
+    },
     async [managedReviewRecovery](input) {
       await serial;
       const records = await controlStore.read();
@@ -2493,11 +2527,12 @@ export function createManagedAgentControl(options: {
                 command.additionalBudgetTokens,
                 managedControlDigest(origin),
               );
-      const sessionTokens = fleetSessionCeiling(records, first.event.envelope.policy);
+      const continuationPolicy = continuationPolicyFor(first.event.envelope);
+      const sessionTokens = fleetSessionCeiling(records, continuationPolicy);
       const available = fleetBudget(records, sessionTokens).available;
       if (available !== null && available <= 0)
         throw new FleetBudgetError("fleet_budget_exhausted");
-      return createDelegationEnvelope(first.event.envelope.policy, {
+      return createDelegationEnvelope(continuationPolicy, {
         mode: first.event.lane === "reserved" ? "foreground" : "background",
         count: 1,
         roles: [first.event.role],
@@ -3639,7 +3674,7 @@ export function createManagedAgentControl(options: {
                 (thread.turn.lane ?? "background") === lane && thread.turn.phase !== "idle",
             ).length +
               command.entries.length >
-            policy[lane].running + policy[lane].queued
+            fleetLimit(policy[lane].running) + fleetLimit(policy[lane].queued)
           )
             return rejected(
               "capacity_exhausted",
@@ -3851,7 +3886,7 @@ export function createManagedAgentControl(options: {
           )
             return rejected(
               "storage_quota_exceeded",
-              "There is not enough logical storage for the complete batch and its terminal receipts.",
+              "This Main's retained control history and child transcripts leave insufficient storage for this batch and its terminal receipts.",
             );
           const records = await controlStore.appendBatchNext(inputs);
           const lastAdmission = records.at(-1);
@@ -4248,7 +4283,8 @@ export function createManagedAgentControl(options: {
           if (
             (await controlStore.read()).filter(
               (record) => record.threadId === previous.threadId && record.event.type === "admitted",
-            ).length >= Math.min(policy.maximumAttempts, initialMaximumAttempts)
+            ).length >=
+            Math.min(fleetLimit(policy.maximumAttempts), fleetLimit(initialMaximumAttempts))
           )
             return rejected("attempt_limit", "This thread has reached its four-attempt limit.");
           if (previous.turn.phase !== "idle")
@@ -4340,6 +4376,7 @@ export function createManagedAgentControl(options: {
               ))) ||
           digest !== managedControlDigest(fields) ||
           envelope.policyDigest !== managedControlDigest(envelope.policy) ||
+          !isDeepStrictEqual(envelope.policy, continuationPolicyFor(inherited.envelope)) ||
           !isDeepStrictEqual(envelope.roles, [inherited.role]) ||
           envelope.threads !== 1 ||
           envelope.running !== 1 ||
@@ -4368,7 +4405,7 @@ export function createManagedAgentControl(options: {
           snapshot.threads.filter(
             (thread) => thread.turn.phase !== "idle" && (thread.turn.lane ?? "background") === lane,
           ).length >=
-          policy[lane].running + policy[lane].queued
+          fleetLimit(policy[lane].running) + fleetLimit(policy[lane].queued)
         )
           return rejected("capacity_exhausted", "This lane has no remaining admission capacity.");
         let continuationFrozen = inherited.frozen;
@@ -4459,7 +4496,7 @@ export function createManagedAgentControl(options: {
         )
           return rejected(
             "storage_quota_exceeded",
-            "There is no exact admission and terminal storage reservation for another turn.",
+            "This Main's retained control history and child transcripts leave insufficient storage for another turn and its terminal receipts.",
           );
         await append(identity, event);
         ready.add(identity.turnId);

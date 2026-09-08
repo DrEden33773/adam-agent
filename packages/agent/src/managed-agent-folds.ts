@@ -394,6 +394,17 @@ export function validateManagedControlRecord(
     )
       return invalid();
     const priorAdmission = threadRecords.findLast((entry) => entry.event.type === "admitted");
+    const priorEnvelope =
+      priorAdmission?.event.type === "admitted" ? priorAdmission.event.envelope : undefined;
+    const envelope = record.event.envelope;
+    // v3 scheduling semantics cannot be attached to a historical thread on replay.
+    if (
+      priorEnvelope !== undefined &&
+      envelope !== undefined &&
+      (priorEnvelope.version === 3 || envelope.version === 3) &&
+      priorEnvelope.version !== envelope.version
+    )
+      return invalid();
     const taskBudget = record.event.envelope?.taskBudget;
     if (taskBudget !== undefined) {
       const priorBudget =

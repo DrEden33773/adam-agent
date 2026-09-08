@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { ManagedDelegationContext, ManagedDelegationLimits } from "@adam-agent/presentation";
 import { z } from "zod";
 import type { ContextProfile } from "./context-profile.js";
+import { backgroundCapacitySchema } from "./managed-agent-capacity.js";
 import type { ManagedControlRecord } from "./managed-agent-folds.js";
 import { agentRoleIdSchema } from "./role-catalog.js";
 import {
@@ -43,7 +44,7 @@ export function requestedDelegationContext(
       ? "task"
       : "current_request";
 }
-export const fleetPolicySchema = z
+const historicalFleetPolicySchema = z
   .strictObject({
     version: z.union([z.literal(1), z.literal(2)]),
     background: z.strictObject({
@@ -68,14 +69,40 @@ export const fleetPolicySchema = z
           policy.sessionTokens === null,
     "Token policy fields must match their frozen version.",
   );
+export const fleetPolicySchema = z.union([
+  historicalFleetPolicySchema,
+  z.strictObject({
+    version: z.literal(3),
+    background: z.strictObject({
+      running: backgroundCapacitySchema,
+      queued: z.literal("unlimited"),
+    }),
+    reserved: z.strictObject({ running: z.literal(1), queued: z.number().int().min(0).max(4) }),
+    maximumAttempts: z.literal("unlimited"),
+    threadTokens: z.null(),
+    batchTokens: z.null(),
+    sessionTokens: z.null(),
+    storageBytes: positive.max(32 * 1024 * 1024),
+  }),
+]);
 export type FleetPolicy = z.infer<typeof fleetPolicySchema>;
+/** Unlimited is serialized explicitly; Infinity is only an arithmetic comparison bound. */
+export function fleetLimit(value: number | "unlimited"): number {
+  return value === "unlimited" ? Infinity : value;
+}
 export const delegationOriginSchema = z.strictObject({
   kind: z.enum(["main_run", "direct_request"]),
   id: z.uuid(),
   callId: z.string().min(1).max(512).optional(),
 });
 const delegationEnvelopeFields = z.strictObject({
-  version: z.union([z.literal(1), z.literal(2)]),
+  version: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+  concurrency: z
+    .discriminatedUnion("mode", [
+      z.strictObject({ mode: z.literal("owner") }),
+      z.strictObject({ mode: z.literal("limited"), running: positive.max(32) }),
+    ])
+    .optional(),
   taskBudget: taskBudgetSchema.optional(),
   id: z.uuid(),
   digest: z
@@ -88,7 +115,7 @@ const delegationEnvelopeFields = z.strictObject({
     .max(32),
   mode: z.enum(["background", "foreground"]),
   threads: positive.max(32),
-  running: positive.max(4),
+  running: positive.max(32),
   queued: z.number().int().min(0).max(32),
   aggregateTokens: positive.nullable(),
   threadTokens: positive.nullable(),
@@ -103,6 +130,15 @@ const delegationEnvelopeFields = z.strictObject({
 export const delegationEnvelopeSchema = delegationEnvelopeFields.refine(
   (envelope) =>
     envelope.version === envelope.policy.version &&
+    (envelope.version === 3
+      ? envelope.concurrency !== undefined &&
+        envelope.running <= envelope.threads &&
+        (envelope.concurrency.mode === "limited"
+          ? envelope.concurrency.running === envelope.running
+          : envelope.mode === "background" &&
+            envelope.running ===
+              Math.min(fleetLimit(envelope.policy.background.running), envelope.threads))
+      : envelope.concurrency === undefined && envelope.running <= 4) &&
     (envelope.version === 1
       ? envelope.taskBudget === undefined &&
         envelope.aggregateTokens !== null &&
@@ -133,10 +169,10 @@ export type FleetUsage = Omit<Extract<FleetProviderEvent, { type: "provider_usag
 export function resolveFleetPolicy(profile: ContextProfile, input?: FleetPolicy): FleetPolicy {
   const policy = fleetPolicySchema.parse(
     input ?? {
-      version: 2,
-      background: { running: 4, queued: 32 },
+      version: 3,
+      background: { running: 8, queued: "unlimited" },
       reserved: { running: 1, queued: 4 },
-      maximumAttempts: 4,
+      maximumAttempts: "unlimited",
       threadTokens: null,
       batchTokens: null,
       sessionTokens: null,
@@ -180,14 +216,28 @@ export function createDelegationEnvelope(
         : { version: 1, mode: "limited", taskId, grants: [{ id: taskId, tokens: budgetTokens }] };
   const value = {
     version: policy.version,
-    ...(policy.version === 2 ? { taskBudget } : {}),
+    ...(policy.version === 3
+      ? {
+          concurrency:
+            limits.running === undefined && input.mode === "background"
+              ? { mode: "owner" as const }
+              : { mode: "limited" as const, running: limits.running ?? 1 },
+        }
+      : {}),
+    ...(policy.version !== 1 ? { taskBudget } : {}),
     id: randomUUID(),
     origin: input.origin,
     roles: input.roles ?? ["builtin:explore"],
     mode: input.mode,
     threads: input.count,
-    running: Math.min(lane.running, input.count),
-    queued: Math.max(0, input.count - lane.running),
+    running: Math.min(fleetLimit(lane.running), input.count),
+    queued: Math.max(
+      0,
+      input.count -
+        (policy.version === 3 && limits.running !== undefined
+          ? limits.running
+          : fleetLimit(lane.running)),
+    ),
     aggregateTokens: minimumTokenCeiling(
       policy.batchTokens,
       input.sessionTokens,
@@ -254,9 +304,13 @@ export function delegationEnvelopeMatches(
     envelope.mode === expected.mode &&
     (expected.origin === undefined || isDeepStrictEqual(envelope.origin, expected.origin)) &&
     envelope.running <=
-      expected.policy[envelope.mode === "background" ? "background" : "reserved"].running &&
+      fleetLimit(
+        expected.policy[envelope.mode === "background" ? "background" : "reserved"].running,
+      ) &&
     envelope.queued <=
-      expected.policy[envelope.mode === "background" ? "background" : "reserved"].queued &&
+      fleetLimit(
+        expected.policy[envelope.mode === "background" ? "background" : "reserved"].queued,
+      ) &&
     (envelope.mode !== "foreground" || envelope.threads === 1) &&
     withinTokenCeiling(envelope.aggregateTokens, expected.policy.batchTokens) &&
     withinTokenCeiling(envelope.aggregateTokens, envelope.sessionTokens) &&
@@ -316,7 +370,7 @@ export function fleetSessionCeiling(
   records: readonly ManagedControlRecord[],
   policy: FleetPolicy,
 ): number | null {
-  if (policy.version === 2) return null;
+  if (policy.version !== 1) return null;
   const first = records.find(
     (entry) => entry.event.type === "admitted" && entry.event.envelope !== undefined,
   );
@@ -344,7 +398,7 @@ export function assertFleetReservation(
 ): void {
   if (admission.event.type !== "admitted" || admission.event.envelope === undefined) return;
   const envelope = admission.event.envelope;
-  if (envelope.version === 2 && envelope.taskBudget !== undefined) {
+  if (envelope.version !== 1 && envelope.taskBudget !== undefined) {
     const budget = taskBudgetUsage(
       fleetTaskBudget(records, envelope.taskBudget),
       taskFleetEvents(records, admission),
