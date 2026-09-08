@@ -573,6 +573,22 @@ export type OperationCursor = {
 
 type OperationDisplayBase = {
   readonly artifacts: readonly OperationArtifactDisplay[];
+  readonly managedReview?: {
+    readonly reviewRunId: string;
+    readonly progress?:
+      | {
+          readonly reviewRunId: string;
+          readonly phase: "waiting_for_capacity" | "settling" | "terminal";
+        }
+      | {
+          readonly reviewRunId: string;
+          readonly phase: "running";
+          readonly startedAt: string;
+          readonly totalDeadlineAt: string;
+          readonly totalMilliseconds: number;
+        };
+    readonly failure?: { readonly code: string; readonly message: string };
+  };
   readonly operationId: string;
   readonly origin: {
     readonly invocation: {

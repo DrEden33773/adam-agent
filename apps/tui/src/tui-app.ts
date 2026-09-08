@@ -2381,6 +2381,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           } else {
             card.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(status))));
           }
+          const reviewStatus = managedReviewStatusText(operation);
+          if (reviewStatus !== null) {
+            card.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(reviewStatus))));
+          }
           const actions = operationActionText(operation);
           if (actions.length > 0) {
             card.addChild(new ResponsiveLine(theme.muted(actions)));
@@ -7621,6 +7625,31 @@ function configurationFieldLabel(field: ConfigurationField): string {
     : field === "maximumOutputTokens"
       ? "output"
       : "compaction";
+}
+
+function managedReviewStatusText(operation: OperationDisplay): string | null {
+  const review = operation.managedReview;
+  if (review === undefined) return null;
+  if (review.failure !== undefined)
+    return `Review · Failed · ${review.failure.code} · ${review.failure.message}`;
+  const phase = review.progress?.phase;
+  const label =
+    phase === "waiting_for_capacity"
+      ? "Waiting for capacity"
+      : phase === "running"
+        ? "Running"
+        : phase === "settling"
+          ? "Settling"
+          : phase === "terminal"
+            ? "Terminal"
+            : "Awaiting state";
+  if (
+    phase !== "terminal" &&
+    operation.status !== "running" &&
+    operation.status !== "cancel_requested"
+  )
+    return `Review · Last recorded state: ${label}`;
+  return `Review · ${label}`;
 }
 
 function operationStatusText(operation: OperationDisplay): string {

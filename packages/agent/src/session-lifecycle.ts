@@ -482,6 +482,9 @@ export const sessionDraftRoles = Symbol("adam-agent.session-draft-roles");
 
 export type SessionLifecycleOptions = {
   readonly [sessionManagedControl]?: {
+    readonly inactivityScheduler?: Parameters<
+      typeof createManagedAgentControl
+    >[0]["inactivityScheduler"];
     readonly [managedAgentSettlementBarrier]?: () => Promise<void>;
     readonly [managedAgentRecordBarrier]?: NonNullable<
       Parameters<typeof createManagedAgentControl>[0][typeof managedAgentRecordBarrier]
@@ -1722,6 +1725,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           executionDomain,
           store: composition.store,
           childSessionStores: composition.childSessionStores,
+          ...(composition.inactivityScheduler === undefined
+            ? {}
+            : { inactivityScheduler: composition.inactivityScheduler }),
           ...(composition[managedAgentRecordBarrier] === undefined
             ? {}
             : { [managedAgentRecordBarrier]: composition[managedAgentRecordBarrier] }),
