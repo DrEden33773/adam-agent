@@ -9,7 +9,7 @@ import type {
   ManagedWorkspaceSnapshot,
   PresentationDisplayState,
 } from "@adam-agent/presentation";
-import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   type DeadlineHandle,
   type DeadlineScheduler,
@@ -126,18 +126,62 @@ export class AgentWidget implements Component {
     const finished = threads.filter((thread) => thread.turn.phase === "idle");
     const isQueuedThread = (thread: (typeof threads)[number]) =>
       thread.turn.phase === "queued" ||
-      (!thread.turn.hasStarted && thread.turn.phase === "waiting");
-    const running = threads.filter(
+      (!thread.turn.hasStarted &&
+        thread.turn.phase === "waiting" &&
+        (thread.turn.waitReason === "capacity" || thread.turn.waitReason === "suspended"));
+    const active = threads.filter(
       (thread) => thread.turn.phase !== "idle" && !isQueuedThread(thread),
     );
+    const running = active.filter(
+      (thread) => thread.turn.phase === "starting" || thread.turn.phase === "executing",
+    );
+    const waiting = active.filter((thread) => thread.turn.phase === "waiting");
+    const settling = active.filter((thread) => thread.turn.phase === "settling");
     const queued = threads.filter(isQueuedThread);
-    const renderThread = (thread: (typeof threads)[number]): string[] => {
+    const needsAttention = (thread: (typeof threads)[number]) =>
+      thread.turn.attention !== undefined ||
+      thread.turn.waitReason === "permission" ||
+      thread.turn.waitReason === "parent_input" ||
+      thread.turn.recovery === "required" ||
+      thread.turn.health === "stalled";
+    const hasError = (thread: (typeof threads)[number]) =>
+      thread.turn.lastOutcome === "failed" || thread.turn.outcome?.error !== undefined;
+    const attentionCount = threads.filter(needsAttention).length;
+    const errorCount = threads.filter(hasError).length;
+    const urgentCounts = [
+      ...(attentionCount ? [`${attentionCount} attention`] : []),
+      ...(errorCount ? [`${errorCount} error${errorCount === 1 ? "" : "s"}`] : []),
+    ];
+    const maximum = Math.max(2, this.maximumLines());
+    if (maximum === 2 && (waiting.length || settling.length || attentionCount || errorCount)) {
+      return [
+        this.theme.primary(
+          `● Agents ${threads.length}${urgentCounts.length ? ` · ${urgentCounts.join(" · ")}` : ""}`,
+        ),
+        boundedCountSummary(
+          [
+            ...(waiting.length ? [`${waiting.length} waiting`] : []),
+            ...(queued.length ? [`${queued.length} queued`] : []),
+            ...(settling.length ? [`${settling.length} settling`] : []),
+            ...(running.length ? [`${running.length} running`] : []),
+            ...(finished.length ? [`${finished.length} finished`] : []),
+          ],
+          width,
+        ),
+      ].map((line) => truncateToWidth(line, width));
+    }
+    const renderThread = (thread: (typeof threads)[number], compressed = false): string[] => {
       const activity = this.#activity.find(
         (item) => item.agentId === thread.threadId && item.attemptId === thread.turn.attemptId,
       );
       const config = thread.turn.configuration;
-      const budget = thread.budget;
       const isQueued = isQueuedThread(thread);
+      const priorityStatus =
+        compressed &&
+        (needsAttention(thread) ||
+          hasError(thread) ||
+          thread.turn.phase === "waiting" ||
+          thread.turn.phase === "settling");
       const elapsed = agentElapsedLabel(thread);
       const content =
         (activity?.tool?.status === "generating_arguments"
@@ -145,30 +189,38 @@ export class AgentWidget implements Component {
           : activity?.tool?.name) ??
         activity?.assistant?.text.split("\n").find((line) => line.trim().length > 0) ??
         (activity?.reasoning ? "Thinking…" : thread.turn.label);
+      const visibleContent =
+        (thread.turn.phase !== "executing" || thread.turn.health === "stalled") &&
+        content !== thread.turn.label
+          ? `${thread.turn.label} · ${content}`
+          : content;
       return [
-        `├─ ${isQueued ? `${thread.turn.label.split(" · ")[0]} ${thread.handle} · ` : thread.turn.phase === "executing" ? `${["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame]} ` : ""}${this.theme.reference(safeTerminalText(thread.displayName))} · ${thread.turn.phase === "idle" ? `${thread.turn.label} · ` : ""}${safeTerminalText(thread.description)}${elapsed}${thread.turn.phase === "idle" ? `${budget === undefined ? "" : ` · ${budget.knownUsed} used${budget.unknownReserved > 0 ? ` · ${budget.unknownReserved} unknown reserved` : ""}`}` : ""}`,
+        `├─ ${isQueued ? `${safeTerminalText(thread.turn.label.split(" · ")[0] ?? thread.turn.label)} ${safeTerminalText(thread.handle)} · ` : priorityStatus ? `${safeTerminalText(thread.turn.label)} · ` : thread.turn.phase === "executing" ? `${["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame]} ` : ""}${this.theme.reference(safeTerminalText(thread.displayName))} · ${thread.turn.phase === "idle" && !priorityStatus ? `${safeTerminalText(thread.turn.label)} · ` : ""}${safeTerminalText(thread.description)}${elapsed}`,
         ...(!isQueued && thread.turn.phase !== "idle"
-          ? [
-              `   ⎿ ${safeTerminalText(content)}${budget === undefined ? "" : ` · ${budget.knownUsed} used · ${budget.outstandingReserved} reserved${budget.unknownReserved ? ` · ${budget.unknownReserved} unknown` : ""}`}`,
-            ]
+          ? [`   ⎿ ${safeTerminalText(visibleContent)}`]
           : []),
-        ...((isQueued || settings?.showModel) && config !== undefined
+        ...(thread.turn.outcome?.error === undefined
+          ? []
+          : [
+              `   ⎿ ${safeTerminalText(`${thread.turn.outcome.error.code}: ${thread.turn.outcome.error.message}`)}`,
+            ]),
+        ...(settings?.showModel && config !== undefined
           ? [
               `   ${safeTerminalText(config.targetId)} · thinking ${safeTerminalText(config.thinking)}`,
             ]
           : []),
-        ...(isQueued && budget !== undefined
-          ? [
-              `   ${budget.knownUsed} used · ${budget.outstandingReserved} reserved · ${budget.unknownReserved} unknown · ${budget.available === null ? "no cumulative budget" : `${budget.available} available`}`,
-            ]
-          : []),
       ];
     };
-    const maximum = Math.max(2, this.maximumLines());
-    const normal = [...finished, ...running, ...queued].flatMap(renderThread);
+    const normal = [...finished, ...active, ...queued].flatMap((thread) => renderThread(thread));
+    const statusCounts = [
+      `${running.length} running`,
+      ...(waiting.length ? [`${waiting.length} waiting`] : []),
+      ...(settling.length ? [`${settling.length} settling`] : []),
+      `${queued.length} queued`,
+    ];
     const lines = [
       this.theme.primary(
-        `● Agents${normal.length + 1 > maximum ? ` · ${running.length} running · ${queued.length} queued` : ""}`,
+        `● Agents${normal.length + 1 > maximum ? ` · ${(urgentCounts.length ? urgentCounts : statusCounts).join(" · ")}` : ""}`,
       ),
     ];
     if (normal.length + 1 <= maximum) lines.push(...normal);
@@ -176,34 +228,35 @@ export class AgentWidget implements Component {
       const showQueueSummary = queued.length > 0 && maximum > 2;
       let budget = maximum - 2 - Number(showQueueSummary);
       let hiddenRunning = 0;
+      let hiddenWaiting = 0;
+      let hiddenSettling = 0;
       let hiddenFinished = 0;
       let hiddenDetails = 0;
-      for (const thread of running) {
+      const priority = (thread: (typeof threads)[number]) =>
+        hasError(thread) ? 2 : needsAttention(thread) ? 1 : 0;
+      const ordered = [...active, ...finished].sort(
+        (left, right) => priority(right) - priority(left),
+      );
+      for (const thread of ordered) {
         if (budget === 0) {
-          hiddenRunning += 1;
+          if (thread.turn.phase === "waiting") hiddenWaiting += 1;
+          else if (thread.turn.phase === "settling") hiddenSettling += 1;
+          else if (thread.turn.phase === "idle") hiddenFinished += 1;
+          else hiddenRunning += 1;
           continue;
         }
-        const full = renderThread(thread);
+        const full = renderThread(thread, true);
         const rendered = full.slice(0, budget);
         lines.push(...rendered);
         budget -= rendered.length;
         hiddenDetails += full.length - rendered.length;
       }
       if (showQueueSummary) lines.push(`├─ ${queued.length} queued · /agents`);
-      for (const thread of finished) {
-        if (budget === 0) {
-          hiddenFinished += 1;
-          continue;
-        }
-        const full = renderThread(thread);
-        const rendered = full.slice(0, budget);
-        lines.push(...rendered);
-        budget -= rendered.length;
-        hiddenDetails += full.length - rendered.length;
-      }
       const compact = width < 60;
       const hidden = [
         ...(hiddenRunning ? [`${hiddenRunning} ${compact ? "run" : "running"}`] : []),
+        ...(hiddenWaiting ? [`${hiddenWaiting} waiting`] : []),
+        ...(hiddenSettling ? [`${hiddenSettling} settling`] : []),
         ...(queued.length ? [`${queued.length} queued`] : []),
         ...(hiddenFinished ? [`${hiddenFinished} ${compact ? "done" : "finished"}`] : []),
         ...(hiddenDetails ? [`${hiddenDetails} ${compact ? "line" : "detail lines"}`] : []),
@@ -214,4 +267,13 @@ export class AgentWidget implements Component {
     if (lastBranch >= 0) lines[lastBranch] = (lines[lastBranch] ?? "").replace("├─", "└─");
     return lines.map((line) => truncateToWidth(line, width));
   }
+}
+
+/** Keep whole status counts; the header's total still covers any omitted categories. */
+function boundedCountSummary(parts: readonly string[], width: number): string {
+  for (let count = parts.length; count > 0; count -= 1) {
+    const text = `${parts.slice(0, count).join(" · ")}${count < parts.length ? " · …" : ""}`;
+    if (visibleWidth(text) <= width) return text;
+  }
+  return truncateToWidth(parts[0] ?? "", width);
 }

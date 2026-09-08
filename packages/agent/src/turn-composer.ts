@@ -230,7 +230,7 @@ export type TurnComposer = {
     }[];
   }>;
   unseal(): void;
-  reset(baseRevision: number, commit: () => Promise<void>): Promise<boolean>;
+  reset(baseRevision: number, commit?: () => Promise<void>): Promise<boolean>;
   clear(options?: { readonly preserveRetained?: boolean }): Promise<void>;
   readExpandedText(): string;
   close(): Promise<void>;
@@ -1379,7 +1379,7 @@ export async function createTurnComposer(options: {
       }
       revision += 1;
       try {
-        await commit();
+        if (commit !== undefined) await commit();
       } catch (error) {
         elements = previousElements;
         nextOrdinal = previousNextOrdinal;

@@ -400,7 +400,7 @@ test("cold undelivered input remains private and can be explicitly inspected and
     await cold.press("\r", "New turn");
     expect(cold.conversationText()).toContain("PRIVATE_UNDELIVERED_MESSAGE");
     await cold.press("\u001b", "Enter compose · Esc back", "To @explore-1");
-    await cold.press("d", "Enter compose · Esc back");
+    await cold.press("\u0004", "Enter compose · Esc back");
     expect(cold.conversationText()).not.toContain("Draft to @explore-1");
     expect(calls).toBe(1);
     expect(

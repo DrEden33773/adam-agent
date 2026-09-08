@@ -1871,6 +1871,7 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
     workspaceRoot,
     stateRoot,
     controlRoot,
+    terminalProcessMarker: join(testRoot, "terminal-process"),
   });
   let completed = false;
   let waiting = "New session";
@@ -1897,6 +1898,43 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
     waiting = "Conversation";
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Conversation", offset);
+    offset = fixture.output().length;
+    waiting = "Conversation help";
+    fixture.write("?");
+    await fixture.waitForCompleteFrameAfter("Conversation help", offset);
+    expect(fixture.screen()?.join("\n")).toContain("Ctrl+D: discard retained draft");
+    offset = fixture.output().length;
+    fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
+    await fixture.waitForCompleteFrameAfter("Enter compose", offset, "Conversation help");
+    offset = fixture.output().length;
+    await fixture.resize(80, 16);
+    await fixture.waitForCompleteFrameAfter("Conversation", offset);
+    offset = fixture.output().length;
+    waiting = "Conversation details";
+    fixture.write("d");
+    await fixture.waitForCompleteFrameAfter("Conversation details", offset);
+    const detailBody = () => {
+      const lines = fixture.screen() ?? [];
+      const title = lines.findIndex((line) => line.includes("Conversation details"));
+      expect(title).toBeGreaterThanOrEqual(0);
+      return lines[title + 1];
+    };
+    expect(detailBody()).toContain("PTY child");
+    offset = fixture.output().length;
+    waiting = "scrolled Conversation details";
+    fixture.write("\u001b[<65;8;9M");
+    await fixture.waitForCompleteFrameAfter("Conversation details", offset);
+    expect(detailBody()).not.toContain("PTY child");
+    offset = fixture.output().length;
+    fixture.write("\u001b[<64;8;9M");
+    await fixture.waitForCompleteFrameAfter("Conversation details", offset);
+    expect(detailBody()).toContain("PTY child");
+    offset = fixture.output().length;
+    fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
+    await fixture.waitForCompleteFrameAfter("Enter compose", offset, "Conversation details");
+    offset = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForCompleteFrameAfter("Enter compose", offset);
     offset = fixture.output().length;
     waiting = "Cooperative";
     fixture.write("\r");

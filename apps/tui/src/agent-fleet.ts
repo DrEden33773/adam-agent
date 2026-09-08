@@ -22,6 +22,8 @@ import {
   truncateToWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { agentElapsedLabel } from "./agent-widget.js";
+import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
 
@@ -63,6 +65,11 @@ export class AgentFleet implements Component {
   handleMainInput(data: string, empty: boolean): boolean {
     if (this.#snapshot === undefined || this.rows().length === 0) return false;
     if (isKeyRelease(data)) return this.#active;
+    const wheel = focusedWheelDirection(data);
+    if (wheel !== null) {
+      if (!this.#active || !empty) return false;
+      data = wheel < 0 ? "\u001b[A" : "\u001b[B";
+    }
     if (!empty) {
       this.#active = false;
       return false;
@@ -104,7 +111,7 @@ export class AgentFleet implements Component {
       { id: null, text: "Main" },
       ...rows.map((thread) => ({
         id: thread.threadId,
-        text: `${thread.handle} · ${thread.displayName} · ${thread.turn.label}${this.drafts.get(thread.threadId)?.text || this.options.hasDraft?.(thread) ? ` · Draft to ${thread.handle}` : ""}`,
+        text: `${thread.handle} · ${safeTerminalText(thread.displayName)} · ${thread.turn.label}${agentElapsedLabel(thread)} · ${safeTerminalText(thread.description)}${this.drafts.get(thread.threadId)?.text || this.options.hasDraft?.(thread) ? ` · Draft to ${thread.handle}` : ""}`,
       })),
     ];
     const selectedIndex = Math.max(
@@ -146,6 +153,9 @@ export class AgentWorkspace implements Component {
   #visibleSettings = new Set<number>();
   #selected: string | undefined;
   #detail = false;
+  #help = false;
+  #helpScroll = 0;
+  #helpMaximumScroll = 0;
   #detailScroll = 0;
   #detailMaximumScroll = 0;
   #history = false;
@@ -203,16 +213,36 @@ export class AgentWorkspace implements Component {
     if (!this.rows().some((thread) => this.key(thread) === this.#selected))
       this.select(this.rows()[0]);
   }
+  openDetails(thread: ManagedControlThread): boolean {
+    const selected = this.rows().find(
+      (entry) => entry.threadId === thread.threadId && entry.turn.turnId === thread.turn.turnId,
+    );
+    if (selected === undefined) return false;
+    this.select(selected);
+    this.#detail = true;
+    this.#detailScroll = 0;
+    this.#help = false;
+    this.#settingsOpen = false;
+    this.#armed = undefined;
+    this.#closeTarget = undefined;
+    this.#resumeTargets = undefined;
+    this.options.onChange();
+    return true;
+  }
   back(): void {
     this.#armed = undefined;
     this.#closeTarget = undefined;
-    if (this.#settingsOpen && this.options.initialView !== "settings") this.#settingsOpen = false;
+    if (this.#help) this.#help = false;
+    else if (this.#settingsOpen && this.options.initialView !== "settings")
+      this.#settingsOpen = false;
     else if (this.#detail) this.#detail = false;
     else this.options.onClose();
     this.options.onChange();
   }
   handleInput(data: string): void {
     if (isKeyRelease(data)) return;
+    const wheel = focusedWheelDirection(data);
+    if (wheel !== null) data = wheel < 0 ? "\u001b[A" : "\u001b[B";
     if (!isKeyRepeat(data)) {
       if (!matchesKey(data, "x")) this.#armed = undefined;
       if (!matchesKey(data, "c")) this.#closeTarget = undefined;
@@ -220,6 +250,31 @@ export class AgentWorkspace implements Component {
     }
     if (matchesKey(data, "escape")) {
       if (!isKeyRepeat(data)) this.back();
+      return;
+    }
+    if (this.#help) {
+      if (matchesKey(data, "?") && !isKeyRepeat(data)) this.#help = false;
+      else if (matchesKey(data, "home")) this.#helpScroll = 0;
+      else if (matchesKey(data, "end")) this.#helpScroll = this.#helpMaximumScroll;
+      else if (matchesKey(data, "up") || matchesKey(data, "pageUp"))
+        this.#helpScroll = Math.max(
+          0,
+          this.#helpScroll -
+            (matchesKey(data, "up") ? 1 : Math.max(1, this.options.maximumLines() - 2)),
+        );
+      else if (matchesKey(data, "down") || matchesKey(data, "pageDown"))
+        this.#helpScroll = Math.min(
+          this.#helpMaximumScroll,
+          this.#helpScroll +
+            (matchesKey(data, "down") ? 1 : Math.max(1, this.options.maximumLines() - 2)),
+        );
+      this.options.onChange();
+      return;
+    }
+    if (matchesKey(data, "?") && !isKeyRepeat(data)) {
+      this.#help = true;
+      this.#helpScroll = 0;
+      this.options.onChange();
       return;
     }
     if (this.#settingsOpen) {
@@ -311,6 +366,11 @@ export class AgentWorkspace implements Component {
     const threads = this.rows();
     const index = threads.findIndex((thread) => this.key(thread) === this.#selected);
     const selected = threads[index];
+    if (matchesKey(data, "d") && !isKeyRepeat(data)) {
+      if (selected !== undefined && (this.#detail || this.#visibleIds.has(this.key(selected))))
+        this.openDetails(selected);
+      return;
+    }
     if (!matchesKey(data, "u") && !matchesKey(data, "shift+u")) this.#resumeTargets = undefined;
     if (
       (matchesKey(data, "u") || matchesKey(data, "shift+u")) &&
@@ -464,7 +524,17 @@ export class AgentWorkspace implements Component {
     }
     this.#armed = undefined;
     if (this.#detail) {
-      if (matchesKey(data, "home")) this.#detailScroll = 0;
+      if (
+        matchesKey(data, "enter") &&
+        !isKeyRepeat(data) &&
+        selected !== undefined &&
+        (selected.turn.hasStarted || selected.turn.outcome !== undefined)
+      )
+        this.options.onOpen(
+          selected,
+          this.#history || selected.lifecycle === "closed" || !selected.turn.hasStarted,
+        );
+      else if (matchesKey(data, "home")) this.#detailScroll = 0;
       else if (matchesKey(data, "end")) this.#detailScroll = this.#detailMaximumScroll;
       else if (matchesKey(data, "up") || matchesKey(data, "pageUp"))
         this.#detailScroll = Math.max(
@@ -489,11 +559,8 @@ export class AgentWorkspace implements Component {
         selected !== undefined &&
         this.#visibleIds.has(this.key(selected))
       ) {
-        if (selected.turn.hasStarted || selected.turn.outcome !== undefined)
-          this.options.onOpen(
-            selected,
-            this.#history || selected.lifecycle === "closed" || !selected.turn.hasStarted,
-          );
+        if (selected.turn.hasStarted)
+          this.options.onOpen(selected, this.#history || selected.lifecycle === "closed");
         else {
           this.#detail = true;
           this.#detailScroll = 0;
@@ -504,6 +571,22 @@ export class AgentWorkspace implements Component {
   }
   invalidate(): void {}
   render(width: number): string[] {
+    if (this.#help) {
+      const lines = [
+        "↑↓ / wheel select · Enter conversation or queued overview",
+        "d details · h history · t types · s settings · a attention",
+        "x x cancel · c c close · u u resume · U then u resume all",
+        "Esc returns to the previous view",
+      ].flatMap((line) => wrapTextWithAnsi(line, width));
+      const height = Math.max(1, this.options.maximumLines() - 2);
+      this.#helpMaximumScroll = Math.max(0, lines.length - height);
+      this.#helpScroll = Math.min(this.#helpScroll, this.#helpMaximumScroll);
+      return [
+        this.options.theme.primary("Agents help"),
+        ...lines.slice(this.#helpScroll, this.#helpScroll + height),
+        "↑↓ / wheel scroll · Esc back",
+      ].map((line) => truncateToWidth(line, width));
+    }
     if (this.#settingsOpen) {
       const settings = this.#settings;
       const entries = [
@@ -534,8 +617,9 @@ export class AgentWorkspace implements Component {
       const config = thread.turn.configuration;
       const budget = thread.budget;
       lines.push(
-        this.options.theme.primary(`${thread.turn.label} ${thread.handle} · ${thread.displayName}`),
+        this.options.theme.primary(`Agent details · ${thread.handle} · ${thread.displayName}`),
         safeTerminalText(thread.description),
+        `${thread.turn.label}${agentElapsedLabel(thread)}`,
       );
       if (config !== undefined)
         lines.push(
@@ -547,6 +631,21 @@ export class AgentWorkspace implements Component {
           `${budget.knownUsed} used · ${budget.outstandingReserved} reserved`,
           `${budget.unknownReserved} unknown · ${budget.available === null ? "no cumulative budget" : `${budget.available} available`}`,
         );
+      if (thread.turn.diagnostic !== undefined)
+        lines.push(safeTerminalText(thread.turn.diagnostic));
+      if (thread.turn.attention?.question !== undefined)
+        lines.push(safeTerminalText(thread.turn.attention.question));
+      if (thread.turn.outcome !== undefined) {
+        if (!thread.turn.hasStarted) lines.push("No agent session was started.");
+        lines.push(safeTerminalText(thread.turn.outcome.summary));
+      }
+      lines.push(
+        `Role: ${thread.role}`,
+        `Turn: ${thread.turn.turnId}`,
+        `Attempt: ${thread.turn.attemptId}`,
+        ...(config === undefined ? [] : [`Configuration: ${config.digest}`]),
+        `Thread: ${thread.threadId}`,
+      );
       if (!thread.turn.hasStarted && thread.turn.outcome === undefined)
         lines.push(
           ...wrapTextWithAnsi(
@@ -570,7 +669,7 @@ export class AgentWorkspace implements Component {
         title,
         `↑↓ detail · ${Math.max(0, details.length - height)} lines hidden`,
         ...details.slice(this.#detailScroll, this.#detailScroll + height),
-        `${thread.actions?.includes("cancel") ? "x x cancel · " : ""}Esc list`,
+        `${thread.turn.hasStarted ? "Enter conversation · " : thread.turn.outcome !== undefined ? "Enter result / export · " : ""}${thread.actions?.includes("cancel") ? "x x cancel · " : ""}Esc list`,
       );
     } else {
       const threads = this.rows();
@@ -592,8 +691,8 @@ export class AgentWorkspace implements Component {
       ].join(" · ");
       const hints = [
         width < 72
-          ? "Enter inspect · t types · h/s/a · Esc"
-          : "Enter inspect · t types · h history · s settings · a attention · Esc back",
+          ? "Enter open · d details · ? help · Esc"
+          : "Enter open · d details · h history · t types · s settings · ? help · Esc back",
         ...(controls ? [controls] : []),
       ];
       const maximum = Math.max(
@@ -619,7 +718,7 @@ export class AgentWorkspace implements Component {
       lines.push(
         ...visible.map(
           (entry) =>
-            `${this.key(entry) === this.#selected ? "●" : "○"} ${entry.handle} · ${width < 48 ? `${entry.turn.label.split(" · ")[0]} · ${safeTerminalText(entry.description)}` : `${safeTerminalText(entry.displayName)} · ${safeTerminalText(entry.description)} · ${entry.turn.label}`}${entry.lifecycle === "closed" ? " · Closed" : ""}${this.#history ? ` · ${entry.turn.turnId.slice(0, 8)}` : ""}${this.options.hasDraft?.(entry) ? ` · Draft to ${entry.handle}` : ""}`,
+            `${this.key(entry) === this.#selected ? "●" : "○"} ${entry.handle} · ${width < 48 ? `${entry.turn.label.split(" · ")[0]} · ${safeTerminalText(entry.description)}` : `${safeTerminalText(entry.displayName)} · ${safeTerminalText(entry.description)} · ${entry.turn.label}`}${agentElapsedLabel(entry)}${entry.lifecycle === "closed" ? " · Closed" : ""}${this.options.hasDraft?.(entry) ? ` · Draft to ${entry.handle}` : ""}`,
         ),
       );
       if (start > 0 || start + visible.length < threads.length)
