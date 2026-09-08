@@ -16,6 +16,81 @@ import {
 } from "./todo.js";
 
 describe("Todo v1", () => {
+  test("activeForm mutation uses UTF-8 bounds, exact CAS, no-op rejection and null clearing", () => {
+    const empty: TodoStoreSnapshotV1 = {
+      policyVersion: todoPolicyVersionV1,
+      storeRevision: 0,
+      items: [],
+    };
+    for (const activeForm of ["", "界".repeat(171), null]) {
+      expect(
+        createTodoMutationV1(empty, { title: "Inspect", activeForm }, todoId(0)),
+      ).toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    }
+    const created = createTodoMutationV1(
+      empty,
+      { title: "Inspect", activeForm: `${"界".repeat(170)}ab` },
+      todoId(0),
+    );
+    if (created.status !== "completed") throw new Error("Expected valid 512-byte activeForm");
+    const cas = { id: created.item.id, expectedItemRevision: 1, expectedStoreRevision: 1 };
+    expect(created.item.activeForm).toBe(`${"界".repeat(170)}ab`);
+    for (const activeForm of ["", "界".repeat(171), created.item.activeForm]) {
+      expect(updateTodoMutationV1(created.snapshot, { ...cas, activeForm })).toMatchObject({
+        status: "failed",
+        error: { code: "invalid_tool_input" },
+      });
+    }
+    expect(
+      updateTodoMutationV1(created.snapshot, {
+        ...cas,
+        expectedStoreRevision: 0,
+        activeForm: null,
+      }),
+    ).toMatchObject({ status: "failed", error: { code: "todo_revision_stale" } });
+    const updated = updateTodoMutationV1(created.snapshot, {
+      ...cas,
+      activeForm: "Inspecting",
+      status: "in_progress",
+    });
+    if (updated.status !== "completed") throw new Error("Expected activeForm update");
+    expect(updated.item).toMatchObject({ activeForm: "Inspecting", itemRevision: 2 });
+    const cleared = updateTodosMutationV1(updated.snapshot, {
+      expectedStoreRevision: 2,
+      updates: [{ id: created.item.id, expectedItemRevision: 2, activeForm: null }],
+    });
+    if (cleared.status !== "completed") throw new Error("Expected batch clear");
+    expect(cleared.snapshot.storeRevision).toBe(3);
+    expect(cleared.items[0]).toEqual({
+      id: todoId(0),
+      createdOrdinal: 1,
+      itemRevision: 3,
+      title: "Inspect",
+      status: "in_progress",
+      dependencyIds: [],
+    });
+    expect(
+      updateTodoMutationV1(cleared.snapshot, {
+        id: todoId(0),
+        expectedItemRevision: 3,
+        expectedStoreRevision: 3,
+        activeForm: null,
+      }),
+    ).toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    const old = createTodoMutationV1(empty, { title: "Historical title" }, todoId(1));
+    if (old.status !== "completed") throw new Error("Expected historical item");
+    expect(old.item).toEqual({
+      id: todoId(1),
+      createdOrdinal: 1,
+      itemRevision: 1,
+      status: "pending",
+      title: "Historical title",
+      dependencyIds: [],
+    });
+    expect(isTodoStoreSnapshotV1Valid(created.snapshot)).toBe(true);
+    expect(isTodoStoreSnapshotV1Valid(cleared.snapshot)).toBe(true);
+  });
+
   test("create rejects the 4,097th live entity without changing folded state", () => {
     const items = Array.from({ length: todoLimitsV1.maximumEntities }, (_, index) => ({
       id: todoId(index),

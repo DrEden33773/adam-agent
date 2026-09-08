@@ -1,8 +1,22 @@
 import { expect, test } from "vitest";
 import {
   adamCommandRegistry,
+  createAdamCommandRegistry,
   createAdamCommandRegistryFromContributions,
 } from "./command-registry.js";
+
+test("Todo overlay uses one configurable semantic binding and exposes its effective Help key", () => {
+  expect(adamCommandRegistry.keybinding("toggle_todo_overlay")).toMatchObject({
+    inputs: ["alt+t"],
+    keys: "Alt+T",
+  });
+  expect(adamCommandRegistry.matchesInput("\u001bt", "toggle_todo_overlay")).toBe(true);
+  const configured = createAdamCommandRegistry([], { todoToggleKey: "ctrl+shift+t" });
+  expect(configured.keybinding("toggle_todo_overlay")).toMatchObject({ keys: "Ctrl+Shift+T" });
+  expect(configured.matchesInput("\u001b[116;6u", "toggle_todo_overlay")).toBe(true);
+  expect(configured.matchesInput("\u001bt", "toggle_todo_overlay")).toBe(false);
+  expect(configured.matchesInput("\u0014", "toggle_todo_overlay")).toBe(false);
+});
 
 test("Plan Registry copy stays policy-neutral", () => {
   const parsed = adamCommandRegistry.parse("/plan");
@@ -41,7 +55,7 @@ test("the TUI Registry exposes the active-run read-only Todo navigator", () => {
     command: {
       id: "todos",
       availability: "always",
-      usage: "/todos",
+      usage: "/todos [toggle]",
       summary: "Browse the authoritative Todo store without mutation.",
     },
   });

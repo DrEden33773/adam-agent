@@ -115,13 +115,14 @@ const expectedTodoTools = [
   {
     name: "create_todo",
     description:
-      "Create one durable pending Todo with a bounded title, optional details, and exact dependency IDs.",
+      "Create one durable pending Todo with a bounded title, optional activeForm describing work in progress, optional details, and exact dependency IDs. activeForm is nonempty and at most 512 UTF-8 bytes; omission displays the title.",
     inputSchema: {
       $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
       properties: {
         title: { type: "string" },
         details: { type: "string" },
+        activeForm: { type: "string" },
         dependencyIds: { maxItems: 64, type: "array", items: uuidSchema },
       },
       required: ["title"],
@@ -158,7 +159,7 @@ const expectedTodoTools = [
   {
     name: "update_todo",
     description:
-      "Update one exact Todo using both expected item revision and expected store revision CAS.",
+      "Update one exact Todo using expected item and store revision CAS. Optional activeForm describes work in progress, is nonempty and at most 512 UTF-8 bytes; null clears it to display the title.",
     inputSchema: {
       $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
@@ -176,6 +177,7 @@ const expectedTodoTools = [
         },
         title: { type: "string" },
         details: { anyOf: [{ type: "string" }, { type: "null" }] },
+        activeForm: { anyOf: [{ type: "string" }, { type: "null" }] },
         dependencyIds: { maxItems: 64, type: "array", items: uuidSchema },
         status: { type: "string", enum: ["pending", "in_progress", "completed"] },
       },
@@ -186,7 +188,7 @@ const expectedTodoTools = [
   {
     name: "update_todos",
     description:
-      "Atomically update 1–16 distinct Todos against one expectedStoreRevision and each expectedItemRevision. Validate dependencies in the complete candidate state. One permission decision; all updates commit or none do. Read current revisions before retrying a rejected batch.",
+      "Atomically update 1–16 distinct Todos against one expectedStoreRevision and each expectedItemRevision. Validate dependencies in the complete candidate state. One permission decision; all updates commit or none do. Read current revisions before retrying a rejected batch. Optional activeForm describes work in progress, is nonempty and at most 512 UTF-8 bytes; null clears it to display the title.",
     inputSchema: {
       $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
@@ -207,6 +209,7 @@ const expectedTodoTools = [
               },
               title: { type: "string" },
               details: { anyOf: [{ type: "string" }, { type: "null" }] },
+              activeForm: { anyOf: [{ type: "string" }, { type: "null" }] },
               dependencyIds: { maxItems: 64, type: "array", items: uuidSchema },
               status: { type: "string", enum: ["pending", "in_progress", "completed"] },
             },
@@ -612,7 +615,7 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
         },
         {
           name: "create_todo",
-          digest: "sha256:77dc7d7915b067e706692df71cf5489f275d76168397be783c7a2fdee9875a1e",
+          digest: "sha256:6ebf6eaf74e007dd2e2a7a17e37b658e3d937813ec314e866d82fbb9c3379fe6",
         },
         {
           name: "get_todo",
@@ -624,14 +627,14 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
         },
         {
           name: "update_todo",
-          digest: "sha256:862986580edb1216123bb51c83f171fd660419d55dee238eee1353b995b5a142",
+          digest: "sha256:8558d8dcf74deb5b827da332e928ef1147e81b8b510b135fe22ec87298843921",
         },
         {
           name: "update_todos",
-          digest: "sha256:7b996f5cafc0c80fdada49cfcacda572a0b74fe70e2331be5697efe4c8a98842",
+          digest: "sha256:4e13855e4c2bfe76d9b02fe0caeab4fcd3a8b45574ba79049b3a1f9a09ff17f5",
         },
       ],
-      digest: "sha256:f8282573fbc7802d2cbd34ab0d1f58d7c90709837742ad2d16949e2e79a0a6c1",
+      digest: "sha256:3e8b0029a2b17b806a63d1f89c8a31fb6ce1047813b0f18d6fd4a2efcc0c9541",
     },
     repository: {
       version: 1,
@@ -813,7 +816,8 @@ test("transient v1 base and ten current tools reduce the profile-v2 ordinary out
         { role: "user", content: "Clamp v1." },
       ],
       tools: expectedTransientCodingTools,
-      maximumOutputTokens: 5_259,
+      // The literal request is 11,072 UTF-8 bytes: 8,000 - ceil(11,072 / 4) - 100.
+      maximumOutputTokens: 5_132,
     });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -1597,11 +1601,11 @@ test("a v3 provider attempt persists only the safe exact request projection dige
     expect({ continuedPromptContext, inspectedPromptContext }).toMatchObject({
       continuedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:73b1ca9a15be972b5f8de421b0e323146dc0c6263ae31de877c3e5c0f2a81ca6",
+          "sha256:4d23a133d7381a692c5a754856f3f95ea805fd58223f05eb48bff3c3dd39917c",
       },
       inspectedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:73b1ca9a15be972b5f8de421b0e323146dc0c6263ae31de877c3e5c0f2a81ca6",
+          "sha256:4d23a133d7381a692c5a754856f3f95ea805fd58223f05eb48bff3c3dd39917c",
       },
     });
     expect(JSON.stringify({ continued, inspected })).not.toContain("Inspect the project.");

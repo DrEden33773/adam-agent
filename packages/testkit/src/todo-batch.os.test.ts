@@ -60,7 +60,10 @@ test.each([false, true])(
       if (requestNumber === 1)
         return [
           ...Array.from({ length: 4 }, (_, index) =>
-            call(`create-${index}`, "create_todo", { title: `Task ${index}` }),
+            call(`create-${index}`, "create_todo", {
+              title: `Task ${index}`,
+              activeForm: `Working ${index}`,
+            }),
           ).flat(),
           { type: "finish", reason: "tool_calls" },
         ];
@@ -74,9 +77,10 @@ test.each([false, true])(
             return output.item.id;
           });
         expect(ids).toHaveLength(4);
-        const updates = ids.map((id) => ({
+        const updates = ids.map((id, index) => ({
           id,
           expectedItemRevision: 1,
+          activeForm: index === 0 ? null : `Finishing ${index}`,
           status: "completed",
           ...(atomic ? { details: "e".repeat(4096) } : {}),
         }));
@@ -182,6 +186,15 @@ test.each([false, true])(
       expect(await lifecycle.inspect({ sessionId: branch.sessionId })).toMatchObject({
         todo: inspected.todo,
       });
+      for (const sessionId of [created.sessionId, branch.sessionId]) {
+        const listed = await lifecycle.listTodos({ sessionId, expectedStoreRevision: 5 });
+        if (listed.status !== "completed") throw new Error("Expected current Todo list");
+        expect(listed.output.items.map((item) => item.activeForm ?? item.title)).toEqual(
+          atomic
+            ? ["Task 0", "Finishing 1", "Finishing 2", "Finishing 3"]
+            : ["Task 0", "Working 1", "Working 2", "Working 3"],
+        );
+      }
       if (atomic) {
         await lifecycle.close();
         const terminal = records.findIndex(

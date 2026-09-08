@@ -199,8 +199,8 @@ test.each([40, 80, 120])(
       expect(compact).toMatch(
         /ID:[a-f0-9-]{36}Digest:sha256:[a-f0-9]{64}Policy:sha256:[a-f0-9]{64}/u,
       );
-      await h.press("\x1b", "Delegation");
-      await h.press("\x1b", "@Explore");
+      await h.press("\x1b", "Delegation", "ID:");
+      await h.press("\x1b", "@Explore", "Esc cancel");
       expect(
         (await h.store.read()).filter((record) => record.event.type === "admitted"),
       ).toHaveLength(0);

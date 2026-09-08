@@ -178,6 +178,8 @@ export type TuiFixtureOptions = {
     readonly workspaceTrustMutation?: "reject";
   };
   readonly mouse?: boolean;
+  readonly commandRegistry?: Parameters<typeof runTui>[0]["commandRegistry"];
+  readonly todoOverlayLines?: number;
   readonly onPresentationReady?: (presentation: PresentationSession) => void;
   readonly presentationCloseMarker?: string;
   readonly scenario?: FixtureScenario;
@@ -427,7 +429,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               options.scenario === "managed-parent-permission" ||
               options.scenario === "managed-stalled"
             ? ["read", "delegate"]
-            : options.scenario === "todo-active" || options.scenario === "todo-batch"
+            : options.scenario === "todo-active" ||
+                options.scenario === "todo-batch" ||
+                options.scenario === "todo-fidelity"
               ? ["read", "write"]
               : options.scenario === "tool-artifact" || options.scenario === "shell"
                 ? ["read", "execute"]
@@ -803,6 +807,12 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     await runTui({
       ...(clipboard === undefined ? {} : { clipboard }),
       closeRuntime,
+      ...(options.commandRegistry === undefined
+        ? {}
+        : { commandRegistry: options.commandRegistry }),
+      ...(options.todoOverlayLines === undefined
+        ? {}
+        : { todoOverlayLines: options.todoOverlayLines }),
       ...(options.scenario === "review-unavailable" || reviewFixture !== undefined
         ? {
             commandRegistry: createAdamCommandRegistry(
@@ -1917,17 +1927,39 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Web search card complete." };
-      } else if (options.scenario === "todo-batch") {
+      } else if (options.scenario === "todo-batch" || options.scenario === "todo-fidelity") {
+        const fidelity = options.scenario === "todo-fidelity";
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
-          for (let index = 0; index < 4; index++) {
+          if (
+            fidelity &&
+            request.messages.some(
+              (message) => message.role === "tool" && message.name === "create_todo",
+            )
+          ) {
+            yield { type: "text_delta", text: "Next Main ready." };
+            yield { type: "finish", reason: "stop" };
+            return;
+          }
+          for (let index = 0; index < (fidelity ? 7 : 4); index++) {
             const id = `batch-create-${index}`;
             yield { type: "tool_call_start", id, name: "create_todo" };
             yield {
               type: "tool_call_delta",
               id,
               json: JSON.stringify({
-                title: `Atomic Task ${index}`,
+                title: fidelity
+                  ? [
+                      "Read contract",
+                      "Capture baseline",
+                      "Implement owner",
+                      "Add tracer",
+                      "Review change",
+                      "Run checks",
+                      "Close evidence",
+                    ][index]
+                  : `Atomic Task ${index}`,
+                ...(fidelity && index === 2 ? { activeForm: "Implementing owner" } : {}),
                 details: "Atomic caller-visible detail.",
               }),
             };
@@ -1951,13 +1983,24 @@ function createFixtureModelTargets(options: {
           yield {
             type: "tool_call_delta",
             id: "atomic-update",
-            json: JSON.stringify({ expectedStoreRevision: 4, updates }),
+            json: JSON.stringify({
+              expectedStoreRevision: fidelity ? 7 : 4,
+              updates: fidelity
+                ? updates.slice(0, 3).map((update, index) => ({
+                    ...update,
+                    status: index === 2 ? "in_progress" : "completed",
+                  }))
+                : updates,
+            }),
           };
           yield { type: "tool_call_end", id: "atomic-update" };
           yield { type: "finish", reason: "tool_calls" };
           return;
         }
-        yield { type: "text_delta", text: "Atomic Todo batch completed." };
+        yield {
+          type: "text_delta",
+          text: fidelity ? "Todo hierarchy ready." : "Atomic Todo batch completed.",
+        };
       } else if (options.scenario === "todo" || options.scenario === "todo-active") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {

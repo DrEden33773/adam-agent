@@ -13,6 +13,7 @@ import {
 import {
   adamCommandRegistry,
   createAdamCommandRegistryFromContributions,
+  type TodoToggleKey,
 } from "./command-registry.js";
 import { createLinuxClipboardAdapter } from "./linux-clipboard.js";
 import { createProductionProjectRuntime } from "./project-runtime.js";
@@ -85,7 +86,9 @@ try {
       }
       throw new TuiConfigurationError(message);
     });
-    const commandRegistry = createAdamCommandRegistryFromContributions(runtime.contributions);
+    const commandRegistry = createAdamCommandRegistryFromContributions(runtime.contributions, {
+      todoToggleKey: command.todoToggleKey,
+    });
     const startupNotice = runtime.extensionAvailability.configurationUnavailable
       ? "Configured extension packages are unavailable; new extension commands are disabled."
       : runtime.extensionAvailability.rejectedCount === 0
@@ -113,6 +116,7 @@ try {
         });
         await runTui({
           clipboard,
+          todoOverlayLines: command.todoOverlayLines,
           closeRuntime,
           commandRegistry,
           mouse: command.mouse,
@@ -143,6 +147,7 @@ try {
         });
         await runTui({
           clipboard,
+          todoOverlayLines: command.todoOverlayLines,
           closeRuntime,
           commandRegistry,
           mouse: command.mouse,
@@ -167,6 +172,8 @@ type TuiCommand =
   | {
       readonly type: "run";
       readonly mouse: boolean;
+      readonly todoToggleKey: TodoToggleKey;
+      readonly todoOverlayLines: number;
       readonly resumeSessionId?: string;
       readonly stateRoot?: string;
       readonly targetId?: string;
@@ -194,7 +201,9 @@ function parseCommand(arguments_: readonly string[]): TuiCommand {
     if (
       option === undefined ||
       value === undefined ||
-      (option !== "--resume" && option !== "--state-root" && option !== "--target") ||
+      !["--resume", "--state-root", "--target", "--todo-toggle-key", "--todo-lines"].includes(
+        option,
+      ) ||
       values.has(option)
     ) {
       throw new TuiConfigurationError("The TUI arguments are invalid.");
@@ -202,8 +211,21 @@ function parseCommand(arguments_: readonly string[]): TuiCommand {
     values.set(option, value);
     index += 2;
   }
+  const todoToggleKey = values.get("--todo-toggle-key") ?? "alt+t";
+  const todoOverlayLines = Number(values.get("--todo-lines") ?? "12");
+  if (
+    !["alt+t", "ctrl+shift+t"].includes(todoToggleKey) ||
+    !Number.isInteger(todoOverlayLines) ||
+    todoOverlayLines < 3 ||
+    todoOverlayLines > 12
+  )
+    throw new TuiConfigurationError(
+      "Todo options require --todo-toggle-key alt+t|ctrl+shift+t and --todo-lines 3–12.",
+    );
   return {
     type: "run",
+    todoToggleKey: todoToggleKey as TodoToggleKey,
+    todoOverlayLines,
     mouse,
     ...(values.get("--resume") === undefined
       ? {}
@@ -237,6 +259,7 @@ function usage(): string {
     "  pnpm tui --target deepseek-v4-flash.direct",
     "  pnpm tui --resume <session-id>",
     "  pnpm tui --no-mouse",
+    "  pnpm tui --todo-toggle-key ctrl+shift+t --todo-lines 8",
     "",
     "Under the default policy, built-in write and execute tools require call-scoped approval.",
     "Built-in file tools reject lexical traversal and symlink escape from the workspace.",

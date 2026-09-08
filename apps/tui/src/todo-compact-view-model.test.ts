@@ -1,157 +1,110 @@
 import type { ActiveSessionDisplay, TodoPageResource } from "@adam-agent/presentation";
 import { expect, test } from "vitest";
-
 import { TodoCompactViewModel } from "./todo-compact-view-model.js";
 
-test("TodoCompactViewModel preserves three-row unfinished priority and one-turn completion linger", () => {
-  const viewModel = new TodoCompactViewModel();
-  const items = [
-    todoItem("10000000-0000-4000-8000-000000000001", "Implement owner", "in_progress"),
-    todoItem("10000000-0000-4000-8000-000000000002", "Add tracer", "pending"),
-    todoItem("10000000-0000-4000-8000-000000000003", "Run Quality", "pending"),
-    todoItem("10000000-0000-4000-8000-000000000004", "Close evidence", "pending"),
-  ];
-  viewModel.setState({
-    items,
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 3, inProgress: 1, completed: 0 }, 1),
-    turnKey: "turn-a",
-  });
-  expect(viewModel.snapshot()).toMatchObject({
-    visible: true,
-    collapsed: false,
-    hiddenCompleted: 0,
-    hiddenUnfinished: 1,
-    rows: [
-      { glyph: "◐", title: "Implement owner" },
-      { glyph: "○", title: "Add tracer" },
-      { glyph: "○", title: "Run Quality" },
-    ],
-  });
-
-  viewModel.setState({
-    items: items.slice(1, 2),
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 1, inProgress: 0, completed: 3 }, 2),
-    turnKey: "turn-a",
-  });
-  expect(viewModel.snapshot()).toMatchObject({
-    rows: [
-      { glyph: "○", title: "Add tracer" },
-      { glyph: "✓", title: "Implement owner" },
-      { glyph: "✓", title: "Run Quality" },
-    ],
-    hiddenCompleted: 1,
-    hiddenUnfinished: 0,
-  });
-
-  viewModel.setState({
-    items: items.slice(1, 2),
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 1, inProgress: 0, completed: 3 }, 2),
-    turnKey: "turn-b",
-  });
-  expect(viewModel.snapshot()).toMatchObject({
-    rows: [{ glyph: "○", title: "Add tracer" }],
-    hiddenCompleted: 0,
-  });
-
-  viewModel.setCollapsed(true);
-  expect(viewModel.snapshot()).toMatchObject({ visible: true, collapsed: true, rows: [] });
-});
-
-test("TodoCompactViewModel never invents completion from an incomplete unfinished projection", () => {
-  const viewModel = new TodoCompactViewModel();
-  const displaced = todoItem(
-    "10000000-0000-4000-8000-000000000021",
-    "Displaced unfinished item",
-    "in_progress",
-  );
-  viewModel.setState({
-    items: [displaced],
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 0, inProgress: 1, completed: 0 }, 1),
-    turnKey: "turn-a",
-  });
-
-  const firstTwentyPending = Array.from({ length: 20 }, (_, index) =>
-    todoItem(
-      `10000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
-      `Pending item ${index + 1}`,
-      "pending",
-    ),
-  );
-  viewModel.setState({
-    items: firstTwentyPending,
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 21, inProgress: 0, completed: 0 }, 2),
-    turnKey: "turn-a",
-  });
-
-  expect(viewModel.snapshot()).toMatchObject({
-    visible: true,
-    hiddenCompleted: 0,
-    hiddenUnfinished: 18,
-  });
-});
-
-test("TodoCompactViewModel removes a completed linger when the same item reopens outside an incomplete page", () => {
-  const viewModel = new TodoCompactViewModel();
-  const firstTwentyPending = Array.from({ length: 20 }, (_, index) =>
-    todoItem(
-      `10000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
-      `Pending item ${index + 1}`,
-      "pending",
-    ),
-  );
-  const displaced = todoItem(
-    "10000000-0000-4000-8000-000000000021",
-    "Reopened outside the first page",
-    "in_progress",
-  );
-  viewModel.setState({
-    items: [...firstTwentyPending, displaced],
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 20, inProgress: 1, completed: 0 }, 1),
-    turnKey: "turn-a",
-  });
-  viewModel.setState({
-    items: firstTwentyPending,
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 20, inProgress: 0, completed: 1 }, 2),
-    turnKey: "turn-a",
-  });
-  expect(viewModel.snapshot()).toMatchObject({ hiddenCompleted: 1 });
-
-  viewModel.setState({
-    items: firstTwentyPending,
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 21, inProgress: 0, completed: 0 }, 3),
-    turnKey: "turn-a",
-  });
-
-  expect(viewModel.snapshot()).toMatchObject({ hiddenCompleted: 0 });
-});
-
-function todoSummary(
-  counts: NonNullable<ActiveSessionDisplay["todo"]>["counts"],
-  storeRevision: number,
-): NonNullable<ActiveSessionDisplay["todo"]> {
-  return { policyVersion: "todo-policy.v1", storeRevision, counts, blockedCount: 1 };
-}
-
-function todoItem(
-  id: string,
-  title: string,
+function item(
+  index: number,
   status: TodoPageResource["items"][number]["status"],
 ): TodoPageResource["items"][number] {
   return {
-    id,
-    createdOrdinal: Number(id.at(-1)),
+    id: `10000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    createdOrdinal: index,
     itemRevision: 1,
     status,
-    title,
+    title: `Task ${index}`,
     dependencyCount: 0,
-    blocked: title === "Run Quality",
+    blocked: false,
   };
 }
+function summary(pending: number, completed: number): NonNullable<ActiveSessionDisplay["todo"]> {
+  return {
+    policyVersion: "todo-policy.v1",
+    storeRevision: pending + completed,
+    counts: { pending, inProgress: 0, completed },
+    blockedCount: 0,
+  };
+}
+
+test("Todo layout preserves creation order and removes completed rows before unfinished tail", () => {
+  const view = new TodoCompactViewModel();
+  const items = Array.from({ length: 14 }, (_, index) =>
+    item(index + 1, index < 3 ? "completed" : "pending"),
+  );
+  view.setState({ sessionId: "a", turnKey: "one", summary: summary(11, 3), items });
+  expect(view.snapshot()).toMatchObject({
+    completedCount: 3,
+    totalCount: 14,
+    hiddenCompleted: 3,
+    hiddenUnfinished: 1,
+    rows: Array.from({ length: 10 }, (_, index) => ({ title: `Task ${index + 4}` })),
+  });
+  view.setState({
+    sessionId: "a",
+    turnKey: "one",
+    summary: summary(5, 8),
+    items: Array.from({ length: 13 }, (_, index) =>
+      item(index + 1, index % 2 === 0 || index > 9 ? "completed" : "pending"),
+    ),
+  });
+  expect(view.snapshot()).toMatchObject({
+    hiddenCompleted: 3,
+    hiddenUnfinished: 0,
+    rows: Array.from({ length: 10 }, (_, index) => ({ title: `Task ${index + 1}` })),
+  });
+});
+
+test("bounded Todo candidates retain pre-clipping counts and configurable three-line minimum", () => {
+  const view = new TodoCompactViewModel();
+  view.setState({
+    sessionId: "a",
+    turnKey: "one",
+    summary: { ...summary(100, 100), overlay: { turnId: "one", completedCount: 100, items: [] } },
+    items: Array.from({ length: 22 }, (_, index) =>
+      item(index + 1, index < 11 ? "completed" : "pending"),
+    ),
+  });
+  expect(view.snapshot()).toMatchObject({
+    totalCount: 200,
+    completedCount: 100,
+    hiddenCompleted: 100,
+    hiddenUnfinished: 90,
+  });
+  expect(view.snapshot(3)).toMatchObject({
+    hiddenCompleted: 100,
+    hiddenUnfinished: 99,
+    rows: [{ title: "Task 12" }],
+  });
+});
+
+test("completed Todo visibility is supplied by canonical projection, never inferred from disappearing IDs", () => {
+  const view = new TodoCompactViewModel();
+  view.setState({
+    sessionId: "a",
+    turnKey: "one",
+    summary: summary(1, 0),
+    items: [item(1, "pending")],
+  });
+  view.setState({ sessionId: "a", turnKey: "one", summary: summary(0, 1), items: [] });
+  expect(view.snapshot()).toEqual({ visible: false, collapsed: false });
+  view.setState({
+    sessionId: "a",
+    turnKey: "one",
+    summary: summary(0, 1),
+    items: [item(1, "completed")],
+  });
+  expect(view.snapshot()).toMatchObject({
+    visible: true,
+    completedCount: 1,
+    totalCount: 1,
+    rows: [{ glyph: "✓" }],
+  });
+  view.setCollapsed(true);
+  expect(view.snapshot()).toMatchObject({ collapsed: true, rows: [] });
+  view.setState({
+    sessionId: "b",
+    turnKey: "two",
+    summary: summary(1, 0),
+    items: [item(1, "pending")],
+  });
+  expect(view.snapshot()).toMatchObject({ collapsed: false, completedCount: 0 });
+});

@@ -8949,8 +8949,8 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
     fixture.write("Create one active Todo fixture\r");
     await waitForFileContents(join(controlRoot, "todo-active-parent-held"), "held\n");
     await fixture.waitForRecordedOutput("Todo 1/0/0 · 0 blocked");
-    await fixture.waitForRecordedOutput("Todos · 1 unfinished · 0 blocked");
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Todos · 1 unfinished · 0 blocked");
+    await fixture.waitForRecordedOutput("● Todos (0/1)");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("● Todos (0/1)");
     expect(fixture.screen()?.join("\n") ?? "").toContain("○ Active Todo fixture");
 
     const beforeTodos = fixture.output().length;
@@ -8958,12 +8958,12 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
     await fixture.waitForCompleteFrameAfter("Todos · revision 1", beforeTodos);
     expect(fixture.output().slice(beforeTodos)).toContain("Active Todo fixture");
 
-    fixture.write("\u001b[99;1:1u");
-    fixture.write("\u001b[99;1:2u");
-    fixture.write("\u001b[99;1:3u");
+    fixture.write("\u001b[116;3:1u");
+    fixture.write("\u001b[116;3:2u");
+    fixture.write("\u001b[116;3:3u");
     const beforeClose = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForCompleteFrameAfter("Todos · 1 unfinished · collapsed", beforeClose);
+    await fixture.waitForCompleteFrameAfter("Alt+T or /todos toggle to expand", beforeClose);
     await writeFile(join(controlRoot, "release-todo-active-parent"), "release\n", "utf8");
     await fixture.waitForRecordedOutput("Todo fixture created.");
     fixture.write("\u0011");

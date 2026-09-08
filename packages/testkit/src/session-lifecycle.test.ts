@@ -3617,7 +3617,7 @@ function snapshotWithLastPromptProjection<Snapshot extends { readonly promptCont
 }
 
 const introductionRequestDigest =
-  "sha256:4b1ce3fb95971aa644189e32db8be7d5149a881cf6742c6d5ae33c1650fc7717" as const;
+  "sha256:64170c2ae8428ebdb374d51161b2d98252293251a0a503c795c0a4d4b0be3248" as const;
 const permissionRequestDigest =
   "sha256:9c1f59ec1ffd20fdfe7486b5fb9efa0d03394adfaf113c23d5e1a7bc22784b60" as const;
 

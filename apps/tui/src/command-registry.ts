@@ -56,6 +56,7 @@ export type AdamKeybindingAction =
   | "rename_session"
   | "save_default_target"
   | "submit"
+  | "toggle_todo_overlay"
   | "toggle_reasoning"
   | "toggle_tool_details";
 
@@ -97,11 +98,18 @@ export type AdamArgumentCompletionResolution =
   | { readonly kind: "not_owned" }
   | { readonly completion: AdamArgumentCompletions | null; readonly kind: "owned" };
 
+export type TodoToggleKey = "alt+t" | "ctrl+shift+t";
+
 export class AdamCommandRegistry {
+  readonly #todoToggleKey: TodoToggleKey;
   readonly #commands: readonly AdamCommandDefinition[];
   readonly #commandsByName: ReadonlyMap<string, AdamCommandDefinition>;
 
-  constructor(commands: readonly AdamCommandDefinition[]) {
+  constructor(
+    commands: readonly AdamCommandDefinition[],
+    options: { readonly todoToggleKey?: TodoToggleKey } = {},
+  ) {
+    this.#todoToggleKey = options.todoToggleKey ?? "alt+t";
     const names = commands.flatMap((command) => [command.name, ...command.aliases]);
     if (new Set(names).size !== names.length) {
       throw new TypeError("Adam command names and aliases must be unique.");
@@ -119,7 +127,7 @@ export class AdamCommandRegistry {
   }
 
   keybindings(): readonly AdamKeybindingDefinition[] {
-    return effectiveKeybindings();
+    return effectiveKeybindings(this.#todoToggleKey);
   }
 
   helpTopics(): readonly AdamHelpTopicDefinition[] {
@@ -145,6 +153,8 @@ export class AdamCommandRegistry {
     let completion: AdamArgumentCompletions | null;
     if (command?.id === "name") {
       completion = completeSingleFiniteArgument(argumentsText, ["--clear", "--generate"]);
+    } else if (command.id === "todos") {
+      completion = completeSingleFiniteArgument(argumentsText, ["toggle"]);
     } else if (command.id === "thinking") {
       completion = completeSingleFiniteArgument(argumentsText, context.thinkingLevelIds);
     } else if (command.id === "instructions" || command.id === "skills") {
@@ -291,7 +301,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     id: "todos",
     name: "todos",
     summary: "Browse the authoritative Todo store without mutation.",
-    usage: "/todos",
+    usage: "/todos [toggle]",
   },
   {
     aliases: [],
@@ -489,21 +499,25 @@ export type AdamExtensionCommandDefinition = {
 
 export function createAdamCommandRegistry(
   extensionCommands: readonly AdamExtensionCommandDefinition[] = [],
+  options: { readonly todoToggleKey?: TodoToggleKey } = {},
 ): AdamCommandRegistry {
-  return new AdamCommandRegistry([
-    ...builtInCommands,
-    ...extensionCommands.map(
-      (command): AdamCommandDefinition => ({
-        aliases: [],
-        availability: "idle",
-        id: "extension",
-        name: command.name,
-        summary: command.title,
-        usage: `/${command.name}`,
-        extensionCommand: { id: command.id, version: command.version },
-      }),
-    ),
-  ]);
+  return new AdamCommandRegistry(
+    [
+      ...builtInCommands,
+      ...extensionCommands.map(
+        (command): AdamCommandDefinition => ({
+          aliases: [],
+          availability: "idle",
+          id: "extension",
+          name: command.name,
+          summary: command.title,
+          usage: `/${command.name}`,
+          extensionCommand: { id: command.id, version: command.version },
+        }),
+      ),
+    ],
+    options,
+  );
 }
 
 export function createAdamCommandRegistryFromContributions(
@@ -511,6 +525,7 @@ export function createAdamCommandRegistryFromContributions(
     readonly command?: AdamExtensionCommandDefinition | undefined;
     readonly inputSource?: { readonly id: string; readonly version: number } | undefined;
   }[],
+  options: { readonly todoToggleKey?: TodoToggleKey } = {},
 ): AdamCommandRegistry {
   return createAdamCommandRegistry(
     contributions.flatMap((contribution) =>
@@ -520,6 +535,7 @@ export function createAdamCommandRegistryFromContributions(
         ? [contribution.command]
         : [],
     ),
+    options,
   );
 }
 
@@ -535,6 +551,13 @@ type KeybindingProjection = {
 );
 
 const keybindingProjections: readonly KeybindingProjection[] = [
+  {
+    action: "toggle_todo_overlay",
+    adamInputs: ["alt+t"],
+    keys: "Alt+T",
+    description: "Expand or collapse the read-only Todo overlay",
+    section: "application",
+  },
   {
     action: "submit",
     description: "Submit or confirm the focused action",
@@ -705,6 +728,7 @@ const finiteArgumentCommandIds: ReadonlySet<AdamCommandDefinition["id"]> = new S
   "name",
   "skills",
   "thinking",
+  "todos",
   "trust",
 ]);
 
@@ -779,9 +803,17 @@ function editDistance(left: string, right: string): number {
   return rows[left.length] ?? right.length;
 }
 
-function effectiveKeybindings(): readonly AdamKeybindingDefinition[] {
+function effectiveKeybindings(todoToggleKey: TodoToggleKey): readonly AdamKeybindingDefinition[] {
   const piKeybindings = getKeybindings();
   return keybindingProjections.map((projection) => {
+    if (projection.action === "toggle_todo_overlay")
+      return {
+        action: projection.action,
+        description: projection.description,
+        section: projection.section,
+        inputs: [todoToggleKey],
+        keys: formatKeyId(todoToggleKey),
+      };
     if ("adamInputs" in projection) {
       return {
         action: projection.action,

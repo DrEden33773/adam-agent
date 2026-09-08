@@ -151,7 +151,7 @@ import {
 } from "./structured-user-content.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import {
-  createTodoInputV1Schema,
+  createTodoInputV2Schema,
   createTodoMutationV1,
   emptyTodoStoreSnapshotV1,
   getTodoInputV1Schema,
@@ -162,9 +162,9 @@ import {
   modelMessagesWithTodoSummaryV1,
   type TodoStoreSnapshotV1,
   todoPolicyVersionV1,
-  updateTodoInputV1Schema,
+  updateTodoInputV2Schema,
   updateTodoMutationV1,
-  updateTodosInputV1Schema,
+  updateTodosInputV2Schema,
   updateTodosMutationV1,
 } from "./todo.js";
 import type {
@@ -2610,7 +2610,7 @@ export class AgentSession {
         parsed = undefined;
       }
       const input = (
-        call.name === "update_todos" ? updateTodosInputV1Schema : updateTodoInputV1Schema
+        call.name === "update_todos" ? updateTodosInputV2Schema : updateTodoInputV2Schema
       ).safeParse(parsed);
       if (input.success) {
         const preflight = (
@@ -2986,7 +2986,7 @@ export class AgentSession {
     } catch {
       parsed = undefined;
     }
-    const input = createTodoInputV1Schema.safeParse(parsed);
+    const input = createTodoInputV2Schema.safeParse(parsed);
     if (!input.success || this.#activeRunId === undefined || this.#plan !== undefined) {
       const planDenied = input.success && this.#plan !== undefined;
       const result: ToolResult = {
@@ -3020,6 +3020,7 @@ export class AgentSession {
       status: mutationItem.status,
       title: mutationItem.title,
       ...(mutationItem.details === undefined ? {} : { details: mutationItem.details }),
+      ...(mutationItem.activeForm === undefined ? {} : { activeForm: mutationItem.activeForm }),
       dependencyIds: mutationItem.dependencyIds,
     };
     const { storeRevision } = mutation.snapshot;
@@ -3150,7 +3151,7 @@ export class AgentSession {
     } catch {
       parsed = undefined;
     }
-    const input = updateTodoInputV1Schema.safeParse(parsed);
+    const input = updateTodoInputV2Schema.safeParse(parsed);
     if (!input.success || this.#activeRunId === undefined || this.#plan !== undefined) {
       const planDenied = input.success && this.#plan !== undefined;
       const result: ToolResult = {
@@ -3181,6 +3182,7 @@ export class AgentSession {
       status: mutationItem.status,
       title: mutationItem.title,
       ...(mutationItem.details === undefined ? {} : { details: mutationItem.details }),
+      ...(mutationItem.activeForm === undefined ? {} : { activeForm: mutationItem.activeForm }),
       dependencyIds: mutationItem.dependencyIds,
     };
     if (emitStarted) {
@@ -3242,7 +3244,7 @@ export class AgentSession {
     } catch {
       parsed = undefined;
     }
-    const input = updateTodosInputV1Schema.safeParse(parsed);
+    const input = updateTodosInputV2Schema.safeParse(parsed);
     const mutation =
       this.#plan !== undefined
         ? {
@@ -3274,6 +3276,7 @@ export class AgentSession {
       title: item.title,
       dependencyIds: item.dependencyIds,
       ...(item.details === undefined ? {} : { details: item.details }),
+      ...(item.activeForm === undefined ? {} : { activeForm: item.activeForm }),
     }));
     const storeRevision = mutation.snapshot.storeRevision;
     const result = {

@@ -106,6 +106,56 @@ export const updateTodosToolDefinitionV1: ModelToolDefinition = {
   inputSchema: z.toJSONSchema(updateTodosInputV1Schema),
 };
 
+const todoActiveFormSchema = boundedUtf8String(todoLimitsV1.maximumTitleBytes).refine(
+  (value) => value.length > 0,
+);
+
+export const createTodoInputV2Schema = createTodoInputV1Schema.extend({
+  activeForm: todoActiveFormSchema.optional(),
+});
+
+export const createTodoToolDefinitionV2: ModelToolDefinition = {
+  ...createTodoToolDefinitionV1,
+  description:
+    "Create one durable pending Todo with a bounded title, optional activeForm describing work in progress, optional details, and exact dependency IDs. activeForm is nonempty and at most 512 UTF-8 bytes; omission displays the title.",
+  inputSchema: z.toJSONSchema(createTodoInputV2Schema),
+};
+
+export const updateTodoInputV2Schema = z
+  .strictObject({
+    ...updateTodoInputV1Schema.shape,
+    activeForm: todoActiveFormSchema.nullable().optional(),
+  })
+  .refine(
+    (input) =>
+      input.title !== undefined ||
+      input.details !== undefined ||
+      input.activeForm !== undefined ||
+      input.dependencyIds !== undefined ||
+      input.status !== undefined,
+  );
+
+export const updateTodoToolDefinitionV2: ModelToolDefinition = {
+  ...updateTodoToolDefinitionV1,
+  description:
+    "Update one exact Todo using expected item and store revision CAS. Optional activeForm describes work in progress, is nonempty and at most 512 UTF-8 bytes; null clears it to display the title.",
+  inputSchema: z.toJSONSchema(updateTodoInputV2Schema),
+};
+
+export const updateTodosInputV2Schema = z.strictObject({
+  expectedStoreRevision: z.number().int().nonnegative(),
+  updates: z
+    .array(z.strictObject(updateTodoInputV2Schema.shape).omit({ expectedStoreRevision: true }))
+    .min(1)
+    .max(16),
+});
+
+export const updateTodosToolDefinitionV2: ModelToolDefinition = {
+  ...updateTodosToolDefinitionV1,
+  description: `${updateTodosToolDefinitionV1.description} Optional activeForm describes work in progress, is nonempty and at most 512 UTF-8 bytes; null clears it to display the title.`,
+  inputSchema: z.toJSONSchema(updateTodosInputV2Schema),
+};
+
 export const todoItemV1Schema = z.strictObject({
   id: z.uuid(),
   createdOrdinal: z.number().int().positive(),
@@ -113,6 +163,7 @@ export const todoItemV1Schema = z.strictObject({
   status: z.enum(["pending", "in_progress", "completed"]),
   title: boundedUtf8String(todoLimitsV1.maximumTitleBytes).refine((value) => value.length > 0),
   details: boundedUtf8String(todoLimitsV1.maximumDetailsBytes).optional(),
+  activeForm: todoActiveFormSchema.optional(),
   dependencyIds: z.array(z.uuid()).max(todoLimitsV1.maximumDirectDependencies),
 });
 
@@ -158,6 +209,7 @@ export type TodoListSummaryV1 = {
   readonly itemRevision: number;
   readonly status: TodoItemV1["status"];
   readonly title: string;
+  readonly activeForm?: string;
   readonly dependencyCount: number;
   readonly blocked: boolean;
 };
@@ -186,7 +238,10 @@ export type TodoGetResultV1 =
       readonly output: {
         readonly policyVersion: typeof todoPolicyVersionV1;
         readonly storeRevision: number;
-        readonly item: Omit<TodoItemV1, "details"> & { readonly details?: string };
+        readonly item: Omit<TodoItemV1, "details" | "activeForm"> & {
+          readonly details?: string;
+          readonly activeForm?: string;
+        };
       };
     }
   | {
@@ -312,7 +367,7 @@ export function createTodoMutationV1(
   input: unknown,
   id: string,
 ): TodoMutationSuccessV1 | TodoMutationFailureV1 {
-  const parsed = createTodoInputV1Schema.safeParse(input);
+  const parsed = createTodoInputV2Schema.safeParse(input);
   if (!parsed.success || !z.uuid().safeParse(id).success) {
     return {
       status: "failed",
@@ -350,6 +405,7 @@ export function createTodoMutationV1(
     itemRevision: 1,
     status: "pending",
     title: parsed.data.title,
+    ...(parsed.data.activeForm === undefined ? {} : { activeForm: parsed.data.activeForm }),
     ...(parsed.data.details === undefined ? {} : { details: parsed.data.details }),
     dependencyIds,
   };
@@ -390,7 +446,7 @@ function prepareTodoUpdate(
   candidate?: TodoStoreSnapshotV1,
 ): TodoMutationSuccessV1 | TodoMutationFailureV1 {
   const graph = candidate ?? snapshot;
-  const parsed = updateTodoInputV1Schema.safeParse(input);
+  const parsed = updateTodoInputV2Schema.safeParse(input);
   const current = parsed.success
     ? snapshot.items.find((item) => item.id === parsed.data.id)
     : undefined;
@@ -466,9 +522,12 @@ function prepareTodoUpdate(
   const details =
     parsed.data.details === null ? undefined : (parsed.data.details ?? current.details);
   const title = parsed.data.title ?? current.title;
+  const activeForm =
+    parsed.data.activeForm === null ? undefined : (parsed.data.activeForm ?? current.activeForm);
   if (
     title === current.title &&
     details === current.details &&
+    activeForm === current.activeForm &&
     status === current.status &&
     dependencyIds.length === current.dependencyIds.length &&
     dependencyIds.every((dependencyId, index) => dependencyId === current.dependencyIds[index])
@@ -488,6 +547,7 @@ function prepareTodoUpdate(
     status,
     title,
     ...(details === undefined ? {} : { details }),
+    ...(activeForm === undefined ? {} : { activeForm }),
     dependencyIds,
   };
   const nextSnapshot: TodoStoreSnapshotV1 = {
@@ -524,7 +584,7 @@ export function updateTodosMutationV1(
       readonly items: readonly TodoItemV1[];
     }
   | TodoMutationFailureV1 {
-  const parsed = updateTodosInputV1Schema.safeParse(input);
+  const parsed = updateTodosInputV2Schema.safeParse(input);
   if (
     !parsed.success ||
     new Set(parsed.data.updates.map((update) => update.id)).size !== parsed.data.updates.length
@@ -546,6 +606,8 @@ export function updateTodosMutationV1(
       const update = updates.get(item.id);
       if (update === undefined) return item;
       const details = update.details === null ? undefined : (update.details ?? item.details);
+      const activeForm =
+        update.activeForm === null ? undefined : (update.activeForm ?? item.activeForm);
       return {
         id: item.id,
         createdOrdinal: item.createdOrdinal,
@@ -554,6 +616,7 @@ export function updateTodosMutationV1(
         status: update.status ?? item.status,
         dependencyIds: update.dependencyIds ?? item.dependencyIds,
         ...(details === undefined ? {} : { details }),
+        ...(activeForm === undefined ? {} : { activeForm }),
       };
     }),
   };
@@ -700,6 +763,7 @@ export function listTodosV1(
         itemRevision: candidate.itemRevision,
         status: candidate.status,
         title: candidate.title,
+        ...(candidate.activeForm === undefined ? {} : { activeForm: candidate.activeForm }),
         dependencyCount: candidate.dependencyIds.length,
         blocked: candidate.dependencyIds.some((dependencyId) => !completedIds.has(dependencyId)),
       },
@@ -759,6 +823,7 @@ export function getTodoV1(snapshot: TodoStoreSnapshotV1, input: unknown): TodoGe
     itemRevision: found.itemRevision,
     status: found.status,
     title: found.title,
+    ...(found.activeForm === undefined ? {} : { activeForm: found.activeForm }),
     ...(found.details === undefined ? {} : { details: found.details }),
     dependencyIds: found.dependencyIds,
   };

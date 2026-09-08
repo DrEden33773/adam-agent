@@ -65,6 +65,7 @@ export const fixtureScenarios = [
   "target-unavailable",
   "todo",
   "todo-batch",
+  "todo-fidelity",
   "todo-active",
   "tool-artifact",
   "tool-multiple",

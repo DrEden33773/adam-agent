@@ -5,46 +5,88 @@ import { createAdamTuiTheme } from "./theme.js";
 import { TodoCompactOverlay } from "./todo-compact-overlay.js";
 import { TodoCompactViewModel } from "./todo-compact-view-model.js";
 
-test("TodoCompactOverlay renders bounded rows and collapse truth from its view model", () => {
+test("the pinned Todo hierarchy shows 2 of 7 with explicit activeForm and a trailing spacer", () => {
   const viewModel = new TodoCompactViewModel();
   const overlay = new TodoCompactOverlay(viewModel, createAdamTuiTheme(true));
-  const summary = todoSummary({ pending: 3, inProgress: 1, completed: 0 }, 1);
   const items = [
-    todoItem("10000000-0000-4000-8000-000000000001", "Implement owner", "in_progress"),
-    todoItem("10000000-0000-4000-8000-000000000002", "Add tracer", "pending"),
-    todoItem("10000000-0000-4000-8000-000000000003", "Run Quality", "pending"),
-    todoItem("10000000-0000-4000-8000-000000000004", "Close evidence", "pending"),
+    todoItem("10000000-0000-4000-8000-000000000001", "Read contract", "completed"),
+    todoItem("10000000-0000-4000-8000-000000000002", "Capture baseline", "completed"),
+    {
+      ...todoItem("10000000-0000-4000-8000-000000000003", "Implement owner", "in_progress"),
+      activeForm: "Implementing owner",
+    },
+    ...["Add tracer", "Review change", "Run checks", "Close evidence"].map((title, index) =>
+      todoItem(`10000000-0000-4000-8000-${String(index + 4).padStart(12, "0")}`, title, "pending"),
+    ),
   ];
-  viewModel.setState({ items, sessionId: "session-a", summary, turnKey: "turn-a" });
-  const bounded = overlay.render(80).join("\n");
-  expect(bounded).toContain("Todos · 4 unfinished · 1 blocked");
-  expect(bounded).toContain("◐ Implement owner");
-  expect(bounded).toContain("○ Add tracer");
-  expect(bounded).toContain("+1 unfinished hidden");
-  expect(overlay.render(80)).toHaveLength(5);
-  for (const width of [40, 80, 120]) {
-    expect(overlay.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
-    expect(overlay.render(width).join("\n")).not.toContain("\u001b[");
-  }
-
   viewModel.setState({
-    items: items.slice(1, 2),
+    items,
     sessionId: "session-a",
-    summary: todoSummary({ pending: 1, inProgress: 0, completed: 3 }, 2),
+    summary: todoSummary({ pending: 4, inProgress: 1, completed: 2 }, 7),
     turnKey: "turn-a",
   });
-  expect(overlay.render(80).join("\n")).toContain("✓ Implement owner");
-  viewModel.setState({
-    items: items.slice(1, 2),
-    sessionId: "session-a",
-    summary: todoSummary({ pending: 1, inProgress: 0, completed: 3 }, 2),
-    turnKey: "turn-b",
-  });
-  expect(overlay.render(80).join("\n")).not.toContain("✓ Implement owner");
+  expect(overlay.render(80)).toEqual([
+    "● Todos (2/7)",
+    "├─ ✓ Read contract",
+    "├─ ✓ Capture baseline",
+    "├─ ◐ Implement owner (Implementing owner)",
+    "├─ ○ Add tracer",
+    "├─ ○ Review change",
+    "├─ ○ Run checks",
+    "└─ ○ Close evidence",
+    "",
+  ]);
+});
 
-  viewModel.setCollapsed(true);
-  expect(overlay.render(40)).toHaveLength(1);
-  expect(overlay.render(40).join("\n")).toContain("Todos · 1 unfinished · collapsed");
+test("Todo overlay uses at most twelve content lines plus spacer and preserves structural NO_COLOR at each width", () => {
+  const view = new TodoCompactViewModel();
+  const overlay = new TodoCompactOverlay(view, createAdamTuiTheme(true));
+  const items = Array.from({ length: 15 }, (_, index) =>
+    todoItem(
+      `10000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      `Task ${index + 1} 中文 e\u0301 🧭`,
+      index < 3 ? "completed" : "pending",
+    ),
+  );
+  view.setState({
+    items,
+    sessionId: "a",
+    turnKey: "one",
+    summary: todoSummary({ pending: 12, inProgress: 0, completed: 3 }, 15),
+  });
+  for (const width of [40, 80, 120]) {
+    const lines = overlay.render(width);
+    expect(lines).toHaveLength(13);
+    expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+    expect(lines.join("\n")).not.toContain("\u001b[");
+    expect(lines[0]).toBe("● Todos (3/15)");
+    expect(lines.at(-2)).toContain("+5 more");
+    expect(lines.at(-1)).toBe("");
+  }
+  view.setCollapsed(true);
+  expect(overlay.render(80)).toEqual(["● Todos (3/15)", "└─ Alt+T or /todos toggle to expand", ""]);
+});
+
+test("Todo overlay colors and strikes completed rows while retaining exact dependency labels", () => {
+  const view = new TodoCompactViewModel();
+  const first = todoItem("10000000-0000-4000-8000-000000000001", "Read source", "completed");
+  const second = {
+    ...todoItem("20000000-0000-4000-8000-000000000002", "Verify", "in_progress"),
+    activeForm: "Verifying",
+    dependencies: [first.id],
+    dependencyLabels: ["10000000"],
+    label: "20000000",
+  };
+  view.setState({
+    sessionId: "a",
+    turnKey: "one",
+    summary: todoSummary({ pending: 0, inProgress: 1, completed: 1 }, 2),
+    items: [first, second],
+  });
+  const colored = new TodoCompactOverlay(view, createAdamTuiTheme(false)).render(120).join("\n");
+  expect(colored).toContain("\u001b[9m");
+  const plain = new TodoCompactOverlay(view, createAdamTuiTheme(true)).render(120).join("\n");
+  expect(plain).toContain("◐ #20000000 Verify (Verifying) ⛓ #10000000");
 });
 
 function todoSummary(
@@ -61,7 +103,7 @@ function todoItem(
 ): TodoPageResource["items"][number] {
   return {
     id,
-    createdOrdinal: Number(id.at(-1)),
+    createdOrdinal: Number(id.slice(-12)),
     itemRevision: 1,
     status,
     title,

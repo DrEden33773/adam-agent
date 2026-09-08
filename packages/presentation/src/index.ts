@@ -540,6 +540,7 @@ export type ActiveSessionDisplay = {
       readonly completed: number;
     };
     readonly blockedCount: number;
+    readonly overlay?: TodoOverlayDisplay;
   };
   readonly plan?: {
     readonly state: "exploring" | "ready" | "approved_not_started";
@@ -564,6 +565,18 @@ export type ActiveSessionDisplay = {
     readonly submission?: PlanSubmissionDisplay;
     readonly approval?: PlanApprovalDisplay;
   };
+};
+
+/** Bounded layout candidates; counts describe the complete visible set before clipping. */
+export type TodoOverlayDisplay = {
+  readonly turnId: string | null;
+  readonly completedCount: number;
+  readonly items: readonly (TodoPageResource["items"][number] & {
+    readonly activeForm?: string;
+    readonly dependencies: readonly string[];
+    readonly dependencyLabels: readonly string[];
+    readonly label: string;
+  })[];
 };
 
 export type OperationCursor = {
@@ -1477,6 +1490,7 @@ export type TodoPageResource = {
     readonly itemRevision: number;
     readonly status: "pending" | "in_progress" | "completed";
     readonly title: string;
+    readonly activeForm?: string;
     readonly dependencyCount: number;
     readonly blocked: boolean;
   }[];
@@ -1493,6 +1507,7 @@ export type TodoEntityResource = {
     readonly itemRevision: number;
     readonly status: "pending" | "in_progress" | "completed";
     readonly title: string;
+    readonly activeForm?: string;
     readonly details?: string;
     readonly dependencyIds: readonly string[];
   };

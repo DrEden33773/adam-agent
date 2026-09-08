@@ -30,7 +30,7 @@ Invalid input feedback names supported fields and correction rules without repro
 }
 ```
 
-Each update uses the existing title, details, status, and dependency limits. Known stale or invalid batches are rejected before permission; the session revalidates before committing. A batch receives one exact call-scoped permission decision. Duplicate targets, stale revisions, no-op mutations, cycles, or invalid final dependency states reject the entire batch. A prerequisite and dependent can become completed together, regardless of their order in the batch.
+Each update uses the existing title, details, status, and dependency limits. Current create, single-update and batch-update definitions additionally accept optional `activeForm`, a nonempty string of at most 512 UTF-8 bytes. This is explicit model-authored display text; omission leaves the title as the display fallback, and an update with `activeForm: null` removes the field. Changes obey the same revisions and no-op rules. Known stale or invalid batches are rejected before permission; the session revalidates before committing. A batch receives one exact call-scoped permission decision. Duplicate targets, stale revisions, no-op mutations, cycles, or invalid final dependency states reject the entire batch. A prerequisite and dependent can become completed together, regardless of their order in the batch.
 
 Success increments each changed item revision once and the store revision once. The output contains `batchVersion: 1`, `policyVersion: "todo-policy.v1"`, `storeRevision`, and the complete changed `items`. One canonical `tool_completed` record carries both the atomic mutation and its model-visible result. Complete-record recovery therefore cannot preserve a success result without its corresponding Todo state. An interrupted write that cannot prove commitment retains the existing indeterminate-effect handling and never automatically replays the mutation.
 
@@ -39,3 +39,5 @@ The authoritative Todo projection consumes that same record for model summaries,
 ## Frozen tool definitions
 
 New sessions receive the current definitions. A persisted Tool Profile keeps its exact definitions and digests: an older `read_file` profile still uses its original path-only, bounded-prefix adapter and original result shape on continuation, safe replay, and Plan execution. Adding a new command does not add it to an existing frozen profile. Historical records and already admitted tool intents are not rewritten.
+
+The original Todo mutation definitions remain available only to their exact historical profiles and reject `activeForm`. Current definitions admit the field without changing the Todo policy, record or atomic-batch version. Resume, compaction and branch inheritance preserve explicit values; records without the field remain unchanged.
