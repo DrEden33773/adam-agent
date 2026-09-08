@@ -45,7 +45,6 @@ import PQueue from "p-queue";
 import { AgentAdmissionCard } from "./agent-admission-card.js";
 import { AgentConversationViewer } from "./agent-conversation-viewer.js";
 import { AgentFleet, AgentSessionTransition, AgentWorkspace } from "./agent-fleet.js";
-import { AgentNavigator, ManagedAgentRoster } from "./agent-navigator.js";
 import { AgentTypes } from "./agent-types.js";
 import { AgentWidget } from "./agent-widget.js";
 import {
@@ -80,6 +79,7 @@ import {
   LargeReasoningViewStore,
   largeReasoningBoundaryAnchorId,
 } from "./large-reasoning-view.js";
+import { LegacyAgentHistory } from "./legacy-agent-history.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { MentionRecipientSelector } from "./mention-recipient-selector.js";
@@ -108,7 +108,6 @@ import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
 import { createAdamStructuredEditorCompletion } from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
-import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
 import { TodoCompactOverlay } from "./todo-compact-overlay.js";
@@ -379,10 +378,79 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
   const footer = new ResponsiveText(() => physicalTerminal.columns);
-  const managedAgentRoster = new ManagedAgentRoster({
-    managedAgents: options.presentation.getState().authoritative.managedAgents,
-    theme,
-  });
+  const compactControlLayout = () =>
+    options.presentation.getState().authoritative.managedControl !== undefined &&
+    physicalTerminal.rows <= 20;
+  const layoutHeader = {
+    invalidate: () => header.invalidate(),
+    render(width: number): string[] {
+      const lines = header.render(width);
+      return compactControlLayout()
+        ? [truncateToWidth(lines.find((line) => line.trim().length > 0) ?? "", width)]
+        : lines;
+    },
+  };
+  const layoutFooter = {
+    invalidate: () => footer.invalidate(),
+    render(width: number): string[] {
+      const state = options.presentation.getState();
+      const active = state.authoritative.active;
+      if (!compactControlLayout() || active === null) return footer.render(width);
+      const plan =
+        active.plan === undefined
+          ? ""
+          : active.plan.state === "ready"
+            ? "Plan ready · "
+            : active.plan.state === "approved_not_started"
+              ? "Plan pending · "
+              : "Plan · ";
+      const thinking = selectedThinkingLevel(targetForState(state));
+      return [
+        `${plan}${sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling)}${thinking === undefined ? "" : ` · thinking ${thinking.label}`}`,
+        `${active.session.targetId} · /help`,
+      ].map((line) => truncateToWidth(theme.muted(safeTerminalText(line)), width));
+    },
+  };
+  const operationActivity = {
+    invalidate() {},
+    render(width: number): string[] {
+      const state = options.presentation.getState();
+      const active = state.authoritative.active;
+      const operation = currentOperationActivity(active);
+      if (operation === undefined) return [];
+      const mainBusy = isTuiRunActive({
+        cancelSettling,
+        parentRun: active?.parentRun,
+        sessionStatus: active?.session.status,
+        pendingInteractionCount: active?.pendingInteractions.length ?? 0,
+        transient: state.transient,
+      });
+      const status =
+        operation.status === "recovery_required"
+          ? `${operation.managedReview === undefined ? "Operation" : "Review"} · Recovery required`
+          : (managedReviewStatusText(operation) ?? `Operation · ${operationStatusText(operation)}`);
+      const actions =
+        editor.focused && permission === undefined && focusedCloseableOverlay() === undefined
+          ? [
+              ...(!mainBusy &&
+              operation.status === "running" &&
+              operation.actions.includes("cancel")
+                ? ["Ctrl+C cancel"]
+                : []),
+              ...(operation.actions.some((action: "cancel" | "recover") => action === "recover")
+                ? ["Ctrl+R recover"]
+                : []),
+            ]
+          : [];
+      const actionText = actions.join(" · ");
+      const statusWidth =
+        actionText.length === 0 ? width : Math.max(0, width - actionText.length - 3);
+      const line =
+        truncateToWidth(safeTerminalText(status), statusWidth) +
+        (actionText.length === 0 ? "" : ` · ${actionText}`);
+      return [theme.toolOutput(line)];
+    },
+  };
   const agentWidget = new AgentWidget(
     theme,
     () =>
@@ -407,7 +475,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             draft.threadId === thread.threadId && draft.parentSessionId === thread.parentSessionId,
         ) ?? false,
     maximumLines: () =>
-      editor.isShowingAutocomplete()
+      editor.isShowingAutocomplete() || compactControlLayout()
         ? 1
         : Math.max(
             1,
@@ -420,15 +488,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const state = options.presentation.getState();
       const hasControl = state.authoritative.managedControl !== undefined;
       const occupied =
-        header.render(width).length +
+        layoutHeader.render(width).length +
         inputRegion.render(width).length +
         (physicalTerminal.rows > 12 ? 1 : 0) +
         1;
-      const agents = hasControl
-        ? agentWidget.render(width).length
-        : state.authoritative.managedAgents.counts.active > 0
-          ? managedAgentRoster.render(width).length
-          : 0;
+      const agents = hasControl ? agentWidget.render(width).length : 0;
       return Math.min(
         options.todoOverlayLines ?? 12,
         Math.max(1, physicalTerminal.rows - occupied - agents - 1),
@@ -551,11 +615,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
-  let agentNavigator:
+  let legacyAgentHistory:
     | {
         readonly close: () => void;
         readonly hide: () => void;
-        readonly navigator: AgentNavigator;
+        readonly navigator: LegacyAgentHistory;
       }
     | undefined;
   let agentConversation:
@@ -586,20 +650,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly workspace: AgentWorkspace;
       }
     | undefined;
-  let pendingManagedAgentInput:
-    | {
-        readonly action: "message" | "reply" | "recovery";
-        readonly sessionId: string;
-        readonly agentId: string;
-        readonly expectedRevision: number;
-        readonly attentionId?: string;
-      }
-    | undefined;
   let attentionView: AttentionCenter | undefined;
   let attentionOverlay: { readonly close: () => void; readonly hide: () => void } | undefined;
   const dismissedAttention = new Set<string>();
   let readyAgentConversation: (() => void) | undefined;
-  let managedAgentFocusHandoffKey: "c" | "m" | "r" | null = null;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
     | {
@@ -623,7 +677,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     agentConversation,
     agentConversationLoading,
     agentWorkspace,
-    agentNavigator,
+    legacyAgentHistory,
     todoNavigator,
     artifactNavigator,
     mcpWizard,
@@ -675,8 +729,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     todoNavigatorGeneration += 1;
     todoNavigator?.hide();
     todoNavigator = undefined;
-    agentNavigator?.hide();
-    agentNavigator = undefined;
+    legacyAgentHistory?.hide();
+    legacyAgentHistory = undefined;
     thinkingPicker?.hide();
     thinkingPicker = undefined;
   };
@@ -729,6 +783,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.isShowingAutocomplete() &&
     physicalTerminal.rows < 18;
   const inputRegion = new VStack([
+    { component: operationActivity, shrink: 0 },
     {
       component: executionFailureNotice,
       visible: () => options.presentation.getState().executionFailure !== undefined,
@@ -753,16 +808,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       shrink: 0,
       visible: () =>
         options.presentation.getState().authoritative.managedControl !== undefined &&
-        options.presentation.getState().agentUiSettings?.fleetEnabled !== false,
+        options.presentation.getState().agentUiSettings?.fleetEnabled !== false &&
+        (!compactControlLayout() || editor.getText().length === 0),
     },
-    { component: footer, visible: () => !compactCompletionFooter() },
+    { component: layoutFooter, visible: () => !compactCompletionFooter() },
     {
       component: new ResponsiveLine(theme.muted("Tab select · ↑↓ choose · Esc close")),
       visible: compactCompletionFooter,
     },
   ]);
   const supportedRoot = new VStack([
-    header,
+    layoutHeader,
     {
       component: new Spacer(1),
       visible: (viewport) => viewport.height > 12,
@@ -772,14 +828,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       basis: 0,
       grow: 1,
       minSize: 1,
-    },
-    {
-      component: managedAgentRoster,
-      basis: "auto",
-      minSize: 0,
-      visible: () =>
-        options.presentation.getState().authoritative.managedControl === undefined &&
-        options.presentation.getState().authoritative.managedAgents.counts.active > 0,
     },
     {
       component: agentWidget,
@@ -1279,6 +1327,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         const current = options.presentation.getState().authoritative.active;
         if (
           generation !== planReviewReadGeneration ||
+          dismissedPlanSubjectKey === subjectKey ||
           current === null ||
           planActionSubjectKey(current) !== subjectKey
         ) {
@@ -1585,11 +1634,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       );
       agentConversation.viewer.setActivity(state.managedAgentActivity);
     }
-    managedAgentRoster.setManagedAgents(state.authoritative.managedAgents);
-    agentNavigator?.navigator.setManagedAgents(
-      state.authoritative.managedAgents,
-      state.managedAgentActivity,
-    );
+    legacyAgentHistory?.navigator.setManagedAgents(state.authoritative.managedAgents);
     targetPicker?.picker.setTargets(
       state.authoritative.targets.items,
       state.authoritative.targets.defaultTargetId,
@@ -3731,7 +3776,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     };
   }
 
-  const showAgentNavigator = (
+  const showAgents = (
     expectedSessionId: string,
     initialView: "workspace" | "settings" | "history" = "workspace",
   ): void => {
@@ -3833,8 +3878,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       };
       return;
     }
-    agentNavigator?.hide();
-    agentNavigator = undefined;
+    legacyAgentHistory?.hide();
+    legacyAgentHistory = undefined;
     const actionId = showNotice(
       "progress",
       "Loading authoritative managed-child state…",
@@ -3861,91 +3906,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         }
         if (current.managedControl !== undefined) {
           settleNotice(actionId, "info", "", "until_next_action", expectedSessionId);
-          showAgentNavigator(expectedSessionId, initialView);
+          showAgents(expectedSessionId, initialView);
           return;
         }
         let handle: { hide(): void } | undefined;
         const close = () => {
           handle?.hide();
-          agentNavigator = undefined;
+          legacyAgentHistory = undefined;
           tui.setFocus(editor);
           tui.requestRender();
         };
-        const navigator = new AgentNavigator({
+        const navigator = new LegacyAgentHistory({
           managedAgents: current.managedAgents,
           maximumContentHeight: () => Math.max(8, Math.floor(physicalTerminal.rows * 0.9) - 2),
-          onCancel(input) {
-            managedAgentFocusHandoffKey = "c";
-            void options.presentation
-              .dispatch({
-                type: "cancel_managed_agent",
-                sessionId: expectedSessionId,
-                ...input,
-              })
-              .then((cancelReceipt) => {
-                close();
-                showNotice(
-                  cancelReceipt.status === "admitted" ? "success" : "error",
-                  cancelReceipt.status === "admitted"
-                    ? "Managed child cancelled after causal settlement."
-                    : cancelReceipt.message,
-                  "until_next_action",
-                  expectedSessionId,
-                );
-                renderState();
-              });
-          },
-          onMessage(input) {
-            managedAgentFocusHandoffKey = "m";
-            close();
-            pendingManagedAgentInput = {
-              action: "message",
-              sessionId: expectedSessionId,
-              ...input,
-            };
-            editor.setText("");
-            showNotice(
-              "info",
-              "Enter one bounded message · Esc Main. Delivery occurs only at the child’s next safe boundary and does not imply compliance.",
-              "until_next_action",
-              expectedSessionId,
-            );
-            renderState();
-          },
-          onRecovery(input) {
-            managedAgentFocusHandoffKey = "r";
-            close();
-            pendingManagedAgentInput = {
-              action: "recovery",
-              sessionId: expectedSessionId,
-              ...input,
-            };
-            editor.setText("");
-            showNotice(
-              "info",
-              "Enter one bounded recovery task for the exact durable child evidence · Esc Main.",
-              "until_next_action",
-              expectedSessionId,
-            );
-            renderState();
-          },
-          onReply(input) {
-            managedAgentFocusHandoffKey = "r";
-            close();
-            pendingManagedAgentInput = {
-              action: "reply",
-              sessionId: expectedSessionId,
-              ...input,
-            };
-            editor.setText("");
-            showNotice(
-              "info",
-              "Enter one bounded reply for the exact managed-child attention request · Esc Main.",
-              "until_next_action",
-              expectedSessionId,
-            );
-            renderState();
-          },
           onChange: () => tui.requestRender(),
           onClose: close,
           async onReadArtifact(input) {
@@ -3983,17 +3956,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           },
           theme,
         });
-        navigator.setManagedAgents(
-          current.managedAgents,
-          options.presentation.getState().managedAgentActivity,
-        );
+        navigator.setManagedAgents(current.managedAgents);
         handle = showOverlay(navigator, {
           width: "90%",
           minWidth: 36,
           maxHeight: "90%",
           margin: 1,
         });
-        agentNavigator = { close, hide: () => handle?.hide(), navigator };
+        legacyAgentHistory = { close, hide: () => handle?.hide(), navigator };
         settleNoticeClear(actionId);
         tui.requestRender();
       })
@@ -5098,7 +5068,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         clearNotice();
         if (thread === undefined) showUnavailableRecipient(first, state.composer.draftRevision);
         else if (!thread.turn.hasStarted) {
-          showAgentNavigator(thread.parentSessionId);
+          showAgents(thread.parentSessionId);
           if (!agentWorkspace?.workspace.openDetails(thread))
             showUnavailableRecipient(first, state.composer.draftRevision);
         } else showManagedConversation(thread);
@@ -5409,100 +5379,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     const earlyParsed = commandRegistry.parse(text);
-    if (earlyParsed.kind === "known") pendingManagedAgentInput = undefined;
-    if (pendingManagedAgentInput !== undefined) {
-      const managedInput = pendingManagedAgentInput;
-      if (active === null || active.session.id !== managedInput.sessionId) {
-        pendingManagedAgentInput = undefined;
-        editor.disableSubmit = false;
-        showNotice("error", "The managed-child target is no longer active.", "until_edit");
-        renderState();
-        return;
-      }
-      const managedActionId = showNotice(
-        "progress",
-        managedInput.action === "message"
-          ? "Sending the exact managed-child message…"
-          : managedInput.action === "reply"
-            ? "Sending the exact managed-child reply…"
-            : "Recovering the exact managed child…",
-        "until_replaced",
-        active.session.id,
-      );
-      let followUpInput: ReturnType<typeof parseTaskBudgetFollowUp>;
-      try {
-        followUpInput =
-          managedInput.action === "recovery" ? parseTaskBudgetFollowUp(text) : { task: text };
-      } catch (error) {
-        editor.disableSubmit = false;
-        showNotice(
-          "error",
-          error instanceof Error ? error.message : "Invalid task budget input.",
-          "until_edit",
-        );
-        renderState();
-        return;
-      }
-      const command: PresentationCommand =
-        managedInput.action === "message" || managedInput.action === "reply"
-          ? {
-              type: "send_managed_agent_message",
-              sessionId: active.session.id,
-              agentId: managedInput.agentId,
-              expectedRevision: managedInput.expectedRevision,
-              ...(managedInput.attentionId === undefined
-                ? {}
-                : { attentionId: managedInput.attentionId }),
-              message: text,
-            }
-          : {
-              type: "recover_managed_agent",
-              sessionId: active.session.id,
-              agentId: managedInput.agentId,
-              expectedRevision: managedInput.expectedRevision,
-              ...followUpInput,
-            };
-      void options.presentation
-        .dispatch(command)
-        .then((receipt) => {
-          if (receipt.status === "admitted") {
-            pendingManagedAgentInput = undefined;
-            editor.setText("");
-            settleNotice(
-              managedActionId,
-              "success",
-              managedInput.action === "message"
-                ? `Managed-child message ${receipt.managedAgentControl?.delivery ?? "accepted"}; delivery occurs only at the next safe boundary and does not imply compliance.`
-                : managedInput.action === "reply"
-                  ? "Managed-child reply enqueued for exact delivery."
-                  : "Managed child recovered from exact durable evidence.",
-              "until_next_action",
-              active.session.id,
-            );
-          } else {
-            editor.disableSubmit = false;
-            settleNotice(
-              managedActionId,
-              "error",
-              receipt.message,
-              "until_edit",
-              active.session.id,
-            );
-          }
-        })
-        .catch(() => {
-          editor.disableSubmit = false;
-          settleNotice(
-            managedActionId,
-            "error",
-            "The managed-child control could not be admitted safely.",
-            "until_edit",
-            active.session.id,
-          );
-        })
-        .finally(() => tui.requestRender());
-      return;
-    }
     if (
       active !== null &&
       earlyParsed.kind === "not_command" &&
@@ -6045,7 +5921,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         openAttentionCenter(true);
         return;
       }
-      showAgentNavigator(
+      showAgents(
         active.session.id,
         parsedCommand.argumentsText === "settings"
           ? "settings"
@@ -6973,34 +6849,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     handleTerminationSignal("SIGTERM");
   }
   tui.addInputListener((data) => {
-    if (managedAgentFocusHandoffKey !== null) {
-      if (
-        matchesKey(data, managedAgentFocusHandoffKey) &&
-        (isKeyRepeat(data) || isKeyRelease(data))
-      ) {
-        if (isKeyRelease(data)) {
-          managedAgentFocusHandoffKey = null;
-        }
-        return { consume: true };
-      }
-      managedAgentFocusHandoffKey = null;
-    }
     if (commandRegistry.matchesInput(data, "exit")) {
       void stop(true);
-      return { consume: true };
-    }
-    if (
-      pendingManagedAgentInput !== undefined &&
-      permission === undefined &&
-      focusedCloseableOverlay() === undefined &&
-      commandRegistry.matchesInput(data, "back")
-    ) {
-      if (!isKeyRepeat(data) && !isKeyRelease(data)) {
-        pendingManagedAgentInput = undefined;
-        editor.disableSubmit = false;
-        showNotice("info", "Managed-child input cancelled. Main draft retained.", "until_edit");
-        renderState();
-      }
       return { consume: true };
     }
     if (
@@ -7011,6 +6861,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return { consume: true };
     if (
       permission === undefined &&
+      editor.focused &&
       focusedCloseableOverlay() === undefined &&
       terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
       options.presentation.getState().agentUiSettings?.fleetEnabled !== false &&
@@ -7119,20 +6970,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (
       commandRegistry.matchesInput(data, "rename_session") &&
+      editor.focused &&
       permission === undefined &&
       focusedCloseableOverlay() === undefined
     ) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
       }
-      const operation = options.presentation
-        .getState()
-        .authoritative.active?.linkedOperations.findLast(
-          (candidate) =>
-            candidate.status === "recovery_required" &&
-            candidate.actions.some((action: "cancel" | "recover") => action === "recover"),
-        );
-      if (operation !== undefined) {
+      const operation = currentOperationActivity(
+        options.presentation.getState().authoritative.active,
+      );
+      if (
+        operation?.status === "recovery_required" &&
+        operation.actions.some((action: "cancel" | "recover") => action === "recover")
+      ) {
         clearExitWindow();
         transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
         const recoveryActionId = showNotice(
@@ -7287,10 +7138,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         pendingInteractionCount: active?.pendingInteractions.length ?? 0,
         transient: runState.transient,
       });
-      const cancellableOperation = active?.linkedOperations.findLast(
-        (candidate) => candidate.status === "running" && candidate.actions.includes("cancel"),
-      );
-      if (!runActive && !cancelSettling && cancellableOperation !== undefined) {
+      const cancellableOperation = currentOperationActivity(active);
+      if (
+        editor.focused &&
+        !runActive &&
+        !cancelSettling &&
+        cancellableOperation?.status === "running" &&
+        cancellableOperation.actions.includes("cancel")
+      ) {
         clearExitWindow();
         transcriptViewport.focus(
           operationAnchorId(cancellableOperation.operationId),
@@ -7604,6 +7459,19 @@ function configurationFieldLabel(field: ConfigurationField): string {
     : field === "maximumOutputTokens"
       ? "output"
       : "compaction";
+}
+
+function currentOperationActivity(
+  active: ActiveSessionDisplay | null | undefined,
+): OperationDisplay | undefined {
+  return (
+    active?.linkedOperations.findLast(
+      (operation) =>
+        operation.status === "running" ||
+        operation.status === "cancel_requested" ||
+        operation.status === "recovery_required",
+    ) ?? active?.linkedOperations.findLast((operation) => operation.managedReview !== undefined)
+  );
 }
 
 function managedReviewStatusText(operation: OperationDisplay): string | null {

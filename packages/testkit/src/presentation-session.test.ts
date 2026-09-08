@@ -12637,7 +12637,7 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
   }
 });
 
-test("PresentationSession repairs a lower-sequence runtime notification regression", async () => {
+test("PresentationSession keeps a covered lower-sequence runtime notification current", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-regression-repair-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -12693,12 +12693,12 @@ test("PresentationSession repairs a lower-sequence runtime notification regressi
       stateRoot,
       workspaceRoot,
     });
-    const repairing = Promise.withResolvers<void>();
+    let enteredRepair = false;
     const completed = Promise.withResolvers<void>();
     const unsubscribe = presentation.subscribe(() => {
       const current = presentation.getState();
       if (current.authoritative.continuity.status === "repairing") {
-        repairing.resolve();
+        enteredRepair = true;
       }
       if (
         injected &&
@@ -12724,8 +12724,8 @@ test("PresentationSession repairs a lower-sequence runtime notification regressi
           thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
-      await repairing.promise;
-      await completed.promise;
+      await withManagedFailureGuard(completed.promise, "covered lower notification completion");
+      expect(enteredRepair).toBe(false);
       expect(presentation.getState().authoritative.continuity).toMatchObject({
         status: "current",
       });

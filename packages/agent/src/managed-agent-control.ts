@@ -2828,6 +2828,7 @@ export function createManagedAgentControl(options: {
           identity: randomUUID(),
         });
         try {
+          await controlStore.preflight();
           const records = await controlStore.read();
           const pending = records.filter(
             (record) =>

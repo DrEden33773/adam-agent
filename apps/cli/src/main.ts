@@ -15,6 +15,7 @@ import {
   createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
+  createProductionManagedControlComposition,
   createSessionLifecycle,
   createWebSearchConfiguration,
   createWorkspaceTrust,
@@ -208,14 +209,16 @@ async function answerPermissionRequest(
 ): Promise<void> {
   writeText(2, formatPermissionPrompt(event));
   const answer = await input.next();
-  activeSession.decidePermission({
+  await activeSession.decidePermission({
     requestId: event.requestId,
     decision: answer === "y" ? "allow" : "deny",
   });
 }
 
 type PermissionDecisionTarget = {
-  decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
+  decidePermission(
+    command: PermissionDecisionCommand,
+  ): PermissionDecisionCommandResult | Promise<PermissionDecisionCommandResult>;
 };
 
 class PermissionLineReader {
@@ -519,47 +522,49 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
       return;
     }
     const modelTargets = createCliModelTargets();
-    if (activeCommand.type === "resume" && !activeCommand.continue) {
-      const lifecycle = await createRunLifecycle(modelTargets);
-      const resumed = await lifecycle.resume({ sessionId: activeCommand.sessionId });
-      if (resumed.status === "rejected") {
-        writeText(2, `${resumed.error.message}\n`);
-        process.exitCode = 1;
+    const lifecycle = await createRunLifecycle(modelTargets);
+    try {
+      if (activeCommand.type === "resume" && !activeCommand.continue) {
+        const resumed = await lifecycle.resume({ sessionId: activeCommand.sessionId });
+        if (resumed.status === "rejected") {
+          writeText(2, `${resumed.error.message}\n`);
+          process.exitCode = 1;
+          return;
+        }
+        writeText(1, `${JSON.stringify(resumed.snapshot)}\n`);
         return;
       }
-      writeText(1, `${JSON.stringify(resumed.snapshot)}\n`);
-      return;
-    }
-    if (activeCommand.type === "branch") {
-      const lifecycle = await createRunLifecycle(modelTargets);
-      const snapshot = await lifecycle.branch({
-        parentSessionId: activeCommand.parentSessionId,
-        atSequence: activeCommand.atSequence,
-        ...(activeCommand.targetId === undefined ? {} : { targetId: activeCommand.targetId }),
-      });
-      writeText(1, `${JSON.stringify(snapshot)}\n`);
-      return;
-    }
+      if (activeCommand.type === "branch") {
+        const snapshot = await lifecycle.branch({
+          parentSessionId: activeCommand.parentSessionId,
+          atSequence: activeCommand.atSequence,
+          ...(activeCommand.targetId === undefined ? {} : { targetId: activeCommand.targetId }),
+        });
+        writeText(1, `${JSON.stringify(snapshot)}\n`);
+        return;
+      }
 
-    const lifecycle = await createRunLifecycle(modelTargets);
-    if (activeCommand.type === "prompt") {
-      const targetId = selectModelTargetId(process.env);
-      const resolved = await modelTargets.resolve({
-        targetId,
-        allowExperimental: false,
-        signal: new AbortController().signal,
-      });
-      await admitAndPresent(lifecycle, {
-        targetIdentity: resolved.identity,
-        input: {
-          text: activeCommand.prompt,
-          ...(activeCommand.skills === undefined ? {} : { skills: activeCommand.skills }),
-        },
-        limits: { maxTurns: 8 },
-      });
-      return;
+      if (activeCommand.type === "prompt") {
+        const targetId = selectModelTargetId(process.env);
+        const resolved = await modelTargets.resolve({
+          targetId,
+          allowExperimental: false,
+          signal: new AbortController().signal,
+        });
+        await admitAndPresent(lifecycle, {
+          targetIdentity: resolved.identity,
+          input: {
+            text: activeCommand.prompt,
+            ...(activeCommand.skills === undefined ? {} : { skills: activeCommand.skills }),
+          },
+          limits: { maxTurns: 8 },
+        });
+        return;
+      }
+      await continueAndPresent(lifecycle, { sessionId: activeCommand.sessionId });
+    } finally {
+      await closeRunLifecycle(lifecycle);
     }
-    await continueAndPresent(lifecycle, { sessionId: activeCommand.sessionId });
   } catch (error) {
     if (
       error instanceof ExtensionConfigurationError ||
@@ -576,10 +581,15 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
   }
 }
 
+async function closeRunLifecycle(lifecycle: SessionLifecycle): Promise<void> {
+  const closed = await lifecycle.close();
+  if (closed.status !== "closed") throw new SessionLifecycleError("mcp_shutdown_unconfirmed");
+}
+
 async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLifecycle> {
   const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
   return createSessionLifecycle({
-    managedAgentTools: "managed-agent-tools.a1.v3",
+    managedControl: await createProductionManagedControlComposition({ workspaceRoot, stateRoot }),
     modelTargets,
     preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
     workspaceTrust: createWorkspaceTrust({
@@ -646,6 +656,31 @@ async function runAndPresent(
       () => pendingPermissionHandlers.delete(handler),
     );
   });
+  const unsubscribeManaged = lifecycle.subscribeManagedAgentEvents?.((notification) => {
+    if (
+      notification.type !== "child_runtime_event" ||
+      notification.event.type !== "tool_permission_requested"
+    )
+      return;
+    const handler = answerPermissionRequest(
+      {
+        decidePermission: (command) =>
+          lifecycle.decideManagedAgentPermission({
+            ...command,
+            sessionId: notification.parentSessionId,
+            threadId: notification.agentId,
+            attemptId: notification.attemptId,
+          }),
+      },
+      notification.event,
+      permissionInput,
+    );
+    pendingPermissionHandlers.add(handler);
+    void handler.then(
+      () => pendingPermissionHandlers.delete(handler),
+      () => pendingPermissionHandlers.delete(handler),
+    );
+  });
   let interrupted = false;
   const abortController = new AbortController();
   const handleInterrupt = () => {
@@ -669,6 +704,7 @@ async function runAndPresent(
     await Promise.allSettled(pendingPermissionHandlers);
     process.removeListener("SIGINT", handleInterrupt);
     unsubscribe();
+    unsubscribeManaged?.();
   }
 }
 

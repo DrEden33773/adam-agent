@@ -1138,7 +1138,7 @@ test("SessionLifecycle accepts only the exact managed-agent v1 transition digest
   }
 });
 
-test("SessionLifecycle keeps managed-agent v1 and v2 list definitions version-exact", async () => {
+test("SessionLifecycle preserves historical list definitions and refuses old execution while Main continues", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-managed-list-versions-"));
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
@@ -1183,6 +1183,7 @@ test("SessionLifecycle keeps managed-agent v1 and v2 list definitions version-ex
     });
     const lifecycle = harness.createLifecycle({
       managedAgentTools: profile,
+      stateRoot: join(testRoot, "state"),
       modelTargets: modelTargetsWithDriver(driver),
       permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
       tools: createCodingToolRegistry({ workspaceRoot }),
@@ -1200,6 +1201,33 @@ test("SessionLifecycle keeps managed-agent v1 and v2 list definitions version-ex
       ).resolves.toMatchObject({
         result: { status: "completed", answer: "Observed the versioned list result." },
       });
+      const before = await lifecycle.inspect({ sessionId: created.sessionId });
+      const oldTarget = {
+        sessionId: created.sessionId,
+        agentId: "historical-agent",
+        expectedRevision: 1,
+        callId: "historical-action",
+        task: "Continue historical child",
+        signal: new AbortController().signal,
+      };
+      await expect(lifecycle.followUpManagedAgent(oldTarget)).rejects.toMatchObject({
+        code: "session_managed_control_read_only",
+      });
+      await expect(lifecycle.recoverManagedAgent(oldTarget)).rejects.toMatchObject({
+        code: "session_managed_control_read_only",
+      });
+      await expect(
+        lifecycle.sendManagedAgentMessage({ ...oldTarget, message: "Historical message" }),
+      ).rejects.toMatchObject({ code: "session_managed_control_read_only" });
+      await expect(lifecycle.cancelManagedAgent(oldTarget)).rejects.toMatchObject({
+        code: "session_managed_control_read_only",
+      });
+      expect(await lifecycle.inspectManagedAgents({ sessionId: created.sessionId })).toEqual({
+        agents: [],
+        counts: { active: 0, terminal: 0, attention: 0 },
+      });
+      expect(await lifecycle.inspect({ sessionId: created.sessionId })).toEqual(before);
+      expect(requestCount).toBe(2);
       const definition = entered.plan?.eligibleToolProfile.definitions.find(
         (candidate) => candidate.name === "list_agents",
       );

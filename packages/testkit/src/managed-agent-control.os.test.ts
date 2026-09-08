@@ -741,7 +741,7 @@ function legacyAdmission(
   };
 }
 
-test("PresentationSession exposes historical managed history read-only through the new candidate without legacy writes", async () => {
+test("PresentationSession keeps missing historical child evidence inspection-only without legacy writes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "adam-control-legacy-view-"));
   const harness = await jsonlControlFixture(directory);
   const { targetIdentity, contextProfile, model: driver } = harness.controlOptions;
@@ -779,7 +779,13 @@ test("PresentationSession exposes historical managed history read-only through t
     workspaceRoot: directory,
     stateRoot: join(directory, "state"),
   });
-  const admission = legacyAdmission(parent.sessionId);
+  const admission = {
+    ...legacyAdmission(parent.sessionId),
+    parentRootId: `session:${parent.sessionId}`,
+    projectId: parent.projectId as `sha256:${string}`,
+    mode: "foreground" as const,
+    deadlineAtUnixMilliseconds: 1_900_000_600_000,
+  };
   await legacy.append(admission);
   const before = await legacy.read();
   const lifecycle = createSessionLifecycle({
@@ -799,14 +805,21 @@ test("PresentationSession exposes historical managed history read-only through t
       projectLabel: "Legacy history",
       sessionId: parent.sessionId,
     });
+    const historicalChildren = createJsonlSessionStoreDirectory({
+      workspaceRoot: directory,
+      stateRoot: join(options.stateRoot, "managed-child-sessions"),
+    });
+    expect(await historicalChildren.open(admission.childSessionId)).toBeUndefined();
     const agent = presentation.getState().authoritative.managedAgents.agents[0];
     expect(agent).toMatchObject({
       agentId: admission.agentId,
       profile: "scout.v1",
-      status: "recovery_required",
+      status: "inspection_required",
       readOnly: true,
+      error: { code: "managed_agent_inspection_required" },
     });
     if (agent === undefined) throw new Error("Missing legacy projection.");
+    expect(agent.result).toBeUndefined();
     expect(
       await presentation.dispatch({
         type: "cancel_managed_agent",

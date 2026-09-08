@@ -4,16 +4,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
-  createJsonlSessionStoreDirectory,
   createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
   createWorkspaceTrust,
-  type SessionRecord,
 } from "@adam-agent/agent";
-import { createJsonlManagedAgentControlStore } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
-import { createProductionProjectRuntime, projectRuntimeManagedControl } from "./project-runtime.js";
+import { createProductionProjectRuntime } from "./project-runtime.js";
 import { removeTuiFixtureRoot as rm } from "./tui-filesystem.test-support.js";
 
 test("the project runtime owns only one Presentation across a concurrent close", async () => {
@@ -62,15 +59,14 @@ test("the project runtime owns only one Presentation across a concurrent close",
 });
 
 test.each([
-  { configuration: "enabled", candidate: true, rejectedCount: 0, available: true },
-  { configuration: "disabled", candidate: true, rejectedCount: 0, available: false },
-  { configuration: "absent", candidate: true, rejectedCount: 0, available: false },
-  { configuration: "missing-package", candidate: true, rejectedCount: 0, available: false },
-  { configuration: "wrong-version", candidate: true, rejectedCount: 1, available: false },
-  { configuration: "missing-grant", candidate: true, rejectedCount: 1, available: false },
-  { configuration: "enabled", candidate: false, rejectedCount: 1, available: false },
+  { configuration: "enabled", rejectedCount: 0, available: true },
+  { configuration: "disabled", rejectedCount: 0, available: false },
+  { configuration: "absent", rejectedCount: 0, available: false },
+  { configuration: "missing-package", rejectedCount: 0, available: false },
+  { configuration: "wrong-version", rejectedCount: 1, available: false },
+  { configuration: "missing-grant", rejectedCount: 1, available: false },
 ] as const)(
-  "exact public Eve configuration $configuration with candidate=$candidate preserves admission and Main availability",
+  "ordinary production exact public Eve configuration $configuration preserves admission and Main availability",
   async (scenario) => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-project-runtime-eve-"));
     const workspaceRoot = join(testRoot, "workspace");
@@ -149,17 +145,6 @@ test.each([
     };
     let providerCalls = 0;
     const runtime = await createProductionProjectRuntime({
-      ...(scenario.candidate
-        ? {
-            [projectRuntimeManagedControl]: {
-              store: await createJsonlManagedAgentControlStore({ workspaceRoot, stateRoot }),
-              childSessionStores: createJsonlSessionStoreDirectory<SessionRecord>({
-                workspaceRoot,
-                stateRoot: join(stateRoot, "children"),
-              }),
-            },
-          }
-        : {}),
       environment,
       extensionPermissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
       modelTargets: createModelTargets({
