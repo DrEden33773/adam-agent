@@ -46,7 +46,10 @@ import {
   outputAfterFinalAltScreenExit,
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
-import { VirtualTerminal } from "./virtual-terminal.test-support.js";
+import {
+  terminalObservationTimeoutMilliseconds,
+  VirtualTerminal,
+} from "./virtual-terminal.test-support.js";
 
 test("cold search interruption exposes recovery and accepts Main input after explicit resume", () =>
   exerciseColdParentRecovery("search_repository", "resume"));
@@ -99,6 +102,7 @@ async function exerciseColdParentRecovery(
   };
   const recovering = Promise.withResolvers<void>();
   const releaseRecovery = Promise.withResolvers<void>();
+  const releaseMainFinish = Promise.withResolvers<void>();
   let calls = 0;
   const modelTargets: ModelTargets = {
     async resolve() {
@@ -132,6 +136,7 @@ async function exerciseColdParentRecovery(
                     ? "Ordinary Main prompt completed."
                     : "Safe search recovered.",
               };
+              if (request.messages.at(-1)?.role === "user") await releaseMainFinish.promise;
               yield { type: "finish", reason: "stop" };
             }
           },
@@ -284,11 +289,40 @@ async function exerciseColdParentRecovery(
       editor: "ready",
     });
     unsubscribe();
-    terminal.input("Ordinary Main prompt\r");
-    await terminal.waitForFrameAfter("Ordinary Main prompt completed.", 0);
-    expect(calls).toBe(action === "resume" ? 4 : 3);
-    expect((await lifecycle.inspect({ sessionId: created.sessionId })).status).toBe("settled");
+    const mainSettled = Promise.withResolvers<void>();
+    let mainRunId: string | undefined;
+    const unsubscribeMain = lifecycle.subscribeSessionEvents((notification) => {
+      if (notification.sessionId !== created.sessionId) return;
+      if (
+        notification.event.type === "user_message" &&
+        notification.event.text === "Ordinary Main prompt"
+      )
+        mainRunId = notification.runId;
+      if (notification.runId === mainRunId && notification.event.type === "session_settled")
+        mainSettled.resolve();
+    });
+    const settlementGuard = setTimeout(
+      () => mainSettled.reject(new Error("The exact ordinary Main run did not settle.")),
+      terminalObservationTimeoutMilliseconds,
+    );
+    const beforeMain = terminal.output().length;
+    try {
+      terminal.input("Ordinary Main prompt\r");
+      // Rendered output precedes provider finish and cannot prove durable settlement.
+      await Promise.all([
+        terminal.waitForFrameAfter("Ordinary Main prompt completed.", beforeMain).then(() => {
+          releaseMainFinish.resolve();
+        }),
+        mainSettled.promise,
+      ]);
+      expect(calls).toBe(action === "resume" ? 4 : 3);
+      expect((await lifecycle.inspect({ sessionId: created.sessionId })).status).toBe("settled");
+    } finally {
+      clearTimeout(settlementGuard);
+      unsubscribeMain();
+    }
   } finally {
+    releaseMainFinish.resolve();
     releaseRecovery.resolve();
     if (terminal.running()) terminal.input("\u0011");
     await running;
