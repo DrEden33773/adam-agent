@@ -4,6 +4,32 @@ import { expect, test } from "vitest";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { createAdamTuiTheme } from "./theme.js";
 
+test("a permission needs a displayed decision and a fresh Enter press", () => {
+  const decisions: string[] = [];
+  const overlay = new PermissionOverlay({
+    interaction: {
+      type: "permission",
+      requestId: "exact-request",
+      callId: "call",
+      effect: "read",
+      subject: { type: "path", value: "evidence.txt" },
+      canAllow: true,
+      changePreviewRef: null,
+    },
+    onDecision: (decision) => decisions.push(decision),
+    theme: createAdamTuiTheme(true),
+  });
+  overlay.setPreview({ readable: true, text: "Exact preview" });
+  overlay.handleInput("\r");
+  expect(decisions).toEqual([]);
+  overlay.render(80);
+  overlay.handleInput("\u001b[13;1:2u");
+  overlay.handleInput("\u001b[13;1:3u");
+  expect(decisions).toEqual([]);
+  overlay.handleInput("\u001b[13;1:1u");
+  expect(decisions).toEqual(["allow"]);
+});
+
 test("permission Enter shows a pending decision and ignores repeated decisions", () => {
   const decisions: string[] = [];
   const overlay = new PermissionOverlay({
@@ -20,6 +46,7 @@ test("permission Enter shows a pending decision and ignores repeated decisions",
     theme: createAdamTuiTheme(true),
   });
   overlay.setPreview({ readable: true, text: "Exact preview" });
+  overlay.render(80);
   overlay.handleInput("\r");
   expect(overlay.render(80).join("\n")).toContain("Submitting allow decision");
   overlay.handleInput("\r");

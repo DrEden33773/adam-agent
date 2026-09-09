@@ -8,6 +8,7 @@ import type {
   BranchSourceBoundary,
   DraftMentionElement,
   DraftPoint,
+  ManagedAttentionItem,
   ManagedControlThread,
   OperationDisplay,
   PresentationCommand,
@@ -30,7 +31,7 @@ import {
   isKeyRelease,
   isKeyRepeat,
   Loader,
-  Markdown,
+  type Markdown,
   matchesKey,
   type OverlayOptions,
   ProcessTerminal,
@@ -53,6 +54,7 @@ import {
   activeChronologyDiffs,
 } from "./artifact-navigator.js";
 import { AttentionCenter, managedAttentionKey } from "./attention-center.js";
+import { attentionSummary, blockingAttention, uniqueAttention } from "./attention-summary.js";
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import {
@@ -72,6 +74,7 @@ import {
   LegacyDuplicateGuard,
   nodeDeadlineScheduler,
 } from "./exit-policy.js";
+import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { HelpNavigator, type HelpPage } from "./help-navigator.js";
 import {
   isLargeReasoning,
@@ -83,6 +86,7 @@ import { LegacyAgentHistory } from "./legacy-agent-history.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { MentionRecipientSelector } from "./mention-recipient-selector.js";
+import { createMessageMarkdown } from "./message-markdown.js";
 import { OverlayFrame } from "./overlay-frame.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import {
@@ -152,7 +156,24 @@ type TuiNotice = {
 
 export async function runTui(options: RunTuiOptions): Promise<void> {
   const physicalTerminal = options.terminal ?? new ProcessTerminal();
+  let bracketedPasteActive = false;
   const terminal = new RightEdgeGuardTerminal(physicalTerminal, (data) => {
+    const pasteStart = data.lastIndexOf("\u001b[200~");
+    const pasteEnd = data.lastIndexOf("\u001b[201~");
+    if (pasteStart >= 0 || pasteEnd >= 0) bracketedPasteActive = pasteStart > pasteEnd;
+    // The selected Child owns its bounded viewport, before Pi's Main viewport bindings.
+    if (
+      agentConversation?.viewer.focused &&
+      (focusedWheelDirection(data) !== null ||
+        matchesKey(data, "home") ||
+        matchesKey(data, "end") ||
+        matchesKey(data, "pageUp") ||
+        matchesKey(data, "pageDown"))
+    ) {
+      agentConversation.viewer.handleInput(data);
+      tui.requestRender();
+      return undefined;
+    }
     // Pi consumes viewport Home/End before component listeners. While the Main
     // editor owns focus, use its equivalent cursor keys without changing global bindings.
     if (editor.focused && editor.getText().length > 0 && !isKeyRelease(data)) {
@@ -422,15 +443,44 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     render(width: number): string[] {
       const state = options.presentation.getState();
       const active = state.authoritative.active;
-      if (!compactControlLayout() || active === null) return footer.render(width);
       const plan =
-        active.plan === undefined
+        active?.plan === undefined
           ? ""
           : active.plan.state === "ready"
             ? "Plan ready · "
             : active.plan.state === "approved_not_started"
               ? "Plan pending · "
               : "Plan · ";
+      const pending = attentionSummary(
+        allAttention(),
+        width,
+        commandRegistry.keybinding("open_attention").keys,
+        theme,
+      );
+      if (pending !== undefined) {
+        const blocked = blockingAttention(
+          state.managedAttention ?? [],
+          state.authoritative.managedControl,
+          agentConversation?.threadId,
+        );
+        const reason = state.authoritative.active?.pendingInteractions.length
+          ? "Current session needs permission"
+          : blocked.length > 0
+            ? `${blocked[0]?.threadId === agentConversation?.threadId ? "Conversation waiting" : "Main waiting"} · ${blocked[0]?.handle}`
+            : undefined;
+        return [
+          truncateToWidth(
+            reason === undefined
+              ? theme.muted(
+                  `${plan}${active === null ? "Pending interaction" : sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling)}`,
+                )
+              : theme.statusWarning(`${plan}${reason}`),
+            width,
+          ),
+          pending,
+        ];
+      }
+      if (!compactControlLayout() || active === null) return footer.render(width);
       const thinking = selectedThinkingLevel(targetForState(state));
       return [
         `${plan}${sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling)}${thinking === undefined ? "" : ` · thinking ${thinking.label}`}`,
@@ -554,8 +604,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly overlay: PermissionOverlay | DelegationSelector;
         readonly requestId: string;
         readonly hide: () => void;
+        readonly show: () => void;
       }
     | undefined;
+  let deferredPermission: typeof permission;
+  let dismissedMainPermissionId: string | undefined;
   let targetPicker:
     | {
         readonly close: () => void;
@@ -675,12 +728,61 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly close: () => void;
         readonly hide: () => void;
         readonly focus: () => void;
+        readonly setHidden: (hidden: boolean) => void;
         readonly workspace: AgentWorkspace;
       }
     | undefined;
   let attentionView: AttentionCenter | undefined;
   let attentionOverlay: { readonly close: () => void; readonly hide: () => void } | undefined;
   const dismissedAttention = new Set<string>();
+  let childPageHeight = 1;
+  let requestedMainPermissionId: string | undefined;
+  function allAttention(): readonly ManagedAttentionItem[] {
+    const state = options.presentation.getState();
+    const active = state.authoritative.active;
+    const managed = uniqueAttention(state.managedAttention ?? []);
+    const blockers = new Set(
+      blockingAttention(
+        managed,
+        state.authoritative.managedControl,
+        agentConversation?.threadId,
+      ).map(managedAttentionKey),
+    );
+    managed.sort(
+      (left, right) =>
+        Number(blockers.has(managedAttentionKey(right))) -
+        Number(blockers.has(managedAttentionKey(left))),
+    );
+    return uniqueAttention([
+      ...(active?.pendingInteractions.map(
+        (interaction): ManagedAttentionItem => ({
+          id: interaction.requestId,
+          parentSessionId: active.session.id,
+          threadId: active.session.id,
+          turnId: active.session.id,
+          handle: "Main",
+          displayName: "Main",
+          description: "Current session permission",
+          available: interaction.canAllow,
+          kind: "permission",
+          interaction,
+        }),
+      ) ?? []),
+      ...managed,
+    ]);
+  }
+  const protectedInteraction = () =>
+    bracketedPasteActive ||
+    (agentConversation !== undefined
+      ? agentConversation.viewer.hasProtectedInteraction() ||
+        focusedCloseableOverlay() !== agentConversation
+      : draftMutationQueue.pending > 0 ||
+        draftMutationQueue.size > 0 ||
+        agentFleet.isNavigating ||
+        editor.getText().length > 0 ||
+        editor.isShowingAutocomplete() ||
+        focusedCloseableOverlay() !== undefined);
+  const childReadingStates = new Map<string, ReturnType<AgentConversationViewer["readingState"]>>();
   let readyAgentConversation: (() => void) | undefined;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
@@ -726,6 +828,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     attentionOverlay = undefined;
     attentionView = undefined;
     dismissedAttention.clear();
+    deferredPermission = undefined;
+    dismissedMainPermissionId = undefined;
+    requestedMainPermissionId = undefined;
+    childReadingStates.clear();
     readyAgentConversation = undefined;
     agentSessionTransition?.hide();
     agentSessionTransition = undefined;
@@ -839,10 +945,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         options.presentation.getState().agentUiSettings?.fleetEnabled !== false &&
         (!compactControlLayout() || editor.getText().length === 0),
     },
-    { component: layoutFooter, visible: () => !compactCompletionFooter() },
+    {
+      component: layoutFooter,
+      visible: () => allAttention().length > 0 || !compactCompletionFooter(),
+    },
     {
       component: new ResponsiveLine(theme.muted("Tab select · ↑↓ choose · Esc close")),
-      visible: compactCompletionFooter,
+      visible: () => allAttention().length === 0 && compactCompletionFooter(),
     },
   ]);
   const supportedRoot = new VStack([
@@ -856,13 +965,43 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       basis: 0,
       grow: 1,
       minSize: 1,
+      visible: () => agentConversation === undefined,
+    },
+    {
+      component: new VStack([
+        {
+          component: {
+            invalidate() {
+              agentConversation?.viewer.invalidate();
+            },
+            render(width: number) {
+              childPageHeight = Math.max(
+                1,
+                physicalTerminal.rows -
+                  layoutHeader.render(width).length -
+                  (physicalTerminal.rows > 12 ? 1 : 0) -
+                  layoutFooter.render(width).length,
+              );
+              return agentConversation?.viewer.render(width) ?? [];
+            },
+          },
+          basis: 0,
+          grow: 1,
+        },
+      ]),
+      basis: 0,
+      grow: 1,
+      minSize: 1,
+      visible: () => agentConversation !== undefined,
     },
     {
       component: agentWidget,
       basis: "auto",
       minSize: 0,
       shrink: 0,
-      visible: () => options.presentation.getState().authoritative.managedControl !== undefined,
+      visible: () =>
+        agentConversation === undefined &&
+        options.presentation.getState().authoritative.managedControl !== undefined,
     },
     {
       component: todoCompactOverlay,
@@ -870,6 +1009,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       shrink: 0,
       minSize: 0,
       visible: () => {
+        if (agentConversation !== undefined) return false;
         const todo = options.presentation.getState().authoritative.active?.todo;
         return (
           todo !== undefined &&
@@ -882,8 +1022,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       basis: "auto",
       minSize: 1,
       shrink: 1,
-      visible: () => targetPicker === undefined,
+      visible: () => targetPicker === undefined && agentConversation === undefined,
     },
+    { component: layoutFooter, shrink: 0, visible: () => agentConversation !== undefined },
   ]);
   tui.setLayoutRoot(
     new VStack([
@@ -2198,7 +2339,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             : "Provider reasoning is available as an artifact · Ctrl+T to retry loading");
       const content = new Container();
       content.addChild(reasoning.status === "active" ? thinking : new ResponsiveLine(title));
-      content.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
+      content.addChild(createMessageMarkdown(text, theme));
       transcript.addChild(new Spacer(1));
       const expandedFrame = new RoundedFrame(content, theme.editor.borderColor);
       transcript.addChild(expandedFrame);
@@ -2232,7 +2373,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           if (cached?.text !== item.text) {
             cached = {
               text: item.text,
-              component: new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown),
+              component: createMessageMarkdown(item.text, theme),
             };
             assistantMarkdown.set(item.id, cached);
           }
@@ -2564,7 +2705,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       transcript.addChild(working);
     } else if (transientAssistant !== undefined && transientAssistant.length > 0) {
       transcript.addChild(new Spacer(1));
-      transcript.addChild(new Markdown(safeTerminalText(transientAssistant), 0, 0, theme.markdown));
+      transcript.addChild(createMessageMarkdown(transientAssistant, theme));
     }
     if (showWorking && !workingVisible) {
       working.start();
@@ -2598,12 +2739,28 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearExitWindow();
     }
     previousRunActive = runActive;
+    if (deferredPermission !== undefined && deferredPermission.requestId !== pending?.requestId)
+      deferredPermission = undefined;
+    if (
+      pending !== undefined &&
+      requestedMainPermissionId === pending.requestId &&
+      deferredPermission?.requestId === pending.requestId
+    ) {
+      permission = deferredPermission;
+      deferredPermission = undefined;
+      permission.show();
+    }
     if (pending === undefined && permission !== undefined) {
       clearExitWindow();
       permission.hide();
       permission = undefined;
       tui.requestRender(true);
-    } else if (pending !== undefined && permission?.requestId !== pending.requestId) {
+    } else if (
+      pending !== undefined &&
+      permission?.requestId !== pending.requestId &&
+      (requestedMainPermissionId === pending.requestId ||
+        (dismissedMainPermissionId !== pending.requestId && !protectedInteraction()))
+    ) {
       clearExitWindow();
       permission?.hide();
       let delegationSelection:
@@ -2617,6 +2774,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               canChangeMode: pending.delegationCanChangeMode ?? false,
               description: `${pending.delegation.threads} child delegation · ${pending.delegation.roles.join(", ")}`,
               theme,
+              deferHint: `${commandRegistry.keybinding("open_attention").keys} later`,
               messages: pending.delegationMessages ?? [],
               onChange: () => tui.requestRender(),
               ...(pending.delegationCanChangeMode !== true
@@ -2686,6 +2844,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : new PermissionOverlay({
               interaction: pending,
               theme,
+              deferHint: `${commandRegistry.keybinding("open_attention").keys} later`,
               onDecision(decision) {
                 tui.requestRender();
                 const failed = (message: string) => {
@@ -2708,13 +2867,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                   .catch(() => failed("The permission decision could not be saved."));
               },
             });
-      const handle = showOverlay(overlay, {
+      const permissionOptions = {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
         margin: 1,
-      });
-      permission = { overlay, requestId: pending.requestId, hide: () => handle.hide() };
+      } as const;
+      let handle = showOverlay(overlay, permissionOptions);
+      permission = {
+        overlay,
+        requestId: pending.requestId,
+        hide: () => handle.hide(),
+        show: () => {
+          handle = showOverlay(overlay, permissionOptions);
+        },
+      };
       if (overlay instanceof DelegationSelector) {
         tui.requestRender();
       } else if (pending.changePreviewRef === null) {
@@ -2723,7 +2890,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         void options.presentation
           .dispatch({ type: "read_artifact", artifact: pending.changePreviewRef, range: null })
           .then((receipt) => {
-            if (permission?.requestId !== pending.requestId) {
+            if (
+              permission?.requestId !== pending.requestId &&
+              deferredPermission?.requestId !== pending.requestId
+            ) {
               return;
             }
             overlay.setPreview(
@@ -2735,7 +2905,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       }
     }
-    const attention = state.managedAttention ?? [];
+    const attention = uniqueAttention(state.managedAttention ?? []);
     attentionView?.setItems(attention);
     if (
       attentionOverlay !== undefined &&
@@ -2748,7 +2918,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       permission === undefined &&
       attentionOverlay === undefined &&
-      attention.some((item) => !dismissedAttention.has(managedAttentionKey(item)))
+      blockingAttention(
+        attention,
+        state.authoritative.managedControl,
+        agentConversation?.threadId,
+      ).some((item) => !dismissedAttention.has(managedAttentionKey(item))) &&
+      !protectedInteraction()
     )
       openAttentionCenter();
     const managedTransition = state.authoritative.managedTransition;
@@ -3524,7 +3699,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     tui.requestRender();
   };
   function openAttentionCenter(force = false): void {
-    const items = options.presentation.getState().managedAttention ?? [];
+    const pending = options.presentation.getState().authoritative.active?.pendingInteractions[0];
+    if (force && pending !== undefined) {
+      if (permission === undefined) {
+        requestedMainPermissionId = pending.requestId;
+        renderState();
+      }
+      return;
+    }
+    const items = allAttention().filter((item) => item.threadId !== item.parentSessionId);
     if (attentionOverlay !== undefined || (items.length === 0 && !attentionView?.hasPendingInput()))
       return;
     let handle: ReturnType<typeof showOverlay> | undefined;
@@ -3533,7 +3716,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         dismissedAttention.add(managedAttentionKey(item));
       handle?.hide();
       attentionOverlay = undefined;
-      showNotice("info", "Attention pending · /agents", "until_next_action");
       tui.requestRender();
     };
     if (attentionView === undefined)
@@ -3572,7 +3754,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
     attentionView.setItems(items);
     const fresh = items.find((item) => !dismissedAttention.has(managedAttentionKey(item)));
-    if (!force && fresh !== undefined) attentionView.focusItem(managedAttentionKey(fresh));
+    const representative = force ? items[0] : fresh;
+    if (representative !== undefined) attentionView.focusItem(managedAttentionKey(representative));
     handle = showOverlay(attentionView, {
       width: "90%",
       minWidth: 36,
@@ -3677,11 +3860,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     returnFocus?: () => void,
     readOnly = false,
   ): void {
-    let handle: { hide(): void } | undefined;
+    const readingKey = `${thread.parentSessionId}:${thread.threadId}:${thread.turn.turnId}`;
     const close = () => {
+      const readingState = viewer.readingState();
+      childReadingStates.set(readingState.identity, readingState);
       viewer.dispose();
-      handle?.hide();
       agentConversation = undefined;
+      agentWorkspace?.setHidden(false);
       if (returnFocus === undefined) tui.setFocus(editor);
       else returnFocus();
       renderState();
@@ -3749,7 +3934,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .managedAgentActivity?.find(
           (entry) => entry.agentId === thread.threadId && entry.attemptId === thread.turn.attemptId,
         ),
-      maximumLines: () => Math.max(6, Math.floor(physicalTerminal.rows * 0.85) - 4),
+      maximumLines: () => Math.max(1, childPageHeight),
       onRead: async (selected, cursor) => {
         const receipt = await options.presentation.dispatch({
           type: "read_agent_conversation",
@@ -3773,6 +3958,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           command,
         }),
       isMainCommand: (text) => commandRegistry.parse(text.trimStart()).kind === "known",
+      onAttention: () => openAttentionCenter(true),
       onSaveDraft: async (draft) => {
         const receipt = await options.presentation.dispatch({ type: "save_agent_draft", draft });
         if (receipt.status === "rejected") {
@@ -3815,17 +4001,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       onChange: () => tui.requestRender(),
       onClose: close,
     });
-    handle = showOverlay(viewer, { width: "90%", minWidth: 36, maxHeight: "85%", margin: 1 });
+    const readingState = childReadingStates.get(readingKey);
+    if (readingState !== undefined) viewer.restoreReadingState(readingState);
+    agentWorkspace?.setHidden(true);
+    tui.setFocus(viewer);
     agentConversation = {
       close: () => viewer.back(),
       hide: () => {
         viewer.dispose();
-        handle?.hide();
       },
       viewer,
       threadId: thread.threadId,
       ...(readOnly ? { pinnedTurnId: thread.turn.turnId } : {}),
     };
+    renderState();
   }
 
   const showAgents = (
@@ -3926,6 +4115,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         close: () => workspace.back(),
         hide: () => handle?.hide(),
         focus: () => handle?.focus(),
+        setHidden: (hidden) => handle?.setHidden(hidden),
         workspace,
       };
       return;
@@ -6934,6 +7124,40 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     handleTerminationSignal("SIGTERM");
   }
   tui.addInputListener((data) => {
+    if (commandRegistry.matchesInput(data, "open_attention")) {
+      if (
+        !isKeyRepeat(data) &&
+        !isKeyRelease(data) &&
+        permission !== undefined &&
+        !permission.overlay.isSubmitting
+      ) {
+        dismissedMainPermissionId = permission.requestId;
+        requestedMainPermissionId = undefined;
+        deferredPermission = permission;
+        permission.hide();
+        permission = undefined;
+        renderState();
+        return { consume: true };
+      }
+      if (
+        !isKeyRepeat(data) &&
+        !isKeyRelease(data) &&
+        permission === undefined &&
+        (focusedCloseableOverlay() === undefined ||
+          (focusedCloseableOverlay() === agentConversation &&
+            !agentConversation?.viewer.hasPendingMutation()) ||
+          focusedCloseableOverlay() === helpNavigator ||
+          focusedCloseableOverlay() === sessionInspector)
+      ) {
+        const pending =
+          options.presentation.getState().authoritative.active?.pendingInteractions[0];
+        if (pending !== undefined) {
+          requestedMainPermissionId = pending.requestId;
+          renderState();
+        } else openAttentionCenter(true);
+      }
+      return { consume: true };
+    }
     if (commandRegistry.matchesInput(data, "exit")) {
       void stop(true);
       return { consume: true };

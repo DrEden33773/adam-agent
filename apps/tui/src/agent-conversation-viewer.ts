@@ -31,7 +31,7 @@ import {
   Input,
   isKeyRelease,
   isKeyRepeat,
-  Markdown,
+  type Markdown,
   matchesKey,
   truncateToWidth,
   wrapTextWithAnsi,
@@ -43,6 +43,7 @@ import {
   agentStatus,
 } from "./agent-view-format.js";
 import { focusedWheelDirection } from "./focused-wheel-input.js";
+import { createMessageMarkdown, protectBareEvidence } from "./message-markdown.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import type { AdamTuiTheme } from "./theme.js";
@@ -70,6 +71,15 @@ type ConversationPage = {
   readonly liveOmittedBytes: number;
   readonly cursor: string | null;
   readonly olderCursor: string | null;
+};
+
+export type AgentReadingState = {
+  readonly identity: string;
+  readonly scrollOffset: number;
+  readonly followTail: boolean;
+  readonly manualPage: ConversationPage | undefined;
+  readonly newerCursors: readonly (string | null)[];
+  readonly renderMode: "raw" | "assistant" | "full";
 };
 
 export type AgentConversationResource =
@@ -195,6 +205,7 @@ export class AgentConversationViewer implements Component {
       ) => Promise<ManagedAgentTranscriptPageResource>;
       readonly onSend: (command: ManagedControlCommand) => Promise<CommandReceipt>;
       readonly isMainCommand?: (text: string) => boolean;
+      readonly onAttention?: () => void;
       readonly onSaveDraft: (draft: ManagedComposerDraft) => Promise<void>;
       readonly onClearDraft: (draft: ManagedComposerDraft) => Promise<boolean>;
       readonly onReadResource: (
@@ -238,6 +249,49 @@ export class AgentConversationViewer implements Component {
   }
   get focused(): boolean {
     return this.#focused;
+  }
+  hasProtectedInteraction(): boolean {
+    return (
+      this.#composing ||
+      this.hasPendingMutation() ||
+      this.#cancelTarget !== undefined ||
+      this.#suppressTarget !== undefined ||
+      this.#resources !== undefined ||
+      this.#exportView !== undefined ||
+      this.#help ||
+      this.#details ||
+      this.#retargetPending
+    );
+  }
+  hasPendingMutation(): boolean {
+    return (
+      this.#sending ||
+      this.#cancelling ||
+      this.#suppressPending ||
+      this.#exportView?.phase === "pending"
+    );
+  }
+  readingState(): AgentReadingState {
+    return {
+      identity: `${this.#thread.parentSessionId}:${this.#thread.threadId}:${this.#thread.turn.turnId}`,
+      scrollOffset: this.#scrollOffset,
+      followTail: this.#followTail,
+      manualPage: this.#manualPage,
+      newerCursors: [...this.#newerCursors],
+      renderMode: this.#renderMode,
+    };
+  }
+  restoreReadingState(state: AgentReadingState): void {
+    if (
+      state.identity !==
+      `${this.#thread.parentSessionId}:${this.#thread.threadId}:${this.#thread.turn.turnId}`
+    )
+      return;
+    this.#scrollOffset = state.scrollOffset;
+    this.#followTail = state.followTail;
+    this.#manualPage = state.manualPage;
+    this.#newerCursors = [...state.newerCursors];
+    this.#renderMode = state.renderMode;
   }
   set focused(value: boolean) {
     this.#focused = value;
@@ -408,6 +462,15 @@ export class AgentConversationViewer implements Component {
   }
   private async submit(text: string): Promise<void> {
     if (this.#sending || this.#closed) return;
+    if (text.trim() === "/agents attention" && this.options.onAttention !== undefined) {
+      this.options.onAttention();
+      return;
+    }
+    if (text.trim() === "/help") {
+      this.#help = true;
+      this.options.onChange();
+      return;
+    }
     if (text.trim().length === 0) {
       this.back();
       return;
@@ -751,6 +814,20 @@ export class AgentConversationViewer implements Component {
     }
     if (this.#composing) {
       if (this.#sending) return;
+      if (matchesKey(data, "tab") && this.#composer.getValue().startsWith("/")) {
+        const candidates = [
+          "/help",
+          ...(this.options.onAttention === undefined ? [] : ["/agents attention"]),
+        ].filter((command) => command.startsWith(this.#composer.getValue()));
+        if (candidates.length === 1) {
+          this.#composer.setValue(candidates[0] ?? "");
+          void this.saveLocalDraft().catch(() => undefined);
+        }
+        this.#inputNotice =
+          candidates.length > 0 ? candidates.join(" · ") : "Run Main commands in Main.";
+        this.options.onChange();
+        return;
+      }
       if (
         matchesKey(data, "tab") &&
         this.#thread.actions?.includes("interrupt") &&
@@ -890,17 +967,7 @@ export class AgentConversationViewer implements Component {
     let entry = this.#markdown.get(id);
     if (entry === undefined) {
       entry = {
-        component: new Markdown(
-          protectBareEvidence(safe),
-          0,
-          0,
-          this.options.theme.markdown,
-          undefined,
-          {
-            preserveOrderedListMarkers: true,
-            preserveBackslashEscapes: true,
-          },
-        ),
+        component: createMessageMarkdown(safe, this.options.theme),
         text: safe,
         failed: false,
       };
@@ -1267,7 +1334,8 @@ export class AgentConversationViewer implements Component {
         "Home/End: scroll start/follow tail",
         "j/k, arrows or wheel: scroll current viewport",
         "PgUp/PgDown or Shift+arrows: page and bounded transcript",
-        "Run built-in commands in Main; child drafts stay private.",
+        "/help: conversation help · /agents attention: pending requests · Tab completes",
+        "Run other built-in commands in Main; child drafts stay private.",
       ].flatMap((line) => wrapTextWithAnsi(line, width));
       const height = Math.max(1, this.options.maximumLines() - 2);
       this.#helpMaximumScroll = Math.max(0, lines.length - height);
@@ -1542,63 +1610,4 @@ export class AgentConversationViewer implements Component {
       ...footer.map(this.options.theme.muted),
     ].map((line) => truncateToWidth(line, width));
   }
-}
-
-/** Keep unfenced evidence blocks literal without disabling Markdown elsewhere in the answer. */
-function protectBareEvidence(text: string): string {
-  const lines = text.split("\n");
-  const result: string[] = [];
-  let fence: { character: string; length: number } | undefined;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? "";
-    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
-    if (fence !== undefined) {
-      result.push(line);
-      if (
-        marker?.[1]?.[0] === fence.character &&
-        marker[1].length >= fence.length &&
-        marker[2]?.trim() === ""
-      )
-        fence = undefined;
-      continue;
-    }
-    if (marker?.[1] !== undefined) {
-      fence = { character: marker[1][0] ?? "`", length: marker[1].length };
-      result.push(line);
-      continue;
-    }
-    if (!/^(?:diff --git |@@ |--- |\+\+\+ |#!|\$ |\d{4}-\d\d-\d\d[T ])/u.test(line)) {
-      result.push(line);
-      continue;
-    }
-    const kind = /^(?:#!|\$ )/u.test(line) ? "shell" : /^\d{4}-/u.test(line) ? "log" : "diff";
-    const literal = [line];
-    while (index + 1 < lines.length) {
-      const next = lines[index + 1] ?? "";
-      if (/^ {0,3}(?:`{3,}|~{3,})/u.test(next)) break;
-      if (kind === "shell") {
-        // Blank lines are valid source. Explicit Markdown starts a new section after a blank.
-        if (literal.at(-1)?.trim() === "" && /^(?:#{1,6}\s|(?:\*\*|__)\S)/u.test(next)) break;
-      } else if (kind === "log") {
-        if (!/^(?:\d{4}-\d\d-\d\d[T ]|[ \t]+\S|at )/u.test(next)) break;
-      } else if (
-        !/^(?:[ +\-\\]|@@|diff --git |index |(?:new|deleted) file mode |(?:old|new) mode |(?:dis)?similarity index |(?:rename|copy) (?:from|to) |$)/u.test(
-          next,
-        )
-      )
-        break;
-      literal.push(next);
-      index += 1;
-    }
-    const delimiter = "~".repeat(
-      Math.max(
-        3,
-        ...literal.flatMap((entry) =>
-          [...entry.matchAll(/~+/gu)].map((match) => match[0].length + 1),
-        ),
-      ),
-    );
-    result.push(`${delimiter}text`, ...literal, delimiter);
-  }
-  return result.join("\n");
 }

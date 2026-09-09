@@ -309,12 +309,7 @@ export async function startManagedTui(
       const lines = terminal.lines();
       const title = lines.find((line) => line.includes("Conversation ·"));
       if (title === undefined) return "";
-      const left = title.indexOf("│");
-      const right = title.lastIndexOf("│");
-      return lines
-        .filter((line) => line[left] === "│" && line[right] === "│")
-        .map((line) => line.slice(left + 1, right))
-        .join("\n");
+      return lines.slice(lines.indexOf(title)).join("\n");
     },
     async openFirstAgent(handle = "@explore-1") {
       await terminal.waitForScreen("Fleet");

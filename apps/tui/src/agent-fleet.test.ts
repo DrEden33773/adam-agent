@@ -555,6 +555,14 @@ test("ConversationViewer follows live output, preserves manual scroll, and survi
       setKeybindings(previousKeys);
     }
     await h.press("\u001b[H", "First live line.");
+    await h.press("m", "m full Markdown");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
+    await h.press("\u001b", "Fleet · ↓ navigate");
+    await h.openFirstAgent();
+    expect(h.conversationText()).toContain("Manual scroll");
+    expect(h.conversationText()).toContain("First live line.");
+    expect(h.conversationText()).toContain("m full Markdown");
+    expect(h.conversationText()).not.toContain("To @explore-1");
     releaseNewest.resolve();
     await newestEmitted.promise;
     await h.press("\u001b[A", "First live line.");
@@ -764,7 +772,7 @@ test("live transcript elision is counted separately from the bounded Markdown co
   }
 });
 
-test("child permission preempts and restores the exact independent composer without capturing Main", async () => {
+test("child permission preserves editing until Alt+A and restores the exact independent composer", async () => {
   const started = Promise.withResolvers<void>();
   const ask = Promise.withResolvers<void>();
   let childCalls = 0;
@@ -826,7 +834,9 @@ test("child permission preempts and restores the exact independent composer with
     await h.press("Kept child draft", "Kept child draft");
     const beforeAsk = h.terminal.output().length;
     ask.resolve();
-    await h.terminal.waitForFrameAfter("Attention Center", beforeAsk);
+    await h.terminal.waitForFrameAfter("1 pending", beforeAsk);
+    expect(h.terminal.lines().join("\n")).not.toContain("Attention Center");
+    await h.press("\u001ba", "Attention Center");
     await h.terminal.waitForFrameAfter("package.json", beforeAsk);
     expect(h.terminal.lines().join("\n")).toContain("Permissions");
     expect(h.terminal.lines().join("\n")).toContain("Parent input");
@@ -950,7 +960,7 @@ test("Attention defaults to one exact permission and explicit multi-selection de
           (item) => item.kind === "permission" && item.interaction !== null && item.available,
         ),
     );
-    await h.terminal.waitForScreen("read · package.json");
+    await h.press("\u001ba", "read · package.json");
     const checked = first.filter((item) =>
       h.terminal.lines().join("\n").includes(`[x] ${item.handle}`),
     );
@@ -976,7 +986,6 @@ test("Attention defaults to one exact permission and explicit multi-selection de
           record.record.event.type === "tool_started",
       ),
     ).toBe(false);
-    const before = h.terminal.output().length;
     expect(await spawn()).toMatchObject({ status: "admitted" });
     const next = await h.waitForAttention(
       (items) =>
@@ -985,7 +994,7 @@ test("Attention defaults to one exact permission and explicit multi-selection de
           (item) => item.kind === "permission" && item.interaction !== null && item.available,
         ),
     );
-    await h.terminal.waitForFrameAfter("Permissions · 2", before);
+    await h.press("\u001ba", "Permissions · 2");
     const selectedIndex = next.findIndex((item) =>
       h.terminal.lines().join("\n").includes(`[x] ${item.handle}`),
     );
@@ -1081,7 +1090,7 @@ test("Parent input in Attention cannot grant a separate child permission", async
       (attention) => attention.length === 2 && attention.every((item) => item.available),
     );
     const permission = items.find((item) => item.kind === "permission");
-    await h.terminal.waitForScreen("Parent input · 1");
+    await h.press("\u001ba", "Parent input · 1");
     await h.press("\u001b[F\r", "Which response should I use?");
     await h.press("allow", "> allow");
     h.terminal.input("\r");
@@ -1326,7 +1335,7 @@ test("40×12 Attention default selection follows the visible exact request and p
         items.length === 2 &&
         items.every((item) => item.kind === "permission" && item.interaction?.canAllow === true),
     );
-    await h.terminal.waitForScreen("Attention Center");
+    await h.press("\u001ba", "Attention Center");
     await h.press("\u001b[B", "@explore-2");
     expect(h.terminal.lines().join("\n")).toContain("● [x] @explore-2");
     await h.press("a", "@explore-1");
@@ -2139,7 +2148,7 @@ test("workspace Attention navigation disarms an earlier exact cancellation", asy
         items[0].interaction !== null &&
         items[0].available,
     );
-    await h.terminal.waitForScreen("Attention Center");
+    await h.press("\u001ba", "Attention Center");
     // Queue a fresh overlay frame before Pi has parsed the following standalone Escape.
     h.terminal.resize(81, 32);
     h.terminal.input("\u001b[A");

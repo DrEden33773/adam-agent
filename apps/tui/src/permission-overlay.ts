@@ -2,6 +2,8 @@ import type { PendingInteraction } from "@adam-agent/presentation";
 import {
   type Component,
   type Focusable,
+  isKeyRelease,
+  isKeyRepeat,
   Key,
   matchesKey,
   truncateToWidth,
@@ -24,17 +26,21 @@ export class PermissionOverlay implements Component, Focusable {
   #subjectLineCount = 0;
   #subjectOffset = 0;
   #subjectPageSize = 4;
+  #rendered = false;
+  readonly #deferHint: string | undefined;
 
   constructor(options: {
     readonly interaction: PendingInteraction;
     readonly onDecision: (decision: "allow" | "deny") => void;
     readonly theme: AdamTuiTheme;
+    readonly deferHint?: string;
   }) {
     this.#interaction = options.interaction;
     this.#onDecision = options.onDecision;
     this.#theme = options.theme;
     this.#allowEnabled = false;
     this.#selection = "deny";
+    this.#deferHint = options.deferHint;
   }
 
   setPreview(input: { readonly readable: boolean; readonly text: string }): void {
@@ -42,10 +48,21 @@ export class PermissionOverlay implements Component, Focusable {
     this.#previewOffset = 0;
     this.#allowEnabled = this.#interaction.canAllow && input.readable;
     this.#selection = this.#allowEnabled ? "allow" : "deny";
+    this.#rendered = false;
+  }
+
+  get isSubmitting(): boolean {
+    return this.#submitting !== undefined;
   }
 
   handleInput(data: string): void {
-    if (this.#submitting !== undefined) return;
+    if (
+      this.#submitting !== undefined ||
+      isKeyRelease(data) ||
+      ((!this.#rendered || isKeyRepeat(data)) &&
+        (matchesKey(data, Key.enter) || matchesKey(data, Key.escape)))
+    )
+      return;
     const wheel = data.codePointAt(0) === 27 ? data.slice(1).match(/^\[<(64|65);\d+;\d+M$/u) : null;
     if (wheel !== null) {
       this.#scrollAuthorityOrPreview(wheel[1] === "64" ? -3 : 3);
@@ -85,9 +102,11 @@ export class PermissionOverlay implements Component, Focusable {
 
   decisionFailed(): void {
     this.#submitting = undefined;
+    this.#rendered = false;
   }
 
   render(width: number): string[] {
+    this.#rendered = true;
     const subject = exactTerminalSubject(this.#interaction.subject.value);
     const effect =
       this.#interaction.effect === "read"
@@ -162,6 +181,7 @@ export class PermissionOverlay implements Component, Focusable {
       width < 60
         ? [
             this.#theme.toolTitle("Permission required"),
+            ...(this.#deferHint === undefined ? [] : [this.#deferHint]),
             ...actionLines,
             ...subjectPosition,
             ...warningLine,
@@ -172,6 +192,7 @@ export class PermissionOverlay implements Component, Focusable {
           ]
         : [
             this.#theme.toolTitle("Permission required"),
+            ...(this.#deferHint === undefined ? [] : [this.#deferHint]),
             ...actionLines,
             ...subjectPosition,
             ...warningLine,

@@ -10,9 +10,9 @@ import type { Terminal } from "@earendil-works/pi-tui";
  */
 export class RightEdgeGuardTerminal implements Terminal {
   readonly #terminal: Terminal;
-  readonly #mapInput: (data: string) => string;
+  readonly #mapInput: (data: string) => string | undefined;
 
-  constructor(terminal: Terminal, mapInput: (data: string) => string = (data) => data) {
+  constructor(terminal: Terminal, mapInput: (data: string) => string | undefined = (data) => data) {
     this.#terminal = terminal;
     this.#mapInput = mapInput;
   }
@@ -30,7 +30,10 @@ export class RightEdgeGuardTerminal implements Terminal {
   }
 
   start(onInput: (data: string) => void, onResize: () => void): void {
-    this.#terminal.start((data) => onInput(this.#mapInput(data)), onResize);
+    this.#terminal.start((data) => {
+      const mapped = this.#mapInput(data);
+      if (mapped !== undefined) onInput(mapped);
+    }, onResize);
   }
 
   stop(): void {

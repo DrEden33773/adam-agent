@@ -2212,6 +2212,11 @@ export type ManagedAgentExport = {
 };
 
 export type ManagedWorkspaceSnapshot = {
+  /** Live exact wait conditions; absent after restart until a wait is admitted. */
+  readonly waits?: readonly {
+    readonly mode: "all" | "any";
+    readonly targets: readonly { readonly threadId: string; readonly expectedTurnId: string }[];
+  }[];
   readonly policy?: ManagedFleetPolicy;
   readonly reviewers?: {
     readonly running: number;

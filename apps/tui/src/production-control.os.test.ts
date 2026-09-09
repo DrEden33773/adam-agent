@@ -49,13 +49,17 @@ test("ordinary production at an intermediate height keeps Agent, Todo, Plan, Att
       () => (h.presentation.getState().managedAttention?.length ?? 0) > 0,
       "Missing child permission attention",
     );
-    await terminal.waitForScreen("Attention Center");
+    await terminal.waitForScreen("Review exact submitted plan");
+    expect(terminal.lines().join("\n")).not.toContain("Attention Center");
     let transition = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
-    await terminal.waitForFrameAfter("Review exact submitted plan", transition, "Attention Center");
+    await terminal.waitForFrameAfter("Plan ready", transition, "Review exact submitted plan");
+    transition = terminal.output().length;
+    terminal.input("\u001ba");
+    await terminal.waitForFrameAfter("Attention Center", transition);
     transition = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
-    await terminal.waitForFrameAfter("Plan ready", transition, "Review exact submitted plan");
+    await terminal.waitForFrameAfter("1 pending", transition, "Attention Center");
     const offset = terminal.output().length;
     terminal.input("retained Main draft");
     await terminal.waitForFrameAfter("retained Main draft", offset);
@@ -65,7 +69,7 @@ test("ordinary production at an intermediate height keeps Agent, Todo, Plan, Att
     expect(frame).toContain("Plan ready");
     expect(frame).toContain("permission");
     expect(frame).toContain("Review · Running");
-    expect(frame).toContain("deepseek-v4-flash.direct");
+    expect(frame).toContain("Alt+A open");
     for (const [columns, rows] of [
       [80, 12],
       [80, 16],
@@ -83,9 +87,8 @@ test("ordinary production at an intermediate height keeps Agent, Todo, Plan, Att
       expect(resized.toLowerCase(), `${columns}x${rows}`).toContain("plan ready");
       expect(resized, `${columns}x${rows}`).toMatch(/attention|permission/);
       expect(resized, `${columns}x${rows}`).toContain("Review · Running");
-      expect(resized, `${columns}x${rows}`).toContain("deepseek-v4-flash");
-      expect(resized, `${columns}x${rows}`).toContain("/help");
-      expect(resized, `${columns}x${rows}`).toContain("thinking High");
+      expect(resized, `${columns}x${rows}`).toContain("1 pending");
+      expect(resized, `${columns}x${rows}`).toContain("Alt+A open");
       expect(resized, `${columns}x${rows}`).not.toContain("Review exact submitted plan");
     }
     const restored = terminal.output().length;
@@ -116,13 +119,12 @@ test("ordinary production at an intermediate height keeps Agent, Todo, Plan, Att
       expect(empty.toLowerCase(), `empty ${columns}x${rows}`).toContain("plan ready");
       expect(empty, `empty ${columns}x${rows}`).toMatch(/attention|permission/);
       expect(empty, `empty ${columns}x${rows}`).toContain("Review · Running");
-      expect(empty, `empty ${columns}x${rows}`).toContain("deepseek-v4-flash");
-      expect(empty, `empty ${columns}x${rows}`).toContain("/help");
-      expect(empty, `empty ${columns}x${rows}`).toContain("thinking High");
+      expect(empty, `empty ${columns}x${rows}`).toContain("1 pending");
+      expect(empty, `empty ${columns}x${rows}`).toContain("Alt+A open");
     }
     before = terminal.output().length;
     terminal.resize(40, 12);
-    await terminal.waitForFrameAfter("/help", before);
+    await terminal.waitForFrameAfter("Alt+A open", before);
     for (const [keys, visible, absent] of [
       ["\u001b[B", "Fleet > Main", undefined],
       ["\u001b[B", "Fleet > @explore-1", undefined],

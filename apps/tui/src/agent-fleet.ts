@@ -69,6 +69,9 @@ export class AgentFleet implements Component {
   private rows(): readonly ManagedControlThread[] {
     return this.#threads.filter((thread) => thread.turn.hasStarted && thread.lifecycle === "open");
   }
+  get isNavigating(): boolean {
+    return this.#active;
+  }
   handleMainInput(data: string, empty: boolean): boolean {
     if (this.#snapshot === undefined || this.rows().length === 0) return false;
     if (isKeyRelease(data)) return this.#active;

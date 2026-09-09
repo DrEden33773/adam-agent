@@ -2159,6 +2159,8 @@ test.each(["escape", "command"] as const)(
       await grantPtyChildBudget(fixture);
       fixture.write("\r");
       await waitForFileContents(join(controlRoot, "child-started"), "started\n");
+      await fixture.waitForScreen("1 pending");
+      fixture.write("\u001ba");
       await fixture.waitForScreen("Attention Center");
       let offset = fixture.output().length;
       fixture.write("\u001b");
@@ -2172,7 +2174,7 @@ test.each(["escape", "command"] as const)(
       offset = fixture.output().length;
       fixture.write("\r");
       await fixture.waitForCompleteFrameAfter("Reply to parent input", offset);
-      const childDraft = exit === "command" ? "/help" : "Private child draft";
+      const childDraft = exit === "command" ? "/new" : "Private child draft";
       offset = fixture.output().length;
       fixture.write(childDraft);
       await fixture.waitForCompleteFrameAfter(childDraft, offset);
@@ -2258,7 +2260,7 @@ async function grantPtyChildBudget(fixture: ReturnType<typeof startFixture>): Pr
   }
 }
 
-test("production Main permission preempts and restores the exact child composer without dispatching its draft", async () => {
+test("production Main permission protects, defers and restores the exact child composer without dispatching its draft", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-control-permission-routing-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -2309,6 +2311,10 @@ test("production Main permission preempts and restores the exact child composer 
     await fixture.waitForCompleteFrameAfter("Kept private child draft", offset);
     offset = fixture.output().length;
     await writeFile(join(controlRoot, "release-main-permission"), "release\n");
+    waiting = "Protected Main permission summary";
+    await fixture.waitForCompleteFrameAfter("1 pending", offset, "Permission required");
+    offset = fixture.output().length;
+    fixture.write("\u001ba");
     waiting = "Main permission overlay";
     await fixture.waitForCompleteFrameAfter("Permission required", offset);
     expect(fixture.screen()?.join("\n")).toContain("main-permission.txt");
@@ -2317,6 +2323,24 @@ test("production Main permission preempts and restores the exact child composer 
     });
     // The title appears while preview loading still leaves Enter on Deny.
     waiting = "Main permission Allow enabled";
+    await fixture.waitForCompleteFrameAfter("> Allow", offset, "Loading canonical preview…");
+    fixture.write("\u001b[13;1:2u\u001b[13;1:3u");
+    offset = fixture.output().length;
+    fixture.write("\u001ba");
+    waiting = "Deferred Main permission keeps its request";
+    await fixture.waitForCompleteFrameAfter("1 pending", offset, "Permission required");
+    offset = fixture.output().length;
+    fixture.write(" saved");
+    await fixture.waitForCompleteFrameAfter(
+      "Kept private child draft saved",
+      offset,
+      "Permission required",
+    );
+    await expect(stat(join(workspaceRoot, "main-permission.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    offset = fixture.output().length;
+    fixture.write("\u001ba");
     await fixture.waitForCompleteFrameAfter("> Allow", offset, "Loading canonical preview…");
     offset = fixture.output().length;
     fixture.write("\r");
@@ -2331,7 +2355,7 @@ test("production Main permission preempts and restores the exact child composer 
     offset = fixture.output().length;
     fixture.write(" remains");
     waiting = "Restored child composer editable";
-    await fixture.waitForCompleteFrameAfter("Kept private child draft remains", offset);
+    await fixture.waitForCompleteFrameAfter("Kept private child draft saved remains", offset);
     for (const visible of ["Enter compose", "Agents workspace", "↓ navigate"]) {
       waiting = visible;
       offset = fixture.output().length;

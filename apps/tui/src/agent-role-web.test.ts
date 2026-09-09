@@ -348,7 +348,8 @@ test.each(["allow", "deny"] as const)(
       await h.press("\t", "@Research");
       await h.press(" Fetch the exact request.", "Fetch the exact request.");
       await h.press("\r", "Delegation");
-      await h.press("\r", "Attention Center");
+      await h.press("\r", "1 pending");
+      await h.press("\u001ba", "Attention Center");
       const pending = await h.waitForAttention(
         (items) =>
           items.length === 1 &&
