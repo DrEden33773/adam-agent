@@ -15,6 +15,7 @@ import type {
   PresentationCommand,
   PresentationDisplayState,
   PresentationSession,
+  ProjectPathCatalogDisplay,
   RepositoryInstructionsDisplay,
   SessionHistoryDiagnosticsDisplay,
   SessionNaming,
@@ -96,6 +97,8 @@ import {
   effectiveSessionStateRoot,
   type ManagedAgentNotification,
   type ManagedAgentTranscriptRecords,
+  type ProjectSessionCatalogController,
+  type ProjectSessionCatalogSnapshot,
   type ProjectSessionSummary,
   type SessionContextUsageSnapshot,
   type SessionHistoryDiagnostics,
@@ -172,6 +175,8 @@ export type PresentationSessionRecordReader = (
 ) => Promise<readonly SessionRecord[]>;
 
 type PresentationSessionBaseOptions = {
+  /** Keep native catalog and path discovery off the interactive startup boundary. */
+  readonly backgroundStartup?: boolean;
   readonly draftPersistencePolicy?: "process_only" | "recoverable";
   readonly lifecycle: SessionLifecycle;
   readonly modelTargets?: ModelTargets;
@@ -224,6 +229,10 @@ export type CreatePresentationSessionOptions = PresentationSessionBaseOptions &
 export async function createPresentationSession(
   options: CreatePresentationSessionOptions,
 ): Promise<PresentationSession> {
+  const startupAbort = new AbortController();
+  let startupCatalog: ProjectSessionCatalogController | undefined;
+  let startupPaths: Promise<void> | undefined;
+  let startupClosing = false;
   options.lifecycle.enableAutomaticTitles();
   const webSearchConfiguration =
     options.webSearchEnvironment === undefined
@@ -368,7 +377,9 @@ export async function createPresentationSession(
     let loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
     const naming =
       created === undefined ? undefined : projectSessionNaming(records, created.sessionId);
-    const catalogPageSize = boundedCatalogPageSize(options[presentationCatalogPageSize]);
+    const catalogPageSize = boundedCatalogPageSize(
+      options[presentationCatalogPageSize] ?? (options.backgroundStartup ? 20 : undefined),
+    );
     const activeSummary: SessionSummary | undefined =
       created === undefined || naming === undefined
         ? undefined
@@ -494,11 +505,18 @@ export async function createPresentationSession(
     ) {
       knownTargets.set(options.targetIdentity.targetId, options.targetIdentity);
     }
-    const catalogPage = await options.lifecycle.listProjectSessionSummaries({
-      limit: catalogPageSize,
-    });
     const workspaceTrustSnapshot = await options.lifecycle.inspectWorkspaceTrust();
-    const projectPaths = await listProjectPaths(options.workspaceRoot);
+    const catalogPage = options.backgroundStartup
+      ? {
+          projectId: workspaceTrustSnapshot.projectId ?? "",
+          items: [],
+          nextCursor: null,
+          diagnostics: { items: [], totalCount: 0, truncated: false },
+        }
+      : await options.lifecycle.listProjectSessionSummaries({ limit: catalogPageSize });
+    let projectPaths: ProjectPathCatalogDisplay = options.backgroundStartup
+      ? { items: [], omittedCount: 0, diagnostic: null, loading: true }
+      : await listProjectPaths(options.workspaceRoot);
     const catalogItems = catalogPage.items.flatMap((snapshot) => {
       if (snapshot.schemaVersion !== 3) return [];
       if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
@@ -627,6 +645,12 @@ export async function createPresentationSession(
         items: initialCatalogItems,
         nextCursor: catalogPage.nextCursor,
         diagnostics: projectSessionHistoryDiagnostics(catalogPage.diagnostics),
+        ...(options.backgroundStartup
+          ? {
+              loading: true,
+              health: { status: "not_started" as const, checked: 0, total: null },
+            }
+          : {}),
       },
       managedAgents: initialManagedAgents,
       active:
@@ -720,10 +744,23 @@ export async function createPresentationSession(
         executionFailure = error.executionFailure;
     };
     let closed = false;
+    const locallyUpdatedCatalog = new Map<
+      string,
+      { readonly summary: SessionSummary; readonly throughSequence: number }
+    >();
+    const locallyCreatedCatalogIds = new Set<string>();
+    const observedCatalogIds = new Set<string>();
     let controlObserver: AbortController | undefined;
     let controlObserverParent: string | undefined;
     let controlObservation = Promise.resolve();
     const publishStateChange = (): void => {
+      const active = state.authoritative.active;
+      if (active !== null) {
+        locallyUpdatedCatalog.set(active.session.id, {
+          summary: active.session,
+          throughSequence: activeSessionThroughSequence,
+        });
+      }
       for (const listener of listeners) {
         notifyObserver(listener);
       }
@@ -1816,6 +1853,7 @@ export async function createPresentationSession(
                 operationThrough: operationCursorSnapshot(),
               },
           sessions: {
+            ...state.authoritative.sessions,
             items: catalogItems,
             nextCursor: state.authoritative.sessions.nextCursor,
           },
@@ -3337,6 +3375,7 @@ export async function createPresentationSession(
             targetIdentity: draftTargetIdentity,
             mode: state.draft?.mode ?? "default",
           });
+          locallyCreatedCatalogIds.add(snapshot.sessionId);
           parentSessionId = snapshot.sessionId;
           await activateSnapshot(snapshot);
           control = await options.lifecycle[sessionManagedControl](parentSessionId);
@@ -5504,6 +5543,8 @@ export async function createPresentationSession(
             if (receipt.runId !== commandId) {
               return;
             }
+            if (!observedCatalogIds.has(receipt.sessionId))
+              locallyCreatedCatalogIds.add(receipt.sessionId);
             admittedSessionId = receipt.sessionId;
             if (activeRun === runState) runState.sessionId = receipt.sessionId;
             admission.resolve(receipt.sessionId);
@@ -5617,6 +5658,7 @@ export async function createPresentationSession(
               : { sourceBoundary: command.sourceBoundary }),
             ...(command.targetId === null ? {} : { targetId: command.targetId }),
           });
+          locallyCreatedCatalogIds.add(snapshot.sessionId);
           const summary = sessionSummaryFromSnapshot(
             snapshot,
             await readActiveBranchRecords(options, snapshot.sessionId),
@@ -6048,6 +6090,10 @@ export async function createPresentationSession(
           };
         }
         try {
+          if (startupCatalog !== undefined) {
+            await startupCatalog.loadMore(command.after);
+            return { status: "admitted", commandId: randomUUID(), resource: null };
+          }
           const page = await options.lifecycle.listProjectSessionSummaries({
             cursor: command.after,
             limit: catalogPageSize,
@@ -6672,6 +6718,108 @@ export async function createPresentationSession(
       };
     };
 
+    if (options.backgroundStartup) {
+      const applyCatalog = (catalog: ProjectSessionCatalogSnapshot): void => {
+        if (closed || startupClosing) return;
+        if (
+          state.authoritative.project.id.length > 0 &&
+          catalog.projectId !== state.authoritative.project.id &&
+          !(catalog.projectId === "" && catalog.phase === "failed")
+        )
+          return;
+        const invalidIds = new Set(catalog.diagnostics.items.map((item) => item.sessionId));
+        const included = new Set<string>();
+        const items = catalog.items.flatMap((item) => {
+          if (item.schemaVersion !== 3) return [];
+          observedCatalogIds.add(item.sessionId);
+          locallyCreatedCatalogIds.delete(item.sessionId);
+          if (!knownTargets.has(item.targetIdentity.targetId))
+            knownTargets.set(item.targetIdentity.targetId, item.targetIdentity);
+          included.add(item.sessionId);
+          const local = locallyUpdatedCatalog.get(item.sessionId);
+          const current = state.authoritative.active?.session;
+          return [
+            current?.id === item.sessionId
+              ? current
+              : local !== undefined && local.throughSequence > item.lastSequence
+                ? local.summary
+                : sessionSummaryFromCatalog(item),
+          ];
+        });
+        for (const [id, local] of locallyUpdatedCatalog) {
+          if (locallyCreatedCatalogIds.has(id) && !included.has(id) && !invalidIds.has(id))
+            items.push(local.summary);
+        }
+        const active = state.authoritative.active;
+        if (active !== null && !items.some((item) => item.id === active.session.id))
+          items.push(active.session);
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            project: {
+              ...state.authoritative.project,
+              id: state.authoritative.project.id || catalog.projectId,
+            },
+            sessions: {
+              items,
+              nextCursor: catalog.nextCursor,
+              diagnostics: projectSessionHistoryDiagnostics(catalog.diagnostics),
+              loading: catalog.phase === "loading",
+              health: catalog.health,
+              ...(catalog.error === undefined ? {} : { error: catalog.error }),
+            },
+          },
+        };
+        publishStateChange();
+      };
+      startupCatalog = options.lifecycle.startProjectSessionCatalog({
+        limit: catalogPageSize,
+        onUpdate: applyCatalog,
+      });
+      startupPaths = listProjectPaths(options.workspaceRoot, startupAbort.signal)
+        .then((paths) => {
+          if (closed || startupClosing) return;
+          projectPaths = { ...paths, loading: false };
+          state = {
+            ...state,
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              active:
+                state.authoritative.active === null
+                  ? null
+                  : { ...state.authoritative.active, projectPaths },
+            },
+            draft: state.draft === null ? null : { ...state.draft, projectPaths },
+          };
+          publishStateChange();
+        })
+        .catch(() => {
+          if (closed || startupClosing) return;
+          projectPaths = {
+            items: [],
+            omittedCount: 0,
+            diagnostic: { code: "project_path_catalog_unavailable" },
+            loading: false,
+          };
+          state = {
+            ...state,
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              active:
+                state.authoritative.active === null
+                  ? null
+                  : { ...state.authoritative.active, projectPaths },
+            },
+            draft: state.draft === null ? null : { ...state.draft, projectPaths },
+          };
+          publishStateChange();
+        });
+    }
+
     return {
       getState: () => {
         const active = state.authoritative.active;
@@ -6745,6 +6893,10 @@ export async function createPresentationSession(
         if (closed) {
           return;
         }
+        startupClosing = true;
+        startupAbort.abort();
+        await startupCatalog?.close();
+        await startupPaths;
         await persistSettledCurrentTurnDraft();
         closed = true;
         controlObserver?.abort();
@@ -6792,6 +6944,10 @@ export async function createPresentationSession(
       },
     };
   } catch (error) {
+    startupClosing = true;
+    startupAbort.abort();
+    await startupCatalog?.close();
+    await startupPaths;
     unsubscribeLifecycle();
     unsubscribeMetadata();
     unsubscribeManagedAgentEvents();

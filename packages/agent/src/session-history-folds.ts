@@ -954,6 +954,42 @@ function ordinaryContextUsageFromRecords(
   return totals;
 }
 
+/** The same durable run boundary drives compact catalog state and complete snapshots. */
+export function sessionRunBoundaryFromRecords(
+  currentRecords: readonly Extract<SessionRecord, { readonly schemaVersion: 3 }>[],
+) {
+  const latestRun = currentRecords.findLast(
+    (record) => record.record.type === "logical_run_started",
+  );
+  if (latestRun === undefined || latestRun.record.type !== "logical_run_started") {
+    return {
+      latestRun: undefined,
+      settlement: undefined,
+      linkedSettlement: undefined,
+      status: "idle" as const,
+    };
+  }
+  const runId = latestRun.record.runId;
+  const settlement = currentRecords.findLast(
+    (record) =>
+      record.record.type === "runtime_event" &&
+      record.record.runId === runId &&
+      record.record.event.type === "session_settled",
+  );
+  const linkedSettlement = currentRecords.findLast(
+    (record) => record.record.type === "run_settled" && record.record.runId === runId,
+  );
+  return {
+    latestRun,
+    settlement,
+    linkedSettlement,
+    status:
+      settlement === undefined && linkedSettlement === undefined
+        ? ("interrupted" as const)
+        : ("settled" as const),
+  };
+}
+
 export function snapshotFromRecords(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
@@ -968,9 +1004,8 @@ export function snapshotFromRecords(
   const todo = hasTodoToolProfileV1(genesis.record.promptContext?.toolProfile.definitions ?? [])
     ? todoSummaryV1(todoStoreSnapshotFromRecordsV1(records))
     : undefined;
-  const latestRun = currentRecords.findLast(
-    (record) => record.record.type === "logical_run_started",
-  );
+  const { latestRun, settlement, linkedSettlement, status } =
+    sessionRunBoundaryFromRecords(currentRecords);
   if (latestRun === undefined || latestRun.record.type !== "logical_run_started") {
     const promptContext = promptContextSnapshotFromRecords(genesis, records);
     const skillContext = skillContextRecordFromRecords(genesis, records);
@@ -990,15 +1025,6 @@ export function snapshotFromRecords(
   const runId = latestRun.record.runId;
   const lastResponse = currentRecords.findLast(
     (record) => record.record.type === "model_response_completed" && record.record.runId === runId,
-  );
-  const settlement = currentRecords.findLast(
-    (record) =>
-      record.record.type === "runtime_event" &&
-      record.record.runId === runId &&
-      record.record.event.type === "session_settled",
-  );
-  const linkedSettlement = currentRecords.findLast(
-    (record) => record.record.type === "run_settled" && record.record.runId === runId,
   );
   const lastAttemptStarted = currentRecords.findLast(
     (record) => record.record.type === "provider_attempt_started" && record.record.runId === runId,
@@ -1031,7 +1057,7 @@ export function snapshotFromRecords(
                   ?.text as string,
               }
         : undefined;
-  const isSettled = settlement !== undefined || linkedSettlement !== undefined;
+  const isSettled = status === "settled";
   const promptContext = promptContextSnapshotFromRecords(genesis, records);
   const skillContext = skillContextRecordFromRecords(genesis, records);
   return {

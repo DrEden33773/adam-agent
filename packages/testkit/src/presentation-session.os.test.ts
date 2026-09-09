@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { FakeModelDriver } from "./index.js";
+import { withManagedFailureGuard } from "./managed-agent-test-support.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -552,3 +553,59 @@ test.each(["missing", "corrupt"] as const)(
     }
   },
 );
+
+test("Presentation startup publishes project paths after returning and preserves the current session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-background-paths-"));
+  const workspaceRoot = join(root, "workspace");
+  const stateRoot = join(root, "state");
+  await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await mkdir(join(workspaceRoot, "node_modules"));
+  await writeFile(join(workspaceRoot, "README.md"), "PRIVATE_README_BYTES");
+  await writeFile(join(workspaceRoot, "src", "entry.ts"), "PRIVATE_SOURCE_BYTES");
+  await writeFile(join(workspaceRoot, "node_modules", "excluded.js"), "excluded");
+  await symlink(join(workspaceRoot, "README.md"), join(workspaceRoot, "linked"));
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const session = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      workspaceRoot,
+      stateRoot,
+      sessionId: session.sessionId,
+      backgroundStartup: true,
+    });
+    try {
+      expect(presentation.getState().authoritative.active?.projectPaths).toEqual({
+        items: [],
+        omittedCount: 0,
+        diagnostic: null,
+        loading: true,
+      });
+      const loaded = Promise.withResolvers<void>();
+      const unsubscribe = presentation.subscribe(() => {
+        if (presentation.getState().authoritative.active?.projectPaths.loading === false)
+          loaded.resolve();
+      });
+      try {
+        await withManagedFailureGuard(loaded.promise, "background project path catalog");
+        expect(presentation.getState().authoritative.active?.session.id).toBe(session.sessionId);
+        expect(presentation.getState().authoritative.active?.projectPaths).toEqual({
+          items: ["README.md", "src/entry.ts"],
+          omittedCount: 0,
+          diagnostic: null,
+          loading: false,
+        });
+        expect(JSON.stringify(presentation.getState())).not.toContain("PRIVATE_README_BYTES");
+        expect(JSON.stringify(presentation.getState())).not.toContain("PRIVATE_SOURCE_BYTES");
+      } finally {
+        unsubscribe();
+      }
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

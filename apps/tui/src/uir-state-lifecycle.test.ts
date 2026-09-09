@@ -170,8 +170,11 @@ test("selecting another session clears the old role catalog and reloads the dest
     expect(h.presentation.getState().agentRoles?.map((role) => role.name)).not.toContain(
       "Original",
     );
-    await h.terminal.waitForFrameAfter("Select a project session", createOffset);
-    await h.press("\x1b", "New session draft", "Select a project session");
+    await h.terminal.waitForFrameAfter(
+      "New session draft",
+      createOffset,
+      "Select a project session",
+    );
     await h.press("@Destination", "New agent · Destination evidence.");
     await h.press("\t", "@Destination");
     await h.press(" Inspect evidence.\r", "Delegation");

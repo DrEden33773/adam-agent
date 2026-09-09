@@ -87,6 +87,7 @@ import {
   type McpDiscoveryScheduler,
   McpHostError,
   type McpIdleScheduler,
+  type McpLiveSessionSnapshot,
   type McpRequestScheduler,
   type McpSessionSnapshot,
   type McpTransportFactory,
@@ -178,6 +179,13 @@ import {
   WorkspaceTrustMcpLeaseError,
   type WorkspaceTrustSnapshot,
 } from "./secure-user-configuration.js";
+import {
+  type ProjectSessionCatalogController,
+  type ProjectSessionCatalogStartOptions,
+  type SessionCatalogWorkerFactory,
+  sessionCatalogWorkerFactory,
+  startNativeSessionCatalog,
+} from "./session-catalog-job.js";
 import {
   type AgentSessionDurableContext,
   type AgentSessionDurableOutputLimits,
@@ -292,6 +300,11 @@ import { createSafeWebHttpAdapter } from "./web-safe-http.js";
 import type { WebSearchConfiguration } from "./web-search-configuration.js";
 
 export type { McpSessionSnapshot } from "./mcp-host.js";
+export type {
+  ProjectSessionCatalogController,
+  ProjectSessionCatalogSnapshot,
+  ProjectSessionCatalogStartOptions,
+} from "./session-catalog-job.js";
 export { SessionLifecycleError } from "./session-lifecycle-error.js";
 export type {
   CurrentSessionSnapshot,
@@ -489,6 +502,7 @@ export type ManagedControlComposition = {
 };
 
 export type SessionLifecycleOptions = {
+  readonly [sessionCatalogWorkerFactory]?: SessionCatalogWorkerFactory;
   readonly onPhaseDiagnostic?: (diagnostic: RuntimePhaseDiagnostic) => void;
   readonly managedControl?: ManagedControlComposition;
   readonly [sessionManagedControl]?: ManagedControlComposition;
@@ -538,6 +552,42 @@ export type SessionLifecycleOptions = {
 };
 
 type WebEvidenceProfileV1 = NonNullable<SessionGenesisRecord["record"]["webEvidence"]>;
+
+export type SessionPlanAuthorityInput = {
+  readonly sessionId: string;
+  readonly managedAgentTools?: SessionGenesisRecord["record"]["managedAgentTools"];
+  readonly webEvidence?: WebEvidenceProfileV1;
+  readonly source: Pick<
+    NonNullable<CurrentSessionSnapshot["promptContext"]>["toolProfile"],
+    "version" | "digest"
+  > & {
+    readonly definitions: readonly Pick<
+      NonNullable<CurrentSessionSnapshot["promptContext"]>["toolProfile"]["definitions"][number],
+      "name" | "digest"
+    >[];
+  };
+  readonly mcpProfile?: {
+    readonly digest: `sha256:${string}`;
+    readonly tools: readonly {
+      readonly qualifiedName: string;
+      readonly serverId: string;
+      readonly originalName: string;
+      readonly serverDefinitionDigest: `sha256:${string}`;
+      readonly definitionDigest: `sha256:${string}`;
+      readonly effect: ToolEffect;
+    }[];
+  };
+  readonly policyVersion: PlanPolicyVersion;
+};
+
+export type SessionPlanAuthorityResolver = (
+  input: SessionPlanAuthorityInput,
+) => Promise<PlanEligibleToolProfileV1>;
+
+export type ReadOnlySessionMcpInputs = {
+  readonly trusted: boolean;
+  readonly live?: McpLiveSessionSnapshot;
+};
 
 export type SessionContinueResult = {
   readonly result: AgentExecutionResult;
@@ -948,6 +998,10 @@ export interface SessionLifecycle {
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<ProjectSessionSummaryPage>;
+  /** Native background display discovery; health completion is separate from summary availability. */
+  startProjectSessionCatalog(
+    input: ProjectSessionCatalogStartOptions,
+  ): ProjectSessionCatalogController;
   previewNewSession(input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
@@ -1092,6 +1146,138 @@ const nodeSessionTitleDeadlineScheduler: SessionTitleDeadlineScheduler = {
   },
 };
 
+/** Shared read-only inspection used by ordinary Lifecycle calls and native catalog workers. */
+export function createReadOnlySessionInspector(dependencies: {
+  readonly options: Pick<SessionLifecycleOptions, "workspaceRoot" | "stateRoot">;
+  readonly readRecords: (sessionId: string) => Promise<readonly SessionRecord[]>;
+  readonly lineage?: SessionLineageTraversal;
+  readonly resolvePlanProfile: SessionPlanAuthorityResolver;
+  readonly inspectMcpInputs: (sessionId: string) => Promise<ReadOnlySessionMcpInputs>;
+}) {
+  const { options } = dependencies;
+  const lineage =
+    dependencies.lineage ??
+    createSessionLineageTraversal({
+      workspaceRoot: options.workspaceRoot,
+      readRecords: dependencies.readRecords,
+    });
+  const validatedHistories = new WeakSet<readonly SessionRecord[]>();
+  const validatedPromptPrefixes = new WeakMap<
+    SessionRecord,
+    {
+      readonly records: readonly SessionRecord[];
+      readonly inheritedMessages: string;
+    }
+  >();
+
+  const inspectSession = async (
+    input: { readonly sessionId: string },
+    artifactCache = createArtifactMaterializationCache(),
+    suppliedRecords?: readonly SessionRecord[],
+  ): Promise<SessionSnapshot> => {
+    const records: readonly SessionRecord[] =
+      suppliedRecords === undefined
+        ? await dependencies.readRecords(input.sessionId)
+        : suppliedRecords;
+    const first = records[0];
+    if (first === undefined) {
+      throw new SessionLifecycleError("session_not_found");
+    }
+    const projectId = await canonicalProjectId(options.workspaceRoot);
+    if (first.schemaVersion === 1 || first.schemaVersion === 2) {
+      if (records.some((record) => record.schemaVersion === 3)) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return {
+        schemaVersion: records.some((record) => record.schemaVersion === 2) ? 2 : 1,
+        sessionId: input.sessionId,
+        projectId,
+        status: "legacy",
+        lastSequence: records.length,
+      };
+    }
+    if (!isGenesisRecord(first) || first.record.sessionId !== input.sessionId) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    if (first.record.projectId !== projectId) {
+      throw new SessionLifecycleError("session_project_mismatch");
+    }
+    if (!validatedHistories.has(records)) {
+      validateCurrentSessionHistory(first, records, options.workspaceRoot);
+      if (isDeeplyImmutable(records)) validatedHistories.add(records);
+    }
+    await lineage.validateSessionLineage(first, records);
+    await validateMcpAuthorityFromLineage(lineage, first, records);
+    await validatePlanToolProfilesFromLineage(
+      lineage,
+      first,
+      records,
+      undefined,
+      dependencies.resolvePlanProfile,
+    );
+    await skillResourceBytesFromLineage(lineage, first, records);
+    const artifactInspection = await inspectModelResponseArtifactLineage(
+      options,
+      lineage,
+      first,
+      records,
+      artifactCache,
+    );
+    if (artifactInspection.degradation === undefined) {
+      await validatePromptProjectionDigests(
+        options,
+        lineage,
+        first,
+        artifactInspection.records,
+        artifactCache,
+        { rawRecords: records, cache: validatedPromptPrefixes },
+      );
+    }
+    const replayRecords =
+      artifactInspection.degradation === undefined ? artifactInspection.records : records;
+    const snapshot = snapshotFromRecords(first, replayRecords, artifactInspection);
+    const inheritedContext =
+      artifactInspection.degradation === undefined
+        ? await contextSnapshotFromLineage(options, lineage, first, replayRecords, artifactCache)
+        : undefined;
+    const [mcpWorkspaceConfirmation, mcpServerApprovals, mcpCommittedProfile, mcpCatalogState] =
+      await Promise.all([
+        mcpWorkspaceConfirmationFromLineage(lineage, first, records),
+        mcpServerApprovalsFromLineage(lineage, first, records),
+        mcpCommittedProfileFromLineage(lineage, first, records),
+        mcpCatalogStateFromLineage(lineage, first, records),
+      ]);
+    let mcp: McpSessionSnapshot | undefined;
+    const liveMcpInputs = await dependencies.inspectMcpInputs(input.sessionId);
+    if (liveMcpInputs.trusted) {
+      try {
+        mcp = await inspectMcpConfiguration(
+          options.workspaceRoot,
+          mcpWorkspaceConfirmation?.sourceDigest,
+          mcpServerApprovals,
+          liveMcpInputs.live,
+          mcpActivationFailureFromRecords(records),
+          mcpCommittedProfile,
+          mcpCatalogState,
+          mcpActivationFromRecords(records),
+        );
+      } catch (error) {
+        if (error instanceof McpConfigurationError) {
+          throw new SessionLifecycleError("mcp_config_invalid");
+        }
+        throw error;
+      }
+    }
+    return {
+      ...snapshot,
+      ...(inheritedContext === undefined ? {} : { context: inheritedContext }),
+      ...(mcp === undefined ? {} : { mcp }),
+    };
+  };
+
+  return inspectSession;
+}
+
 export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
   const effectiveStateRoot = effectiveSessionStateRoot(providedOptions.stateRoot);
   const sharedArtifactStore = createLazyArtifactStore(join(effectiveStateRoot, "artifacts"));
@@ -1161,6 +1347,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   let activeSession: AgentSession | undefined;
   let activeSessionSettlement: Promise<boolean> | undefined;
   let lifecycleClosing = false;
+  let catalogJob: ProjectSessionCatalogController | undefined;
   let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
   let workspaceMcpLeasePromise: Promise<WorkspaceTrustMcpLease> | undefined;
@@ -2531,124 +2718,29 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     mcpIdleTimers.set(sessionId, { generationId, cancel: scheduled.cancel });
   };
 
-  const validatedHistories = new WeakSet<readonly SessionRecord[]>();
-  const validatedPromptPrefixes = new WeakMap<
-    SessionRecord,
-    {
-      readonly records: readonly SessionRecord[];
-      readonly inheritedMessages: string;
-    }
-  >();
-
-  const inspectSession = async (
-    input: { readonly sessionId: string },
-    artifactCache = createArtifactMaterializationCache(),
-    suppliedRecords?: readonly SessionRecord[],
-  ): Promise<SessionSnapshot> => {
-    const records: readonly SessionRecord[] =
-      suppliedRecords === undefined
-        ? await readSessionRecords(options, input.sessionId)
-        : suppliedRecords;
-    const first = records[0];
-    if (first === undefined) {
-      throw new SessionLifecycleError("session_not_found");
-    }
-    const projectId = await canonicalProjectId(options.workspaceRoot);
-    if (first.schemaVersion === 1 || first.schemaVersion === 2) {
-      if (records.some((record) => record.schemaVersion === 3)) {
-        throw new SessionLifecycleError("session_invalid");
-      }
-      return {
-        schemaVersion: records.some((record) => record.schemaVersion === 2) ? 2 : 1,
-        sessionId: input.sessionId,
-        projectId,
-        status: "legacy",
-        lastSequence: records.length,
-      };
-    }
-    if (!isGenesisRecord(first) || first.record.sessionId !== input.sessionId) {
-      throw new SessionLifecycleError("session_invalid");
-    }
-    if (first.record.projectId !== projectId) {
-      throw new SessionLifecycleError("session_project_mismatch");
-    }
-    if (!validatedHistories.has(records)) {
-      validateCurrentSessionHistory(first, records, options.workspaceRoot);
-      if (isDeeplyImmutable(records)) validatedHistories.add(records);
-    }
-    await lineage.validateSessionLineage(first, records);
-    await validateMcpAuthorityFromLineage(lineage, first, records);
-    const planTools = records.some(
-      (entry) =>
-        entry.schemaVersion === 3 &&
-        (entry.record.type === "plan_cycle_entered" ||
-          entry.record.type === "plan_cycle_inherited"),
-    )
-      ? await toolsForSession(
-          input.sessionId,
-          first.record.managedAgentTools,
-          first.record.webEvidence,
-        )
-      : options.tools;
-    await validatePlanToolProfilesFromLineage(lineage, first, records, planTools);
-    await skillResourceBytesFromLineage(lineage, first, records);
-    const artifactInspection = await inspectModelResponseArtifactLineage(
-      options,
-      lineage,
-      first,
-      records,
-      artifactCache,
+  const resolveCatalogPlanProfile: SessionPlanAuthorityResolver = async (input) => {
+    const tools = await toolsForSession(
+      input.sessionId,
+      input.managedAgentTools,
+      input.webEvidence,
     );
-    if (artifactInspection.degradation === undefined) {
-      await validatePromptProjectionDigests(
-        options,
-        lineage,
-        first,
-        artifactInspection.records,
-        artifactCache,
-        { rawRecords: records, cache: validatedPromptPrefixes },
-      );
-    }
-    const replayRecords =
-      artifactInspection.degradation === undefined ? artifactInspection.records : records;
-    const snapshot = snapshotFromRecords(first, replayRecords, artifactInspection);
-    const inheritedContext =
-      artifactInspection.degradation === undefined
-        ? await contextSnapshotFromLineage(options, lineage, first, replayRecords, artifactCache)
-        : undefined;
-    const [mcpWorkspaceConfirmation, mcpServerApprovals, mcpCommittedProfile, mcpCatalogState] =
-      await Promise.all([
-        mcpWorkspaceConfirmationFromLineage(lineage, first, records),
-        mcpServerApprovalsFromLineage(lineage, first, records),
-        mcpCommittedProfileFromLineage(lineage, first, records),
-        mcpCatalogStateFromLineage(lineage, first, records),
-      ]);
-    let mcp: McpSessionSnapshot | undefined;
-    if ((await inspectWorkspaceTrust()).status === "trusted") {
-      try {
-        mcp = await inspectMcpConfiguration(
-          options.workspaceRoot,
-          mcpWorkspaceConfirmation?.sourceDigest,
-          mcpServerApprovals,
-          mcpHost.snapshot(input.sessionId),
-          mcpActivationFailureFromRecords(records),
-          mcpCommittedProfile,
-          mcpCatalogState,
-          mcpActivationFromRecords(records),
-        );
-      } catch (error) {
-        if (error instanceof McpConfigurationError) {
-          throw new SessionLifecycleError("mcp_config_invalid");
-        }
-        throw error;
-      }
-    }
+    return planToolProfileFromAuthority(input.source, tools, input.mcpProfile, input.policyVersion);
+  };
+  const inspectCatalogMcpInputs = async (sessionId: string): Promise<ReadOnlySessionMcpInputs> => {
+    const trusted = (await inspectWorkspaceTrust()).status === "trusted";
+    const live = trusted ? mcpHost.snapshot(sessionId) : undefined;
     return {
-      ...snapshot,
-      ...(inheritedContext === undefined ? {} : { context: inheritedContext }),
-      ...(mcp === undefined ? {} : { mcp }),
+      trusted,
+      ...(live === undefined ? {} : { live }),
     };
   };
+  const inspectSession = createReadOnlySessionInspector({
+    options,
+    readRecords: (sessionId) => readSessionRecords(options, sessionId),
+    lineage,
+    resolvePlanProfile: resolveCatalogPlanProfile,
+    inspectMcpInputs: inspectCatalogMcpInputs,
+  });
 
   const inspectSessionContextUsage = async (
     input: { readonly sessionId: string },
@@ -3810,6 +3902,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       const runningSession = activeSessionSettlement;
       activeSession?.abort();
       lifecycleClosePromise = (async (): Promise<McpCloseResult> => {
+        await catalogJob?.close();
         await runningSession;
         const controlSettlements = await Promise.allSettled(
           [...managedControls].map(
@@ -5721,6 +5814,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 },
         ),
       };
+    },
+    startProjectSessionCatalog(input) {
+      if (lifecycleClosing) throw new SessionLifecycleError("project_owner_unavailable");
+      const previous = catalogJob?.close();
+      catalogJob = startNativeSessionCatalog({
+        ...input,
+        workspaceRoot: options.workspaceRoot,
+        stateRoot: effectiveStateRoot,
+        supported: providedOptions[sessionStoreDirectory] === undefined,
+        ...(providedOptions[sessionCatalogWorkerFactory] === undefined
+          ? {}
+          : { workerFactory: providedOptions[sessionCatalogWorkerFactory] }),
+        ...(previous === undefined ? {} : { beforeStart: previous }),
+        resolvePlanProfile: resolveCatalogPlanProfile,
+        inspectMcpInputs: inspectCatalogMcpInputs,
+      });
+      return catalogJob;
     },
     async previewNewSession(input) {
       return withOwner(async () => {
@@ -8996,7 +9106,7 @@ function sessionStoreDirectoryFrom(
   return directory;
 }
 
-function sessionHistoryDiagnosticFromError(
+export function sessionHistoryDiagnosticFromError(
   sessionId: string,
   error: unknown,
 ): SessionHistoryDiagnostic | undefined {
@@ -9081,21 +9191,9 @@ function planToolProfile(
 }
 
 function planToolProfileFromAuthority(
-  source: NonNullable<CurrentSessionSnapshot["promptContext"]>["toolProfile"],
+  source: SessionPlanAuthorityInput["source"],
   tools: ToolRegistry,
-  mcpProfile:
-    | {
-        readonly digest: `sha256:${string}`;
-        readonly tools: readonly {
-          readonly qualifiedName: string;
-          readonly serverId: string;
-          readonly originalName: string;
-          readonly serverDefinitionDigest: `sha256:${string}`;
-          readonly definitionDigest: `sha256:${string}`;
-          readonly effect: ToolEffect;
-        }[];
-      }
-    | undefined,
+  mcpProfile: SessionPlanAuthorityInput["mcpProfile"],
   policyVersion: PlanPolicyVersion,
 ): PlanEligibleToolProfileV1 {
   const mcpTools = new Map(
@@ -9164,8 +9262,9 @@ async function validatePlanToolProfilesFromLineage(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   tools: ToolRegistry | undefined,
+  resolveExpectedProfile?: SessionPlanAuthorityResolver,
 ): Promise<void> {
-  if (tools === undefined) {
+  if (tools === undefined && resolveExpectedProfile === undefined) {
     throw new SessionLifecycleError("session_invalid");
   }
   for (const entry of records) {
@@ -9190,12 +9289,33 @@ async function validatePlanToolProfilesFromLineage(
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
-    const expected = planToolProfileFromAuthority(
-      promptContext.toolProfile,
-      tools,
-      mcpProfile,
-      entry.record.policyVersion,
-    );
+    const expected =
+      resolveExpectedProfile === undefined
+        ? planToolProfileFromAuthority(
+            promptContext.toolProfile,
+            tools as ToolRegistry,
+            mcpProfile,
+            entry.record.policyVersion,
+          )
+        : await resolveExpectedProfile({
+            sessionId: genesis.record.sessionId,
+            ...(genesis.record.managedAgentTools === undefined
+              ? {}
+              : { managedAgentTools: genesis.record.managedAgentTools }),
+            ...(genesis.record.webEvidence === undefined
+              ? {}
+              : { webEvidence: genesis.record.webEvidence }),
+            source: {
+              version: promptContext.toolProfile.version,
+              digest: promptContext.toolProfile.digest,
+              definitions: promptContext.toolProfile.definitions.map(({ name, digest }) => ({
+                name,
+                digest,
+              })),
+            },
+            ...(mcpProfile === undefined ? {} : { mcpProfile }),
+            policyVersion: entry.record.policyVersion,
+          });
     const transitionExpected =
       genesis.record.managedAgentTools === "managed-agent-tools.a3-long-lived.v1"
         ? createPlanToolProfileV1({

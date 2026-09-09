@@ -13,7 +13,11 @@ const maximumDirectoryEntries = 20_000;
 const maximumFiles = 4_096;
 const maximumPathBytes = 4_096;
 
-export async function listProjectPaths(workspaceRoot: string): Promise<ProjectPathCatalog> {
+export async function listProjectPaths(
+  workspaceRoot: string,
+  signal?: AbortSignal,
+): Promise<ProjectPathCatalog> {
+  signal?.throwIfAborted();
   const canonicalRoot = await realpath(workspaceRoot);
   const pending = [canonicalRoot];
   const paths: string[] = [];
@@ -23,6 +27,7 @@ export async function listProjectPaths(workspaceRoot: string): Promise<ProjectPa
   let truncated = false;
 
   while (pending.length > 0 && !truncated) {
+    signal?.throwIfAborted();
     const directory = pending.shift();
     if (directory === undefined) {
       break;
@@ -38,6 +43,7 @@ export async function listProjectPaths(workspaceRoot: string): Promise<ProjectPa
     } catch {
       continue;
     }
+    signal?.throwIfAborted();
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
       visitedEntries += 1;
@@ -64,6 +70,7 @@ export async function listProjectPaths(workspaceRoot: string): Promise<ProjectPa
     }
   }
   paths.sort((left, right) => left.localeCompare(right));
+  signal?.throwIfAborted();
   return {
     items: paths,
     omittedCount,

@@ -147,6 +147,11 @@ export {
   createPresentationSession,
 } from "./presentation-session.js";
 export type { RuntimePhaseDiagnostic } from "./runtime-phase-diagnostics.js";
+export type {
+  ProjectSessionCatalogController,
+  ProjectSessionCatalogSnapshot,
+  ProjectSessionCatalogStartOptions,
+} from "./session-catalog-job.js";
 export {
   type CurrentSessionSnapshot,
   createSessionLifecycle,

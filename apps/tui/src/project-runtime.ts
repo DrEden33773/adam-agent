@@ -231,6 +231,7 @@ export async function createProductionProjectRuntime(
         );
       }
       presentationPromise = createPresentationSession({
+        backgroundStartup: true,
         lifecycle,
         modelTargets: options.modelTargets,
         operations: host.operations,
