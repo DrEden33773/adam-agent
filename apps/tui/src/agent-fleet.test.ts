@@ -1779,17 +1779,26 @@ test("cold Seen and Suppress reconcile an already durable wait tool result befor
 
 test("a queued cancellation keeps per-thread export available without creating a child session or continuation action", async () => {
   let calls = 0;
+  const releaseCompletion = Promise.withResolvers<void>();
   const eightStarted = Promise.withResolvers<void>();
-  const h = await startManagedTui({
-    async *stream(request) {
-      calls += 1;
-      if (calls === 8) eightStarted.resolve();
-      await new Promise<void>((resolve) =>
-        request.signal.addEventListener("abort", () => resolve(), { once: true }),
-      );
-      yield { type: "finish", reason: "stop" };
+  const h = await startManagedTui(
+    {
+      async *stream(request) {
+        calls += 1;
+        if (calls === 8) eightStarted.resolve();
+        await new Promise<void>((resolve) =>
+          request.signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        yield { type: "finish", reason: "stop" };
+      },
     },
-  });
+    {
+      controlRecordBarrier: async (record) => {
+        // Hold publication after durable append so the viewer still lacks the receipt.
+        if (record.event.type === "completion") await releaseCompletion.promise;
+      },
+    },
+  );
   try {
     expect(
       await h.presentation.dispatch({
@@ -1814,7 +1823,22 @@ test("a queued cancellation keeps per-thread export available without creating a
     await h.press("\r", "Enter result / export");
     await h.press("\r", "Conversation · @explore-9");
     await h.press("?", "e: export");
-    await h.press("\u001b", "Conversation · @explore-9");
+    await h.press("\u001b", "Conversation · @explore-9", "Conversation help");
+    // Cancelled and the static Help shortcut can render before receipt publication.
+    expect(h.presentation.getState().authoritative.managedControl?.completions).toEqual([]);
+    const beforeEarlyExport = h.terminal.output().length;
+    h.terminal.input("e");
+    h.terminal.resize(81, 32);
+    await h.terminal.waitForFrameAfter(
+      "Conversation · @explore-9",
+      beforeEarlyExport,
+      "Export agent",
+    );
+    expect(h.terminal.lines().join("\n")).not.toContain("Main pending");
+    const beforeCompletion = h.terminal.output().length;
+    releaseCompletion.resolve();
+    // Main pending is derived from the exact receipt required by export.
+    await h.terminal.waitForFrameAfter("Main pending", beforeCompletion, "Conversation help");
     await h.press("e", "Export agent");
     await h.press("\r", "Confirm export");
     await h.press("\r", "Export ready");
@@ -1827,6 +1851,7 @@ test("a queued cancellation keeps per-thread export available without creating a
     );
     expect(calls).toBe(8);
   } finally {
+    releaseCompletion.resolve();
     await h.close();
   }
 });
