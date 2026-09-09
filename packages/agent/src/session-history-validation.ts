@@ -26,6 +26,7 @@ import { isExactPlanMcpPermissionEventV1 } from "./plan-mcp-permission-validatio
 import {
   isHybridPlanPolicy,
   isPlanToolProfileV1Valid,
+  isTodoPlanPolicy,
   type PlanEligibleToolProfileV1,
 } from "./plan-mode.js";
 import { isPlanShellEnvironmentV1Valid } from "./plan-shell-environment.js";
@@ -78,6 +79,7 @@ import {
   updateTodoMutationV1,
   updateTodosMutationV1,
 } from "./todo.js";
+import { todoPermissionPolicyFromRecords } from "./todo-permission-policy.js";
 import type { PermissionSubject } from "./tool-runtime.js";
 import { canonicalChangePreviewForToolCall } from "./tool-runtime.js";
 
@@ -254,6 +256,8 @@ export function validateCurrentSessionHistory(
     | "plan-policy.read-v1"
     | "plan-policy.hybrid-v1"
     | "plan-policy.hybrid-delegation-v1"
+    | "plan-policy.hybrid-todo-v1"
+    | "plan-policy.hybrid-delegation-todo-v1"
     | undefined;
   let activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
   let activePlanShellEnvironmentDigest: string | undefined;
@@ -275,6 +279,7 @@ export function validateCurrentSessionHistory(
       }
     | undefined;
   let sawTodoInheritance = false;
+  let todoPermissionPolicy = todoPermissionPolicyFromRecords([genesis]);
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
   let mcpWorkspaceConfirmation: SessionMcpWorkspaceConfirmedRecord["record"] | undefined;
@@ -298,10 +303,18 @@ export function validateCurrentSessionHistory(
     if (inheritedTodoChunks !== undefined && record.type !== "todo_store_inherited") {
       throw new SessionLifecycleError("session_invalid");
     }
+    if (record.type === "session_todo_permission_policy_changed") {
+      if (run !== undefined || todoPermissionPolicy !== "todo-permission.legacy-v1")
+        throw new SessionLifecycleError("session_invalid");
+      todoPermissionPolicy = record.policyVersion;
+      continue;
+    }
     if (record.type === "plan_cycle_entered") {
       if (
         run !== undefined ||
         activePlanCycleId !== undefined ||
+        (isTodoPlanPolicy(record.policyVersion) &&
+          todoPermissionPolicy !== "todo-permission.session-v1") ||
         !isPlanToolProfileV1Valid(record.eligibleToolProfile, record.policyVersion) ||
         isHybridPlanPolicy(record.policyVersion) !==
           (record.shellPolicyVersion === "plan-shell-policy.v1") ||
@@ -346,6 +359,8 @@ export function validateCurrentSessionHistory(
         lineage === undefined ||
         record.source.sessionId !== sourceSessionId ||
         record.source.throughSequence !== sourceSequence ||
+        (isTodoPlanPolicy(record.policyVersion) &&
+          todoPermissionPolicy !== "todo-permission.session-v1") ||
         !isPlanToolProfileV1Valid(record.eligibleToolProfile, record.policyVersion) ||
         isHybridPlanPolicy(record.policyVersion) !==
           (record.shellPolicyVersion === "plan-shell-policy.v1") ||
@@ -607,7 +622,7 @@ export function validateCurrentSessionHistory(
       const mutation = createTodoMutationV1(todoSnapshot, input, record.item.id);
       if (
         run?.runId !== record.runId ||
-        activePlanState !== undefined ||
+        (activePlanState !== undefined && !isTodoPlanPolicy(activePlanPolicyVersion)) ||
         toolState?.call.name !== "create_todo" ||
         !toolState.requested ||
         !toolState.started ||
@@ -648,7 +663,7 @@ export function validateCurrentSessionHistory(
       const mutation = updateTodoMutationV1(todoSnapshot, input);
       if (
         run?.runId !== record.runId ||
-        activePlanState !== undefined ||
+        (activePlanState !== undefined && !isTodoPlanPolicy(activePlanPolicyVersion)) ||
         toolState?.call.name !== "update_todo" ||
         !toolState.requested ||
         !toolState.started ||
@@ -1982,6 +1997,16 @@ export function validateCurrentSessionHistory(
       }
       if (
         (event.type === "tool_permission_requested" || event.type === "tool_permission_decided") &&
+        event.subject?.type === "session_todo" &&
+        (todoPermissionPolicy !== "todo-permission.session-v1" ||
+          event.subject.sessionId !== genesis.record.sessionId ||
+          event.subject.operation !== state.call.name ||
+          event.effect !== "write" ||
+          event.scope !== "call")
+      )
+        throw new SessionLifecycleError("session_invalid");
+      if (
+        (event.type === "tool_permission_requested" || event.type === "tool_permission_decided") &&
         !isValidPlanPermissionEvent({
           event,
           runId: run.runId,
@@ -2092,7 +2117,7 @@ export function validateCurrentSessionHistory(
             }
             const mutation = updateTodosMutationV1(todoSnapshot, input);
             if (
-              activePlanState !== undefined ||
+              (activePlanState !== undefined && !isTodoPlanPolicy(activePlanPolicyVersion)) ||
               mutation.status !== "completed" ||
               !isDeepStrictEqual(event.output, {
                 batchVersion: 1,
@@ -2519,6 +2544,8 @@ function isValidPlanPermissionEvent(input: {
     | "plan-policy.read-v1"
     | "plan-policy.hybrid-v1"
     | "plan-policy.hybrid-delegation-v1"
+    | "plan-policy.hybrid-todo-v1"
+    | "plan-policy.hybrid-delegation-todo-v1"
     | undefined;
   readonly activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
   readonly activePlanShellEnvironmentDigest: string | undefined;

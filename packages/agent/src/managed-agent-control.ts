@@ -16,7 +16,7 @@ import {
   type StagedInputResourceSelectionV1,
 } from "./input-resources.js";
 import { notifyObserver } from "./observer-notification.js";
-import type { PlanCycleSnapshot } from "./plan-mode.js";
+import { isDelegationPlanPolicy, type PlanCycleSnapshot } from "./plan-mode.js";
 import {
   type AgentRoleAdministration,
   createAgentRoleAdministration,
@@ -1072,7 +1072,7 @@ export function createManagedAgentControl(options: {
   };
   const currentCeilingAllows = async () => {
     const plan = await options.readPlan?.();
-    return plan === undefined || plan.policyVersion === "plan-policy.hybrid-delegation-v1";
+    return plan === undefined || isDelegationPlanPolicy(plan.policyVersion);
   };
   const waitForCeiling = async (identity: ManagedControlIdentity, signal: AbortSignal) => {
     while (!signal.aborted && !(await currentCeilingAllows())) {

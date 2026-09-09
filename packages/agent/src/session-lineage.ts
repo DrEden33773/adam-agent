@@ -19,6 +19,7 @@ import {
   todoStoreSnapshotDigestV1,
   todoStoreSnapshotFromRecordsV1,
 } from "./todo.js";
+import { todoPermissionPolicyFromRecords } from "./todo-permission-policy.js";
 
 export type SessionLineageRecordReader = (sessionId: string) => Promise<readonly SessionRecord[]>;
 
@@ -416,7 +417,12 @@ export function createSessionLineageTraversal(input: {
     const digest = `sha256:${createHash("sha256").update(prefix).digest("hex")}`;
     const expectedDigest =
       "recordVersion" in lineage ? lineage.sourcePrefixDigest : lineage.prefixDigest;
-    if (digest !== expectedDigest || !isCompleteBranchBoundary(prefixRecords)) {
+    if (
+      digest !== expectedDigest ||
+      !isCompleteBranchBoundary(prefixRecords) ||
+      todoPermissionPolicyFromRecords([childGenesis]) !==
+        todoPermissionPolicyFromRecords(prefixRecords)
+    ) {
       throw new SessionLifecycleError("session_invalid");
     }
     validateCurrentSessionHistory(parentGenesis, prefixRecords, input.workspaceRoot);

@@ -444,6 +444,9 @@ function safeToolSubject(
   if (subject?.type === "file" || subject?.type === "workspace_path") {
     return { type: "path", value: subject.path };
   }
+  if (subject?.type === "session_todo") {
+    return { type: "generic", value: "Session Todo" };
+  }
   if (subject?.type === "command" || subject?.type === "plan_command") {
     return { type: "command", value: subject.command };
   }

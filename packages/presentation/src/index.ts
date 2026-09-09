@@ -439,7 +439,9 @@ export type PlanSubmissionDisplay = {
   readonly policyVersion:
     | "plan-policy.read-v1"
     | "plan-policy.hybrid-v1"
-    | "plan-policy.hybrid-delegation-v1";
+    | "plan-policy.hybrid-delegation-v1"
+    | "plan-policy.hybrid-todo-v1"
+    | "plan-policy.hybrid-delegation-todo-v1";
   readonly toolProfileDigest: `sha256:${string}`;
 };
 
@@ -454,7 +456,9 @@ export type PlanApprovalDisplay = {
   readonly policyVersion:
     | "plan-policy.read-v1"
     | "plan-policy.hybrid-v1"
-    | "plan-policy.hybrid-delegation-v1";
+    | "plan-policy.hybrid-delegation-v1"
+    | "plan-policy.hybrid-todo-v1"
+    | "plan-policy.hybrid-delegation-todo-v1";
   readonly toolProfileDigest: `sha256:${string}`;
 };
 
@@ -515,7 +519,12 @@ export type ContextUsageDisplay = {
   readonly unknownCalls: number;
 };
 
+export type TodoPermissionPolicyDisplay =
+  | "todo-permission.legacy-v1"
+  | "todo-permission.session-v1";
+
 export type ActiveSessionDisplay = {
+  readonly todoPermissionPolicy?: TodoPermissionPolicyDisplay;
   readonly parentRun?: {
     readonly phase: "ready" | "running" | "interrupted" | "recovering" | "cancelling";
     readonly editor: "ready" | "blocked";
@@ -549,7 +558,9 @@ export type ActiveSessionDisplay = {
     readonly policyVersion:
       | "plan-policy.read-v1"
       | "plan-policy.hybrid-v1"
-      | "plan-policy.hybrid-delegation-v1";
+      | "plan-policy.hybrid-delegation-v1"
+      | "plan-policy.hybrid-todo-v1"
+      | "plan-policy.hybrid-delegation-todo-v1";
     readonly shellPolicyVersion?: "plan-shell-policy.v1";
     readonly eligibleToolProfile: {
       readonly version: 1;
@@ -1534,6 +1545,7 @@ export type ManagedAgentTranscriptPageResource = {
 };
 
 export type PresentationCommand =
+  | { readonly type: "upgrade_todo_permission_policy"; readonly sessionId: string }
   | {
       readonly type: "direct_agent_input";
       readonly draftRevision: number;

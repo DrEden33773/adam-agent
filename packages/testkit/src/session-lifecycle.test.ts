@@ -563,7 +563,7 @@ test("SessionLifecycle rejects a self-consistent forged Todo dependency cycle", 
   }
 });
 
-test("SessionLifecycle Plan may read Todo but cannot mutate or materialize it", async () => {
+test("SessionLifecycle legacy Plan may read Todo but cannot mutate or materialize it", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-todo-policy-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -641,7 +641,23 @@ test("SessionLifecycle Plan may read Todo but cannot mutate or materialize it", 
       { type: "finish", reason: "stop" },
     ];
   });
-  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+  const directory = createInMemorySessionStoreDirectory<SessionRecord>();
+  const legacyRecord = (entry: SessionRecord): SessionRecord => {
+    if (entry.schemaVersion !== 3 || entry.record.type !== "session_genesis") return entry;
+    const { todoPermissionPolicyVersion: _policy, ...record } = entry.record;
+    return { ...entry, record };
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness({
+    ...directory,
+    async create(sessionId) {
+      const store = await directory.create(sessionId);
+      return {
+        ...store,
+        append: (entry) => store.append(legacyRecord(entry)),
+        appendBatch: (entries) => store.appendBatch(entries.map(legacyRecord)),
+      };
+    },
+  }).createLifecycle({
     modelTargets: modelTargetsWithDriver(driver),
     permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
     stateRoot,
@@ -1507,8 +1523,11 @@ test("SessionLifecycle Plan exposes only its exact eligible profile and denies a
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "create_todo",
         "get_todo",
         "list_todos",
+        "update_todo",
+        "update_todos",
         "submit_plan",
       ]);
       return [
@@ -1571,7 +1590,7 @@ test("SessionLifecycle Plan exposes only its exact eligible profile and denies a
       snapshot: {
         plan: {
           state: "exploring",
-          policyVersion: "plan-policy.hybrid-v1",
+          policyVersion: "plan-policy.hybrid-todo-v1",
           shellPolicyVersion: "plan-shell-policy.v1",
         },
       },
@@ -1927,10 +1946,10 @@ test("SessionLifecycle rejects an unsupported durable Plan policy before model u
       `${created.sessionId}.jsonl`,
     );
     const durableHistory = await readFile(sessionPath, "utf8");
-    expect(durableHistory.match(/plan-policy\.hybrid-v1/gu)).toHaveLength(1);
+    expect(durableHistory.match(/plan-policy\.hybrid-todo-v1/gu)).toHaveLength(1);
     await writeFile(
       sessionPath,
-      durableHistory.replace("plan-policy.hybrid-v1", "plan-policy.future-v99"),
+      durableHistory.replace("plan-policy.hybrid-todo-v1", "plan-policy.future-v99"),
       "utf8",
     );
     const modelTargets: ModelTargets = {
@@ -2064,8 +2083,8 @@ test("SessionLifecycle preserves the exact Plan cycle identity through context c
     version: 1,
     contextWindowTokens: 10_000,
     maximumOutputTokens: 1_000,
-    compactAtTokens: 5_000,
-    postCompactTargetTokens: 3_000,
+    compactAtTokens: 6_500,
+    postCompactTargetTokens: 6_000,
     retainedTargetTokens: 200,
     estimatorVersion: 1,
   };
@@ -3538,13 +3557,16 @@ async function rewriteManagedAgentPlanFixture(input: {
       ...entered.record.eligibleToolProfile.source,
       ...(input.sourceDigest === undefined ? {} : { digest: input.sourceDigest }),
     },
-    definitions: entered.record.eligibleToolProfile.definitions.map((definition) =>
-      definition.name === "list_agents"
-        ? { ...definition, definitionDigest: input.definitionDigest }
-        : definition,
-    ),
+    definitions: entered.record.eligibleToolProfile.definitions
+      .filter((definition) => definition.effect !== "write")
+      .map((definition) =>
+        definition.name === "list_agents"
+          ? { ...definition, definitionDigest: input.definitionDigest }
+          : definition,
+      ),
   };
   Object.assign(entered.record, {
+    policyVersion: "plan-policy.hybrid-v1",
     eligibleToolProfile: {
       ...profileWithoutDigest,
       digest: `sha256:${createHash("sha256")
@@ -3707,6 +3729,7 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
       promptContext: created.promptContext,
       skillContext: created.skillContext,
       todo: created.todo,
+      todoPermissionPolicy: "todo-permission.session-v1",
     };
     expect({ created, inspected }).toEqual({ created: expected, inspected: expected });
     await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -7215,6 +7238,7 @@ test("SessionLifecycle branches a complete boundary by reference without changin
         promptContext: parent.promptContext,
         skillContext: parent.skillContext,
         todo: parent.todo,
+        todoPermissionPolicy: "todo-permission.session-v1",
         lineage: {
           parentSessionId: parent.sessionId,
           parentEventPosition: 1,
@@ -7463,6 +7487,7 @@ test("SessionLifecycle branches to an explicit compatible exact target only when
       promptContext: parent.promptContext,
       skillContext: parent.skillContext,
       todo: parent.todo,
+      todoPermissionPolicy: "todo-permission.session-v1",
       lineage: {
         parentSessionId: parent.sessionId,
         parentEventPosition: parentRun.snapshot.lastSequence,

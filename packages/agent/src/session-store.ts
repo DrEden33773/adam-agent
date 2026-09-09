@@ -55,6 +55,7 @@ import {
 import { taskBudgetSchema } from "./task-budget.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import { type TodoItemV1, todoItemV1Schema, todoPolicyVersionV1 } from "./todo.js";
+import type { TodoPermissionPolicy } from "./todo-permission-policy.js";
 import { isCanonicalPatchPath, toolErrorSchema } from "./tool-error.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
@@ -149,6 +150,7 @@ export type SessionGenesisRecord = {
   readonly sequence: number;
   readonly record: {
     readonly type: "session_genesis";
+    readonly todoPermissionPolicyVersion?: TodoPermissionPolicy;
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
@@ -1066,7 +1068,18 @@ export type SessionManagedInputContinuationRecord = {
   };
 };
 
+export type SessionTodoPermissionPolicyChangedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_todo_permission_policy_changed";
+    readonly recordVersion: 1;
+    readonly policyVersion: "todo-permission.session-v1";
+  };
+};
+
 export type SessionV3Record =
+  | SessionTodoPermissionPolicyChangedRecord
   | SessionManagedInputContinuationRecord
   | SessionGenesisRecord
   | SessionMcpWorkspaceConfirmedRecord
@@ -1742,7 +1755,12 @@ const planCommandPermissionSubjectSchema = z.strictObject({
     .max(16 * 1024),
   cwd: z.literal("."),
   planCycleId: z.uuid(),
-  planPolicyVersion: z.enum(["plan-policy.hybrid-v1", "plan-policy.hybrid-delegation-v1"]),
+  planPolicyVersion: z.enum([
+    "plan-policy.hybrid-v1",
+    "plan-policy.hybrid-delegation-v1",
+    "plan-policy.hybrid-todo-v1",
+    "plan-policy.hybrid-delegation-todo-v1",
+  ]),
   shellPolicyVersion: z.literal("plan-shell-policy.v1"),
   shellEnvironmentVersion: z.literal("plan-shell-env.v1"),
   shellEnvironmentDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
@@ -1785,6 +1803,11 @@ const planCommandPermissionSubjectSchema = z.strictObject({
   }),
 });
 const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("session_todo"),
+    sessionId: z.uuid(),
+    operation: z.enum(["create_todo", "update_todo", "update_todos"]),
+  }),
   managedActionPermissionSubjectSchema,
   managedBatchPermissionSubjectSchema,
   z.strictObject({ type: z.literal("file"), path: z.string() }),
@@ -2174,6 +2197,9 @@ const sessionGenesisV1RecordSchema = z.strictObject({
   sessionId: z.uuid(),
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: modelTargetIdentitySchema,
+  todoPermissionPolicyVersion: z
+    .enum(["todo-permission.legacy-v1", "todo-permission.session-v1"])
+    .optional(),
   managedParent: z
     .strictObject({
       version: z.literal(3),
@@ -2354,6 +2380,8 @@ const logicalRunStartedV2Schema = z
           "plan-policy.read-v1",
           "plan-policy.hybrid-v1",
           "plan-policy.hybrid-delegation-v1",
+          "plan-policy.hybrid-todo-v1",
+          "plan-policy.hybrid-delegation-todo-v1",
         ]),
         toolProfileDigest: sha256DigestSchema,
       })
@@ -2412,6 +2440,11 @@ const logicalRunStartedV2Schema = z
     }
   });
 const sessionV3RecordSchema = z.union([
+  z.strictObject({
+    type: z.literal("session_todo_permission_policy_changed"),
+    recordVersion: z.literal(1),
+    policyVersion: z.literal("todo-permission.session-v1"),
+  }),
   sessionGenesisV1RecordSchema,
   sessionGenesisV2RecordSchema,
   z.strictObject({
@@ -2608,6 +2641,8 @@ const sessionV3RecordSchema = z.union([
           "plan-policy.read-v1",
           "plan-policy.hybrid-v1",
           "plan-policy.hybrid-delegation-v1",
+          "plan-policy.hybrid-todo-v1",
+          "plan-policy.hybrid-delegation-todo-v1",
         ]),
         toolProfileDigest: sha256DigestSchema,
       })
@@ -2654,6 +2689,8 @@ const sessionV3RecordSchema = z.union([
         "plan-policy.read-v1",
         "plan-policy.hybrid-v1",
         "plan-policy.hybrid-delegation-v1",
+        "plan-policy.hybrid-todo-v1",
+        "plan-policy.hybrid-delegation-todo-v1",
       ]),
       shellPolicyVersion: z.literal("plan-shell-policy.v1").optional(),
       shellEnvironment: planShellEnvironmentV1Schema.optional(),
@@ -2696,6 +2733,8 @@ const sessionV3RecordSchema = z.union([
         "plan-policy.read-v1",
         "plan-policy.hybrid-v1",
         "plan-policy.hybrid-delegation-v1",
+        "plan-policy.hybrid-todo-v1",
+        "plan-policy.hybrid-delegation-todo-v1",
       ]),
       toolProfileDigest: sha256DigestSchema,
     })
@@ -2720,6 +2759,8 @@ const sessionV3RecordSchema = z.union([
       "plan-policy.read-v1",
       "plan-policy.hybrid-v1",
       "plan-policy.hybrid-delegation-v1",
+      "plan-policy.hybrid-todo-v1",
+      "plan-policy.hybrid-delegation-todo-v1",
     ]),
     toolProfileDigest: sha256DigestSchema,
   }),
@@ -2783,6 +2824,8 @@ const sessionV3RecordSchema = z.union([
         "plan-policy.read-v1",
         "plan-policy.hybrid-v1",
         "plan-policy.hybrid-delegation-v1",
+        "plan-policy.hybrid-todo-v1",
+        "plan-policy.hybrid-delegation-todo-v1",
       ]),
       shellPolicyVersion: z.literal("plan-shell-policy.v1").optional(),
       shellEnvironment: planShellEnvironmentV1Schema.optional(),
@@ -2805,6 +2848,8 @@ const sessionV3RecordSchema = z.union([
             "plan-policy.read-v1",
             "plan-policy.hybrid-v1",
             "plan-policy.hybrid-delegation-v1",
+            "plan-policy.hybrid-todo-v1",
+            "plan-policy.hybrid-delegation-todo-v1",
           ]),
           toolProfileDigest: sha256DigestSchema,
         })

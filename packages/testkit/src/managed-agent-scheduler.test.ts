@@ -1342,115 +1342,123 @@ test("exit suspends queued intents, retains interrupted running outcomes and res
   }
 });
 
-test("candidate Lifecycle exposes the current Registry under the new Plan policy while child evidence cannot revise a ready Plan", async () => {
-  const h = createInMemorySessionLifecycleHarness();
-  const records = createInMemoryManagedAgentControlStore();
-  let mainCalls = 0;
-  let childCalls = 0;
-  const driver: ModelDriver = {
-    async *stream(request) {
-      if (request.tools.some((tool) => tool.name === "spawn_agents")) {
-        if (++mainCalls === 1) {
-          yield { type: "tool_call_start", id: "plan-explore", name: "spawn_agents" };
-          yield {
-            type: "tool_call_delta",
-            id: "plan-explore",
-            json: JSON.stringify({ mode: "foreground", entries: batch(1).entries }),
-          };
-          yield { type: "tool_call_end", id: "plan-explore" };
-          yield { type: "usage", inputTokens: 10, outputTokens: 5 };
-          yield { type: "finish", reason: "tool_calls" };
-          return;
+test.each(["historical", "current"] as const)(
+  "%s delegation Plan policy preserves child execution and ready Plan identity",
+  async (policy) => {
+    const h = createInMemorySessionLifecycleHarness();
+    const records = createInMemoryManagedAgentControlStore();
+    let mainCalls = 0;
+    let childCalls = 0;
+    const driver: ModelDriver = {
+      async *stream(request) {
+        if (request.tools.some((tool) => tool.name === "spawn_agents")) {
+          if (++mainCalls === 1) {
+            yield { type: "tool_call_start", id: "plan-explore", name: "spawn_agents" };
+            yield {
+              type: "tool_call_delta",
+              id: "plan-explore",
+              json: JSON.stringify({ mode: "foreground", entries: batch(1).entries }),
+            };
+            yield { type: "tool_call_end", id: "plan-explore" };
+            yield { type: "usage", inputTokens: 10, outputTokens: 5 };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          if (mainCalls === 3) {
+            yield { type: "tool_call_start", id: "publish-plan", name: "submit_plan" };
+            yield {
+              type: "tool_call_delta",
+              id: "publish-plan",
+              json: JSON.stringify({
+                markdown: "# Exact Plan\n\nInspect bounded repository evidence.\n",
+              }),
+            };
+            yield { type: "tool_call_end", id: "publish-plan" };
+            yield { type: "usage", inputTokens: 10, outputTokens: 5 };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          yield { type: "text_delta", text: "Plan evidence received." };
+        } else {
+          childCalls++;
+          yield { type: "text_delta", text: "Local child evidence." };
         }
-        if (mainCalls === 3) {
-          yield { type: "tool_call_start", id: "publish-plan", name: "submit_plan" };
-          yield {
-            type: "tool_call_delta",
-            id: "publish-plan",
-            json: JSON.stringify({
-              markdown: "# Exact Plan\n\nInspect bounded repository evidence.\n",
-            }),
+        yield { type: "usage", inputTokens: 10, outputTokens: 5 };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const lifecycle = h.createLifecycle({
+      workspaceRoot: process.cwd(),
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+      modelTargets: {
+        async resolve() {
+          return { identity: targetIdentity, driver, contextProfile };
+        },
+        async snapshot() {
+          return {
+            targets: [
+              {
+                identity: targetIdentity,
+                contextProfile,
+                readiness: { status: "available", credentialSource: "fixture" },
+              },
+            ],
           };
-          yield { type: "tool_call_end", id: "publish-plan" };
-          yield { type: "usage", inputTokens: 10, outputTokens: 5 };
-          yield { type: "finish", reason: "tool_calls" };
-          return;
-        }
-        yield { type: "text_delta", text: "Plan evidence received." };
-      } else {
-        childCalls++;
-        yield { type: "text_delta", text: "Local child evidence." };
-      }
-      yield { type: "usage", inputTokens: 10, outputTokens: 5 };
-      yield { type: "finish", reason: "stop" };
-    },
-  };
-  const lifecycle = h.createLifecycle({
-    workspaceRoot: process.cwd(),
-    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
-    modelTargets: {
-      async resolve() {
-        return { identity: targetIdentity, driver, contextProfile };
+        },
       },
-      async snapshot() {
-        return {
-          targets: [
-            {
-              identity: targetIdentity,
-              contextProfile,
-              readiness: { status: "available", credentialSource: "fixture" },
-            },
-          ],
-        };
+      [sessionManagedControl]: {
+        store: records,
+        childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+        ...(policy === "historical"
+          ? { planPolicyVersion: "plan-policy.hybrid-delegation-v1" as const }
+          : {}),
       },
-    },
-    [sessionManagedControl]: {
-      store: records,
-      childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
-    },
-  });
-  const confirmation = confirmRequestedEnvelopes(lifecycle);
-  try {
-    const parent = await lifecycle.create({ targetIdentity });
-    expect((await lifecycle.enterPlan({ sessionId: parent.sessionId })).plan?.policyVersion).toBe(
-      "plan-policy.hybrid-delegation-v1",
-    );
-    expect(
+    });
+    const confirmation = confirmRequestedEnvelopes(lifecycle);
+    try {
+      const parent = await lifecycle.create({ targetIdentity });
+      expect((await lifecycle.enterPlan({ sessionId: parent.sessionId })).plan?.policyVersion).toBe(
+        policy === "historical"
+          ? "plan-policy.hybrid-delegation-v1"
+          : "plan-policy.hybrid-delegation-todo-v1",
+      );
+      expect(
+        await lifecycle.continue({
+          sessionId: parent.sessionId,
+          input: { text: "Gather local evidence for this Plan." },
+        }),
+      ).toMatchObject({ result: { status: "completed", answer: "Plan evidence received." } });
+      expect(mainCalls).toBe(2);
+      expect(childCalls).toBe(1);
+      const control = await lifecycle[sessionManagedControl](parent.sessionId);
+      if (control === undefined) throw new Error("No current control");
+      expect(
+        (await control.inspect({ parentSessionId: parent.sessionId })).completions[0]?.consumption,
+      ).toBe("consumed");
       await lifecycle.continue({
         sessionId: parent.sessionId,
-        input: { text: "Gather local evidence for this Plan." },
-      }),
-    ).toMatchObject({ result: { status: "completed", answer: "Plan evidence received." } });
-    expect(mainCalls).toBe(2);
-    expect(childCalls).toBe(1);
-    const control = await lifecycle[sessionManagedControl](parent.sessionId);
-    if (control === undefined) throw new Error("No current control");
-    expect(
-      (await control.inspect({ parentSessionId: parent.sessionId })).completions[0]?.consumption,
-    ).toBe("consumed");
-    await lifecycle.continue({
-      sessionId: parent.sessionId,
-      input: { text: "Publish the exact Plan." },
-    });
-    const ready = await lifecycle.inspect({ sessionId: parent.sessionId });
-    if (ready.schemaVersion !== 3) throw new Error("No current Plan");
-    expect(ready.plan?.state).toBe("ready");
-    expect(
-      await control.dispatch({
-        ...batch(1, "Ready evidence"),
-        parentSessionId: parent.sessionId,
-        mode: "foreground",
-      }),
-    ).toMatchObject({ status: "completed" });
-    const after = await lifecycle.inspect({ sessionId: parent.sessionId });
-    if (after.schemaVersion !== 3) throw new Error("No Plan after child evidence");
-    expect(after.plan).toEqual(ready.plan);
-    expect(after.lastSequence).toBe(ready.lastSequence);
-  } finally {
-    confirmation();
-    await lifecycle.close();
-  }
-});
+        input: { text: "Publish the exact Plan." },
+      });
+      const ready = await lifecycle.inspect({ sessionId: parent.sessionId });
+      if (ready.schemaVersion !== 3) throw new Error("No current Plan");
+      expect(ready.plan?.state).toBe("ready");
+      expect(
+        await control.dispatch({
+          ...batch(1, "Ready evidence"),
+          parentSessionId: parent.sessionId,
+          mode: "foreground",
+        }),
+      ).toMatchObject({ status: "completed" });
+      const after = await lifecycle.inspect({ sessionId: parent.sessionId });
+      if (after.schemaVersion !== 3) throw new Error("No Plan after child evidence");
+      expect(after.plan).toEqual(ready.plan);
+      expect(after.lastSequence).toBe(ready.lastSequence);
+    } finally {
+      confirmation();
+      await lifecycle.close();
+    }
+  },
+);
 
 test("a tightened envelope bounds concurrency independently and queued task bytes stay immutable", async () => {
   const started = Promise.withResolvers<void>();

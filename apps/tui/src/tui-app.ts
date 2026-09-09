@@ -105,6 +105,7 @@ import { RoundedFrame } from "./rounded-frame.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
+import { SessionSettings } from "./session-settings.js";
 import { SkillPalette } from "./skill-palette.js";
 import { createAdamStructuredEditorCompletion } from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
@@ -574,7 +575,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | {
         readonly close: () => void;
         readonly hide: () => void;
-        readonly inspector: SessionInspector;
+        readonly inspector: SessionInspector | SessionSettings;
       }
     | undefined;
   let chronologyPicker:
@@ -6000,7 +6001,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       parsedCommand.kind === "known" &&
       parsedCommand.command.id === "session" &&
-      parsedCommand.argumentsText.length === 0
+      (parsedCommand.argumentsText.length === 0 || parsedCommand.argumentsText === "settings")
     ) {
       editor.setText("");
       editor.disableSubmit = false;
@@ -6013,13 +6014,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.requestRender();
       };
       const continuity = state.authoritative.continuity;
-      const inspector = new SessionInspector({
-        active,
-        onClose: close,
-        runStatus: sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling),
-        theme,
-        throughSequence: continuity.status === "current" ? continuity.sessionThroughSequence : null,
-      });
+      const runStatus = sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling);
+      const inspector =
+        parsedCommand.argumentsText === "settings"
+          ? new SessionSettings({
+              active,
+              runStatus,
+              theme,
+              onClose: close,
+              onChange: () => tui.requestRender(),
+              onUpgrade: async (sessionId) => {
+                const receipt = await options.presentation.dispatch({
+                  type: "upgrade_todo_permission_policy",
+                  sessionId,
+                });
+                return receipt.status === "admitted"
+                  ? "Session Todo defaults enabled."
+                  : receipt.message;
+              },
+            })
+          : new SessionInspector({
+              active,
+              onClose: close,
+              runStatus,
+              theme,
+              throughSequence:
+                continuity.status === "current" ? continuity.sessionThroughSequence : null,
+            });
       handle = showOverlay(inspector, {
         width: "90%",
         minWidth: 36,
@@ -7689,9 +7710,16 @@ function planPolicyFooterSummary(
   if (policyVersion === "plan-policy.read-v1") {
     return density === "compact" ? "plan read-only" : "plan-policy.read-v1 · read-only";
   }
+  const sessionTodo =
+    policyVersion === "plan-policy.hybrid-todo-v1" ||
+    policyVersion === "plan-policy.hybrid-delegation-todo-v1";
   return density === "compact"
-    ? "inspect:auto · ambig:ask · mutate:deny"
-    : `${policyVersion} · inspect auto · ambiguous exec asks · mutation denies`;
+    ? sessionTodo
+      ? "inspect:auto · exec:ask · files:deny · Todo:session"
+      : "inspect:auto · ambig:ask · mutate:deny"
+    : sessionTodo
+      ? `${policyVersion} · inspect auto · exec asks · files deny`
+      : `${policyVersion} · inspect auto · ambiguous exec asks · mutation denies`;
 }
 
 function footerContextText(active: ActiveSessionDisplay): string {

@@ -34,7 +34,7 @@ Each update uses the existing title, details, status, and dependency limits. Cur
 
 Success increments each changed item revision once and the store revision once. The output contains `batchVersion: 1`, `policyVersion: "todo-policy.v1"`, `storeRevision`, and the complete changed `items`. One canonical `tool_completed` record carries both the atomic mutation and its model-visible result. Complete-record recovery therefore cannot preserve a success result without its corresponding Todo state. An interrupted write that cannot prove commitment retains the existing indeterminate-effect handling and never automatically replays the mutation.
 
-The authoritative Todo projection consumes that same record for model summaries, compaction, resume, prefix branches, `/todos`, and compact status. Plan continues to deny Todo mutations. Todo never starts another turn, and TUI navigation remains read-only.
+The authoritative Todo projection consumes that same record for model summaries, compaction, resume, prefix branches, `/todos`, and compact status. New sessions record `todo-permission.session-v1`, which defaults the exact built-in create/update/batch Todo operations to allow unless the ordinary policy denies them. New Plan cycles use the corresponding Todo-enabled hybrid policy; the original read/hybrid/delegation Plan versions continue to deny Todo mutations. Older sessions retain `todo-permission.legacy-v1` semantics until an explicit idle upgrade through `/session settings`. The upgrade appends a record, preserves old JSONL and pending identities, and affects future calls and new Plan cycles. Branches inherit the policy at their selected source prefix. Todo never starts another turn, and TUI navigation remains read-only.
 
 ## Frozen tool definitions
 

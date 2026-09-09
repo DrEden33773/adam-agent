@@ -345,6 +345,9 @@ function formatPermissionPrompt(
   if (event.subject.type === "web_artifact") {
     return `Allow ${event.name} to ${event.subject.operation} immutable Web artifact ${event.subject.artifactId} [y/N] `;
   }
+  if (event.subject.type === "session_todo") {
+    return `Allow ${event.subject.operation} in session ${quoteForTerminal(event.subject.sessionId)} [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 

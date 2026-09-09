@@ -10,7 +10,7 @@ Explore receives repository reads, explicitly selected immutable input resources
 
 Each new thread freezes its role definition, exact certified target, effective context and thinking policy, initial context, permissions and budget. Unconfigured roles inherit Main's effective target and limits. A configured but unavailable target requires an explicit Use inherited, Update, or Cancel choice. Reloading definitions or the parent Skill catalog affects future threads. Existing threads retain their frozen definitions and independently activated Skills.
 
-The current Plan policy, `plan-policy.hybrid-delegation-v1`, admits only the registered non-mutating role/control and Main/Research Web families under their ordinary permissions. Current Plan and permission ceilings remain enforceable at execution, queued work and recovery boundaries. Compatible work can continue while Plan is active. Plan approval is never delegated to a child.
+The current Plan policy, `plan-policy.hybrid-delegation-todo-v1`, admits the registered non-mutating role/control and Main/Research Web families under their ordinary permissions, plus exact built-in session Todo bookkeeping under the recorded Todo permission policy. Historical `plan-policy.hybrid-delegation-v1` retains its original Todo denial. Current Plan and permission ceilings remain enforceable at execution, queued work and recovery boundaries. Compatible work can continue while Plan is active. Plan approval is never delegated to a child.
 
 ## Custom definitions
 

@@ -1264,7 +1264,7 @@ test("PresentationSession causally projects a Todo mutation before the parent ru
   }
 });
 
-test("PresentationSession allows create_todo without a workspace change preview", async () => {
+test("PresentationSession allows legacy create_todo without a workspace change preview", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-permission-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -1350,7 +1350,25 @@ test("PresentationSession allows create_todo without a workspace change preview"
       };
     },
   };
+  const directory = createInMemorySessionStoreDirectory<SessionRecord>();
+  const legacyRecord = (entry: SessionRecord): SessionRecord => {
+    if (entry.schemaVersion !== 3 || entry.record.type !== "session_genesis") return entry;
+    const { todoPermissionPolicyVersion: _policy, ...record } = entry.record;
+    return { ...entry, record };
+  };
+  const legacyDirectory: SessionStoreDirectory<SessionRecord> = {
+    ...directory,
+    async create(sessionId) {
+      const store = await directory.create(sessionId);
+      return {
+        ...store,
+        append: (entry) => store.append(legacyRecord(entry)),
+        appendBatch: (entries) => store.appendBatch(entries.map(legacyRecord)),
+      };
+    },
+  };
   const lifecycle = createSessionLifecycle({
+    [sessionStoreDirectory]: legacyDirectory,
     modelTargets,
     permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
     stateRoot,
@@ -1361,6 +1379,7 @@ test("PresentationSession allows create_todo without a workspace change preview"
 
   try {
     const presentation = await createPresentationSession({
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(directory),
       lifecycle,
       projectLabel: "workspace",
       targetIdentity,
@@ -3577,14 +3596,17 @@ test("PresentationSession admits the first draft prompt directly into durable Pl
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "create_todo",
         "get_todo",
         "list_todos",
+        "update_todo",
+        "update_todos",
         "submit_plan",
       ]);
       expect(presentation.getState().authoritative.active?.plan).toMatchObject({
         state: "exploring",
         revision: 1,
-        policyVersion: "plan-policy.hybrid-v1",
+        policyVersion: "plan-policy.hybrid-todo-v1",
       });
       await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
         items: [{ plan: { state: "exploring" } }],

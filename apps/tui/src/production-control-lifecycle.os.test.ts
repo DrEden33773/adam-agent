@@ -289,7 +289,7 @@ test("ordinary blank Plan draft confirms Research and exact Web authority before
     if (active === null || active === undefined) throw new Error("Missing direct parent Session.");
     expect(active.plan).toMatchObject({
       state: "exploring",
-      policyVersion: "plan-policy.hybrid-delegation-v1",
+      policyVersion: "plan-policy.hybrid-delegation-todo-v1",
     });
     const directRecords = await (await h.sessions.open(active.session.id))?.read();
     expect(
