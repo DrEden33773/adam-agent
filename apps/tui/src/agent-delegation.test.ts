@@ -190,7 +190,7 @@ test.each([40, 80, 120])(
       { columns },
     );
     try {
-      await h.press("@Explore", columns === 40 ? "New agent @Explore" : "New agent · Explore");
+      await h.press("@Explore", "New agent · Explore");
       await h.press("\t", "@Explore");
       await h.press(" Inspect bounds", "Inspect bounds");
       await h.press("\r", "Delegation");

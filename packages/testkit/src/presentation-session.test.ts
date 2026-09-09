@@ -853,7 +853,7 @@ test("PresentationSession exposes authoritative read-only Todo summary, list, an
       counts: { pending: 1, inProgress: 0, completed: 0 },
       blockedCount: 0,
       overlay: {
-        turnId: createdTodo.record.runId,
+        turnId: null,
         completedCount: 0,
         items: [
           {

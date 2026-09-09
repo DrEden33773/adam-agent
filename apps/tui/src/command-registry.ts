@@ -5,6 +5,7 @@ import { getKeybindings, type Keybinding, type KeyId, matchesKey } from "@earend
 
 export type AdamCommandDefinition = {
   readonly aliases: readonly string[];
+  readonly arguments?: readonly AdamArgumentCompletion[];
   readonly availability: "always" | "idle";
   readonly id:
     | "artifacts"
@@ -84,6 +85,7 @@ export type AdamCommandParseResult =
     };
 
 export type AdamArgumentCompletion = {
+  readonly description: string;
   readonly label: string;
   readonly value: string;
 };
@@ -96,6 +98,7 @@ export type AdamArgumentCompletions = {
 
 export type AdamArgumentCompletionResolution =
   | { readonly kind: "not_owned" }
+  | { readonly kind: "path" }
   | { readonly completion: AdamArgumentCompletions | null; readonly kind: "owned" };
 
 export type TodoToggleKey = "alt+t" | "ctrl+shift+t";
@@ -141,30 +144,51 @@ export class AdamCommandRegistry {
       readonly attachmentsAvailable?: boolean;
       readonly runActive: boolean;
       readonly thinkingLevelIds: readonly string[];
+      readonly resources?: readonly {
+        readonly index: number;
+        readonly label: string;
+        readonly status: string;
+      }[];
     },
   ): AdamArgumentCompletionResolution {
     const command = this.#commandsByName.get(commandName);
-    if (command === undefined || !finiteArgumentCommandIds.has(command.id)) {
-      return { kind: "not_owned" };
-    }
-    if (!this.isAvailable(command, context)) {
-      return { completion: null, kind: "owned" };
-    }
+    if (command === undefined) return { kind: "not_owned" };
+    if (!this.isAvailable(command, context)) return { completion: null, kind: "owned" };
+    if (command.id === "attach") return { kind: "path" };
     let completion: AdamArgumentCompletions | null;
-    if (command?.id === "name") {
-      completion = completeSingleFiniteArgument(argumentsText, ["--clear", "--generate"]);
-    } else if (command.id === "todos") {
-      completion = completeSingleFiniteArgument(argumentsText, ["toggle"]);
-    } else if (command.id === "thinking") {
-      completion = completeSingleFiniteArgument(argumentsText, context.thinkingLevelIds);
-    } else if (command.id === "instructions" || command.id === "skills") {
-      completion = completeSingleFiniteArgument(argumentsText, ["reload"]);
+    if (command.id === "thinking") {
+      completion = completeSingleFiniteArgument(
+        argumentsText,
+        context.thinkingLevelIds.map((value) => ({
+          label: value,
+          value,
+          description: `Use the available ${value} thinking level`,
+        })),
+      );
+    } else if (command.id === "detach" || command.id === "cancelattach") {
+      completion = completeSingleFiniteArgument(
+        argumentsText,
+        (context.resources ?? [])
+          .filter((resource) => command.id === "detach" || resource.status === "copying")
+          .map((resource) => ({
+            label: String(resource.index),
+            value: String(resource.index),
+            description: `${resource.label} · ${resource.status}`,
+          })),
+      );
     } else if (command.id === "config") {
-      completion = completeConfigurationArguments(argumentsText);
-    } else if (command.id === "trust") {
-      completion = completeSingleFiniteArgument(argumentsText, ["status", "grant", "revoke"]);
+      completion = completeConfigurationArguments(argumentsText, command.arguments ?? []);
+    } else if (command.id === "help") {
+      completion = completeSingleFiniteArgument(
+        argumentsText,
+        fixedHelpTopics.map((topic) => ({
+          label: topic.id,
+          value: topic.id,
+          description: topic.summary,
+        })),
+      );
     } else {
-      completion = null;
+      completion = completeSingleFiniteArgument(argumentsText, command.arguments ?? []);
     }
     return { completion, kind: "owned" };
   }
@@ -251,6 +275,15 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "always",
     id: "agents",
+    arguments: [
+      { label: "history", value: "history", description: "Browse agent history" },
+      { label: "settings", value: "settings", description: "Configure agent views" },
+      {
+        label: "attention",
+        value: "attention",
+        description: "Resolve pending permissions and replies",
+      },
+    ],
     name: "agents",
     summary: "Inspect, reply to, or cancel managed children for the active session.",
     usage: "/agents [history|settings|attention]",
@@ -299,6 +332,9 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "always",
     id: "todos",
+    arguments: [
+      { label: "toggle", value: "toggle", description: "Collapse or expand the Todo overlay" },
+    ],
     name: "todos",
     summary: "Browse the authoritative Todo store without mutation.",
     usage: "/todos [toggle]",
@@ -307,6 +343,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "always",
     id: "copy",
+    arguments: [{ label: "draft", value: "draft", description: "Copy the current draft" }],
     name: "copy",
     summary: "Copy the last assistant response or the expanded current draft.",
     usage: "/copy [draft]",
@@ -355,6 +392,17 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "idle",
     id: "config",
+    arguments: [
+      { label: "context", value: "context", description: "Set the context token limit" },
+      { label: "output", value: "output", description: "Set the output token limit" },
+      {
+        label: "compaction",
+        value: "compaction",
+        description: "Set the compaction token threshold",
+      },
+      { label: "web", value: "web", description: "Set the Web endpoint" },
+      { label: "web-fake-ip", value: "web-fake-ip", description: "Set fake-IP network ranges" },
+    ],
     name: "config",
     summary: "Inspect and tighten owner-local model limits for new sessions.",
     usage:
@@ -364,6 +412,11 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "idle",
     id: "trust",
+    arguments: [
+      { label: "status", value: "status", description: "Show workspace trust" },
+      { label: "grant", value: "grant", description: "Trust this workspace" },
+      { label: "revoke", value: "revoke", description: "Revoke workspace trust" },
+    ],
     name: "trust",
     summary: "Inspect, grant, or revoke owner-local trust for this exact project.",
     usage: "/trust [status|grant|revoke]",
@@ -436,6 +489,10 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "idle",
     id: "name",
+    arguments: [
+      { label: "--clear", value: "--clear", description: "Remove the session name" },
+      { label: "--generate", value: "--generate", description: "Generate a session name" },
+    ],
     name: "name",
     summary: "Set, clear, or regenerate the active session name.",
     usage: "/name <text|--clear|--generate>",
@@ -468,6 +525,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "idle",
     id: "instructions",
+    arguments: [{ label: "reload", value: "reload", description: "Reload project instructions" }],
     name: "instructions",
     summary: "Inspect or reload repository instruction status.",
     usage: "/instructions [reload]",
@@ -476,9 +534,10 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "idle",
     id: "skills",
+    arguments: [{ label: "reload", value: "reload", description: "Reload the Skill catalog" }],
     name: "skills",
     summary: "Select exact Skills or reload the Skill catalog.",
-    usage: "/skills [reload]",
+    usage: "/skills [reload|qualified-id]",
   },
   {
     aliases: [],
@@ -721,36 +780,25 @@ const fixedHelpTopics: readonly AdamHelpTopicDefinition[] = [
   { id: "safety", label: "Safety", summary: "Permissions, trust, and isolation boundaries" },
 ];
 
-const finiteArgumentCommandIds: ReadonlySet<AdamCommandDefinition["id"]> = new Set([
-  "config",
-  "help",
-  "instructions",
-  "name",
-  "skills",
-  "thinking",
-  "todos",
-  "trust",
-]);
-
 function completeSingleFiniteArgument(
   argumentsText: string,
-  values: readonly string[],
+  values: readonly AdamArgumentCompletion[],
   exactIsComplete = true,
 ): AdamArgumentCompletions | null {
   if (/\s/u.test(argumentsText)) {
     return null;
   }
-  if (exactIsComplete && values.includes(argumentsText)) {
+  if (exactIsComplete && values.some((item) => item.value === argumentsText)) {
     return { exact: true, items: [], prefix: argumentsText };
   }
-  const items = values
-    .filter((value) => value.startsWith(argumentsText))
-    .map((value) => ({ label: value, value }));
+  const items = values.filter((item) => item.value.startsWith(argumentsText));
   return items.length === 0 ? null : { exact: false, items, prefix: argumentsText };
 }
 
-function completeConfigurationArguments(argumentsText: string): AdamArgumentCompletions | null {
-  const fields = ["context", "output", "compaction", "web", "web-fake-ip"] as const;
+function completeConfigurationArguments(
+  argumentsText: string,
+  fields: readonly AdamArgumentCompletion[],
+): AdamArgumentCompletions | null {
   if (!/\s/u.test(argumentsText)) {
     return completeSingleFiniteArgument(argumentsText, fields, false);
   }
@@ -762,7 +810,9 @@ function completeConfigurationArguments(argumentsText: string): AdamArgumentComp
   }
   return completeSingleFiniteArgument(
     valueMatch[2] ?? "",
-    valueMatch[1] === "web" || valueMatch[1] === "web-fake-ip" ? ["clear"] : ["default"],
+    valueMatch[1] === "web" || valueMatch[1] === "web-fake-ip"
+      ? [{ label: "clear", value: "clear", description: "Remove the configured override" }]
+      : [{ label: "default", value: "default", description: "Restore the target default" }],
   );
 }
 

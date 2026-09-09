@@ -712,7 +712,7 @@ test("a selected main atom routes the following task to the existing Main Sessio
     },
   });
   try {
-    await h.press("@main", "> [Agent] @main");
+    await h.press("@main", "> main");
     await h.press("\t", "@main");
     await h.press(" Inspect the parent request.", "Inspect the parent request.");
     await h.press("\r", "Main received the selected task.");

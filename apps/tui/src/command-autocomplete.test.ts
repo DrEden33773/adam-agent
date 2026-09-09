@@ -105,13 +105,13 @@ test("Skill mention rows expose deterministic source labels without qualified ID
         qualifiedId: "skill:v1:project:packages/app:shared",
       },
       value: "$shared",
-      label: "$shared",
+      label: "shared",
       description: "project:packages/app · Project procedure.",
     },
     {
       adamSkill: { name: "shared", qualifiedId: "skill:v1:user:shared" },
       value: "$shared",
-      label: "$shared",
+      label: "shared",
       description: "user · User procedure.",
     },
     {
@@ -120,7 +120,7 @@ test("Skill mention rows expose deterministic source labels without qualified ID
         qualifiedId: "skill:v1:extension:eve:shared",
       },
       value: "$shared",
-      label: "$shared",
+      label: "shared",
       description: "extension:eve@0.3.0 · Extension procedure.",
     },
   ]);
@@ -162,13 +162,13 @@ test("path mention rows separate file names from parent paths without changing i
       {
         adamPath: { path: "README.md" },
         value: "@README.md",
-        label: "<text>[File] @README.md</text>",
+        label: "<text>README.md</text>",
         description: "[File] README.md",
       },
       {
         adamPath: { path: "packages/extension-api/README.md" },
         value: "@packages/extension-api/README.md",
-        label: "<text>[File] @README.md</text>",
+        label: "<text>README.md</text>",
         description: "[File] packages/extension-api/README.md",
       },
     ],
@@ -197,16 +197,158 @@ test("path mentions recall root and nested files with the same matching name", a
       {
         adamPath: { path: "AGENTS.md" },
         value: "@AGENTS.md",
-        label: "[File] @AGENTS.md",
+        label: "AGENTS.md",
         description: "[File] AGENTS.md",
       },
       {
         adamPath: { path: "examples/portfolio-walkthrough/AGENTS.md" },
         value: "@examples/portfolio-walkthrough/AGENTS.md",
-        label: "[File] @AGENTS.md",
+        label: "AGENTS.md",
         description: "[File] examples/portfolio-walkthrough/AGENTS.md",
       },
     ],
     prefix: "@agents",
   });
+});
+
+test("command arguments own their completion and never fall back to project files", async () => {
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => ["README.md", "src/"],
+    getRunActive: () => false,
+    getSkills: () => [],
+  });
+  for (const [input, expected] of [
+    ["/agents ", ["history", "settings", "attention"]],
+    ["/agents s", ["settings"]],
+    ["/copy ", ["draft"]],
+  ] as const) {
+    for (const force of [false, true]) {
+      const result = await provider.getSuggestions([input], 0, input.length, {
+        force,
+        signal: new AbortController().signal,
+      });
+      expect(result?.items.map((item) => item.value)).toEqual(expected);
+      expect(result?.items.every((item) => Boolean(item.description))).toBe(true);
+      const item = result?.items[0];
+      if (item && result)
+        expect(
+          provider.applyCompletion([input], 0, input.length, item, result.prefix).lines,
+        ).toEqual([`${input.split(" ")[0]} ${expected[0]}`]);
+    }
+  }
+  for (const input of [
+    "/agents wrong",
+    "/copy src",
+    "/exit ",
+    "/detach ",
+    "/cancelattach ",
+    "/skills wrong",
+    "/config web https://",
+  ]) {
+    expect(
+      await provider.getSuggestions([input], 0, input.length, {
+        force: true,
+        signal: new AbortController().signal,
+      }),
+    ).toBeNull();
+  }
+});
+
+test("dynamic argument catalogs preserve resource indexes and available thinking and Skill values", async () => {
+  let resources = [
+    { index: 2, label: "log.txt", status: "ready" },
+    { index: 4, label: "image.png", status: "copying" },
+  ];
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => ["src/main.ts"],
+    getRunActive: () => false,
+    getResources: () => resources,
+    getThinkingLevelIds: () => ["medium", "high"],
+    getSkills: () => [
+      {
+        name: "audit",
+        qualifiedId: "skill:v1:user:audit",
+        description: "Audit changes",
+        source: { type: "user" },
+      },
+    ],
+  });
+  const suggest = (input: string) =>
+    provider.getSuggestions([input], 0, input.length, {
+      force: true,
+      signal: new AbortController().signal,
+    });
+  expect((await suggest("/detach "))?.items).toEqual([
+    { label: "2", value: "2", description: "log.txt · ready" },
+    { label: "4", value: "4", description: "image.png · copying" },
+  ]);
+  expect((await suggest("/cancelattach "))?.items.map((item) => item.value)).toEqual(["4"]);
+  resources = [];
+  expect(await suggest("/detach ")).toBeNull();
+  expect((await suggest("/thinking "))?.items.map((item) => item.value)).toEqual([
+    "medium",
+    "high",
+  ]);
+  expect((await suggest("/skills skill:"))?.items).toEqual([
+    { label: "skill:v1:user:audit", value: "skill:v1:user:audit", description: "Audit changes" },
+  ]);
+  expect((await suggest("/attach src/"))?.items.map((item) => item.value)).toEqual(["src/main.ts"]);
+  for (const input of [
+    "/help ",
+    "/config ",
+    "/config context ",
+    "/config web ",
+    "/instructions ",
+    "/skills ",
+    "/name ",
+    "/trust ",
+    "/todos ",
+    "/thinking ",
+  ]) {
+    const items = (await suggest(input))?.items;
+    expect(items?.length).toBeGreaterThan(0);
+    expect(items?.every((item) => Boolean(item.description))).toBe(true);
+  }
+});
+
+test("attach completes literal paths beginning with mention characters without binding atoms", async () => {
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => ["@audit.txt", "$audit.txt", "audit.txt"],
+    getRunActive: () => false,
+    getRoles: () => [
+      {
+        name: "audit",
+        qualifiedId: "user:audit",
+        description: "Agent decoy",
+        base: "explore",
+        tools: [],
+        web: false,
+        definitionDigest: `sha256:${"0".repeat(64)}`,
+      },
+    ],
+    getSkills: () => [
+      {
+        name: "audit",
+        qualifiedId: "skill:v1:user:audit",
+        description: "Skill decoy",
+        source: { type: "user" },
+      },
+    ],
+  });
+  for (const prefix of ["@a", "$a"]) {
+    for (const force of [false, true]) {
+      const input = `/attach ${prefix}`;
+      const result = await provider.getSuggestions([input], 0, input.length, {
+        force,
+        signal: new AbortController().signal,
+      });
+      const path = `${prefix[0]}audit.txt`;
+      expect(result).toEqual({ items: [{ label: path, value: path }], prefix });
+      const item = result?.items[0];
+      if (result && item)
+        expect(
+          provider.applyCompletion([input], 0, input.length, item, result.prefix).lines,
+        ).toEqual([`/attach ${path}`]);
+    }
+  }
 });

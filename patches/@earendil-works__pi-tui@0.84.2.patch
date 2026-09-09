@@ -121,7 +121,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..2643d068c510ce326e6b6059bd2f68bb
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf421ea6e24f 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..260c6f54a3d057912bc00bb5cb4780672ff3725f 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
 @@ -166,6 +166,10 @@ const SLASH_COMMAND_SELECT_LIST_LAYOUT = {
@@ -203,7 +203,29 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
                      displayText = before + marker + cursor + restAfter;
                      // lineVisibleWidth stays the same - we're replacing, not adding
                  }
-@@ -527,6 +549,26 @@ export class Editor {
+@@ -466,6 +488,21 @@ export class Editor {
+         // Add autocomplete list if active
+         if (this.autocompleteState && this.autocompleteList) {
+             const autocompleteResult = this.autocompleteList.render(contentWidth);
++            const selectedDescription = this.autocompleteList.getSelectedItem()?.description;
++            // Narrow menus keep names compact while exposing the selected object's identity.
++            if (contentWidth <= 40 && selectedDescription) {
++                const detail = selectedDescription.replace(/[\r\n]+/g, " ").trim();
++                const detailWidth = Math.max(1, contentWidth - 2);
++                const chunks = wordWrapLine(detail, detailWidth);
++                const detailRows = Math.max(1, Math.min(3, this.tui.terminal.rows - result.length - autocompleteResult.length));
++                for (let index = 0; index < Math.min(chunks.length, detailRows); index++) {
++                    const clipped = index === detailRows - 1 && chunks.length > detailRows;
++                    const text = clipped
++                        ? `${sliceByColumn(chunks[index].text, 0, Math.max(0, detailWidth - 1), true)}…`
++                        : chunks[index].text;
++                    autocompleteResult.push(this.theme.selectList.description(`  ${text}`));
++                }
++            }
+             for (const line of autocompleteResult) {
+                 const lineWidth = visibleWidth(line);
+                 const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
+@@ -527,6 +564,26 @@ export class Editor {
              this.undo();
              return;
          }
@@ -230,7 +252,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          // Handle autocomplete mode
          if (this.autocompleteState && this.autocompleteList) {
              if (kb.matches(data, "tui.select.cancel")) {
-@@ -540,35 +582,21 @@ export class Editor {
+@@ -540,35 +597,21 @@ export class Editor {
              if (kb.matches(data, "tui.input.tab")) {
                  const selected = this.autocompleteList.getSelectedItem();
                  if (selected && this.autocompleteProvider) {
@@ -268,7 +290,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
                          return;
                      }
                  }
-@@ -748,10 +776,12 @@ export class Editor {
+@@ -748,10 +791,12 @@ export class Editor {
                  text: "",
                  hasCursor: true,
                  cursorPos: 0,
@@ -281,7 +303,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          for (let i = 0; i < this.state.lines.length; i++) {
              const line = this.state.lines[i] || "";
              const isCurrentLine = i === this.state.cursorLine;
-@@ -763,12 +793,14 @@ export class Editor {
+@@ -763,12 +808,14 @@ export class Editor {
                          text: line,
                          hasCursor: true,
                          cursorPos: this.state.cursorCol,
@@ -296,7 +318,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
                      });
                  }
              }
-@@ -810,19 +842,44 @@ export class Editor {
+@@ -810,19 +857,44 @@ export class Editor {
                              text: chunk.text,
                              hasCursor: true,
                              cursorPos: adjustedCursorPos,
@@ -341,7 +363,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
      getText() {
          return this.state.lines.join("\n");
      }
-@@ -847,6 +904,261 @@ export class Editor {
+@@ -847,6 +919,261 @@ export class Editor {
      getCursor() {
          return { line: this.state.cursorLine, col: this.state.cursorCol };
      }
@@ -603,7 +625,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
      setText(text) {
          this.cancelAutocomplete();
          this.lastAction = null;
-@@ -858,8 +1170,16 @@ export class Editor {
+@@ -858,8 +1185,16 @@ export class Editor {
          }
          this.pastes.clear();
          this.pasteCounter = 0;
@@ -620,7 +642,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
      /**
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
-@@ -868,6 +1188,10 @@ export class Editor {
+@@ -868,6 +1203,10 @@ export class Editor {
      insertTextAtCursor(text) {
          if (!text)
              return;
@@ -631,7 +653,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          this.cancelAutocomplete();
          this.pushUndoSnapshot();
          this.lastAction = null;
-@@ -890,6 +1214,10 @@ export class Editor {
+@@ -890,6 +1229,10 @@ export class Editor {
      insertTextAtCursorInternal(text) {
          if (!text)
              return;
@@ -642,7 +664,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          // Normalize line endings and tabs
          const normalized = this.normalizeText(text);
          const insertedLines = normalized.split("\n");
-@@ -925,6 +1253,10 @@ export class Editor {
+@@ -925,6 +1268,10 @@ export class Editor {
      // All the editor methods from before...
      insertCharacter(char, skipUndoCoalescing) {
          this.exitHistoryBrowsing();
@@ -653,7 +675,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          // Undo coalescing (fish-style):
          // - Consecutive word chars coalesce into one undo unit
          // - Space captures state before itself (so undo removes space+following word together)
-@@ -1011,11 +1343,22 @@ export class Editor {
+@@ -1011,11 +1358,22 @@ export class Editor {
                  filteredText = ` ${filteredText}`;
              }
          }
@@ -677,7 +699,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
              // Store the paste and insert a marker
              this.pasteCounter++;
              const pasteId = this.pasteCounter;
-@@ -1036,6 +1379,10 @@ export class Editor {
+@@ -1036,6 +1394,10 @@ export class Editor {
          this.insertTextAtCursorInternal(filteredText);
      }
      addNewLine() {
@@ -688,7 +710,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          this.cancelAutocomplete();
          this.exitHistoryBrowsing();
          this.lastAction = null;
-@@ -1068,6 +1415,11 @@ export class Editor {
+@@ -1068,6 +1430,11 @@ export class Editor {
      submitValue() {
          this.cancelAutocomplete();
          const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
@@ -700,7 +722,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
          this.pastes.clear();
          this.pasteCounter = 0;
-@@ -1083,6 +1435,16 @@ export class Editor {
+@@ -1083,6 +1450,16 @@ export class Editor {
      handleBackspace() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -717,7 +739,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          if (this.state.cursorCol > 0) {
              this.pushUndoSnapshot();
              // Delete grapheme before cursor (handles emojis, combining characters, etc.)
-@@ -1157,6 +1519,7 @@ export class Editor {
+@@ -1157,6 +1534,7 @@ export class Editor {
       */
      setCursorCol(col) {
          this.state.cursorCol = col;
@@ -725,7 +747,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          this.preferredVisualCol = null;
          this.snappedFromCursorCol = null;
      }
-@@ -1410,6 +1773,16 @@ export class Editor {
+@@ -1410,6 +1788,16 @@ export class Editor {
      handleForwardDelete() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -742,7 +764,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          const currentLine = this.state.lines[this.state.cursorLine] || "";
          if (this.state.cursorCol < currentLine.length) {
              this.pushUndoSnapshot();
-@@ -1520,6 +1893,12 @@ export class Editor {
+@@ -1520,6 +1908,12 @@ export class Editor {
          if (deltaCol !== 0) {
              const currentLine = this.state.lines[this.state.cursorLine] || "";
              if (deltaCol > 0) {
@@ -755,7 +777,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
                  // Moving right - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol < currentLine.length) {
                      const afterCursor = currentLine.slice(this.state.cursorCol);
-@@ -1541,6 +1920,12 @@ export class Editor {
+@@ -1541,6 +1935,12 @@ export class Editor {
                  }
              }
              else {
@@ -768,7 +790,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
                  // Moving left - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol > 0) {
                      const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-@@ -1704,6 +2089,10 @@ export class Editor {
+@@ -1704,6 +2104,10 @@ export class Editor {
      }
      undo() {
          this.exitHistoryBrowsing();
@@ -779,7 +801,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          const snapshot = this.undoStack.pop();
          if (!snapshot)
              return;
-@@ -1803,17 +2192,90 @@ export class Editor {
+@@ -1803,17 +2207,90 @@ export class Editor {
          return firstPrefixIndex;
      }
      createAutocompleteList(prefix, items) {
@@ -873,7 +895,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
              this.handleSlashCommandCompletion();
          }
-@@ -1830,9 +2292,12 @@ export class Editor {
+@@ -1830,9 +2307,12 @@ export class Editor {
      requestAutocomplete(options) {
          if (!this.autocompleteProvider)
              return;
@@ -887,7 +909,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
              if (!shouldTrigger) {
                  return;
              }
-@@ -1882,14 +2347,20 @@ export class Editor {
+@@ -1882,14 +2362,20 @@ export class Editor {
          if (options.explicitTab || options.force) {
              return 0;
          }
@@ -911,7 +933,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..2c86808e42068b3c8215ad924162bf42
          if (!this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
              return;
          }
-@@ -1901,14 +2372,7 @@ export class Editor {
+@@ -1901,14 +2387,7 @@ export class Editor {
          }
          if (options.force && options.explicitTab && suggestions.items.length === 1) {
              const item = suggestions.items[0];

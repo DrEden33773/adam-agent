@@ -48,7 +48,7 @@ test.each(["message", "role"] as const)(
         await started.promise;
       }
       const recipient = kind === "message" ? "@explore-1" : "@Explore";
-      await h.press(recipient, kind === "message" ? "> [Agent] @explore-1" : "New agent · Explore");
+      await h.press(recipient, kind === "message" ? "> explore-1" : "New agent · Explore");
       await h.press("\t", recipient);
       await h.press(" Keep this draft.", "Keep this draft.");
       await h.press("\r", kind === "message" ? "Send to @explore-1" : "Delegation");

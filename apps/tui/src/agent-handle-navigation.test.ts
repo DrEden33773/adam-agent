@@ -24,7 +24,7 @@ async function startThreads(h: ManagedTuiFixture, count: number) {
 }
 
 async function selectHandle(h: ManagedTuiFixture, handle: string) {
-  await h.press(handle, `> [Agent] ${handle}`);
+  await h.press(handle, `> ${handle.replace(/^@/u, "")}`);
   await h.press("\t", handle);
 }
 
@@ -207,8 +207,8 @@ test("a selected file sharing an agent handle stays a Main file reference", asyn
   try {
     await startThreads(h, 1);
     await h.terminal.waitForScreen("Completed");
-    await h.press("@explore-1", "> [Agent] @explore-1");
-    await h.press("\x1b[B", "> [File] @explore-1");
+    await h.press("@explore-1", "> explore-1");
+    await h.press("\x1b[B", "> explore-1");
     await h.press("\t", "@explore-1");
     await h.press("\r", "The prompt does not target the active session or is blank.");
     expect(calls).toBe(1);

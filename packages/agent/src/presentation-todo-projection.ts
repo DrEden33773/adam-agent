@@ -10,6 +10,7 @@ import {
 /** Completion visibility derives from canonical Main runs, including cold reads and branches. */
 export function projectTodoSummary(
   records: readonly SessionRecord[],
+  includeCurrentRunCompletions = true,
 ): NonNullable<ActiveSessionDisplay["todo"]> {
   const snapshot = todoStoreSnapshotFromRecordsV1(records);
   const statuses = new Map<string, TodoItemV1["status"]>();
@@ -25,6 +26,14 @@ export function projectTodoSummary(
     if (entry.schemaVersion !== 3) continue;
     const record = entry.record;
     if (record.type === "logical_run_started") turnId = record.runId;
+    else if (
+      "runId" in record &&
+      record.runId === turnId &&
+      (record.type === "run_settled" ||
+        (record.type === "runtime_event" &&
+          (record.event.type === "session_settled" || record.event.type === "session_interrupted")))
+    )
+      turnId = null;
     else if (record.type === "todo_store_inherited") {
       if (record.chunkIndex === 0) {
         statuses.clear();
@@ -43,7 +52,8 @@ export function projectTodoSummary(
   }
   const visible = snapshot.items.filter(
     (item) =>
-      item.status !== "completed" || (turnId !== null && completedIn.get(item.id) === turnId),
+      item.status !== "completed" ||
+      (includeCurrentRunCompletions && turnId !== null && completedIn.get(item.id) === turnId),
   );
   // Twelve content lines need at most eleven items of either retention class.
   // Include both prefixes so responsive compression can discard completed items first.
