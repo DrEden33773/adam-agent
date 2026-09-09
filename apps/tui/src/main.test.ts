@@ -8387,8 +8387,9 @@ test("slash Artifacts opens one bounded assistant artifact page", async () => {
       workspaceRoot,
     });
     await fixture.waitForScreen("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitForRecordedOutput("Adam · Streaming session");
+    await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
     const beforeArtifacts = fixture.output().length;
     fixture.write("/artifacts \r");
     const opened = await Promise.race([
