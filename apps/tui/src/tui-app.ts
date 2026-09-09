@@ -312,6 +312,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const created = new Editor(tui, theme.editor, { paddingX: 1 });
     created.setAutocompleteProvider(
       new AdamAutocompleteProvider({
+        getResources: () =>
+          options.presentation.getState().composer.resources.map((resource, index) => ({
+            index: index + 1,
+            label: resource.displayName,
+            status: resource.state,
+          })),
         getThreads: () =>
           options.presentation.getState().authoritative.managedControl?.threads ?? [],
         getMain: () => (options.presentation.getState().agentRoles?.length ?? 0) > 0,
@@ -2870,7 +2876,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const todoSummary =
         active.todo === undefined
           ? ""
-          : ` · Todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
+          : ` · Todo ${active.todo.counts.pending + active.todo.counts.inProgress} remaining${active.todo.blockedCount === 0 ? "" : ` · ${active.todo.blockedCount} blocked`}`;
       const compactPlanSummary =
         active.plan === undefined
           ? ""
@@ -2882,7 +2888,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const compactTodoSummary =
         active.todo === undefined
           ? ""
-          : ` · todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
+          : ` · todo ${active.todo.counts.pending + active.todo.counts.inProgress} remaining${active.todo.blockedCount === 0 ? "" : ` · ${active.todo.blockedCount} blocked`}`;
       const managedAgents = state.authoritative.managedAgents.counts;
       const agentSummary =
         managedAgents.active === 0 && managedAgents.terminal === 0

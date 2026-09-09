@@ -661,6 +661,7 @@ export async function createPresentationSession(
                       records.flatMap((record) =>
                         record.sessionId === created.sessionId ? [record.entry] : [],
                       ),
+                      false,
                     ),
                   }),
               ...(created.plan === undefined ? {} : { plan: created.plan }),
@@ -1845,6 +1846,7 @@ export async function createPresentationSession(
                     activatedRecords.flatMap((record) =>
                       record.sessionId === snapshot.sessionId ? [record.entry] : [],
                     ),
+                    activeRun?.sessionId === snapshot.sessionId && executionFailure === undefined,
                   ),
                 }),
             ...(snapshot.plan === undefined ? {} : { plan: snapshot.plan }),
@@ -2628,6 +2630,7 @@ export async function createPresentationSession(
                     refreshedRecords.flatMap((record) =>
                       record.sessionId === active.session.id ? [record.entry] : [],
                     ),
+                    executionFailure?.sessionId !== notification.sessionId,
                   );
             const effectiveOperations = refreshedOperations.map((operation) => {
               const previousSequence = operationCursors.get(operation.display.operationId) ?? 0;

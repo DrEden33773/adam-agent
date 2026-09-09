@@ -1481,6 +1481,11 @@ function createFixtureModelTargets(options: {
           yield { type: "finish", reason: "tool_calls" };
           return;
         }
+        if (!fidelity && options.controlRoot !== undefined) {
+          await writeFile(join(options.controlRoot, "todo-batch-held"), "held\n", "utf8");
+          if (!(await waitForFile(options.controlRoot, "release-todo-batch", request.signal)))
+            throw request.signal.reason;
+        }
         yield {
           type: "text_delta",
           text: fidelity ? "Todo hierarchy ready." : "Atomic Todo batch completed.",

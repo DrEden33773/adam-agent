@@ -942,9 +942,9 @@ test("Skill completion remains available after one large pasted Text atom", asyn
   try {
     const beforeCompletion = fixture.output().length;
     fixture.write(" Use $fir");
-    await fixture.waitForCompleteFrameAfter("$first", beforeCompletion);
+    await fixture.waitForCompleteFrameAfter("first", beforeCompletion);
     const completionOutput = fixture.output().slice(beforeCompletion);
-    expect(completionOutput).toContain("\u001b[38;2;203;166;247m> $first");
+    expect(completionOutput).toContain("\u001b[38;2;203;166;247m> first");
     expect(stripTerminalSequences(completionOutput)).toContain("project:. · First structured");
     expect(completionOutput).not.toContain("skill:v1:project:.:first");
     fixture.write("\u0011");
@@ -963,18 +963,18 @@ test("Skill completion restores Green and Overlay roles when Mauve selection mov
   try {
     const beforeCompletion = fixture.output().length;
     fixture.write(" Use $");
-    await fixture.waitForCompleteFrameAfter("$beta", beforeCompletion);
+    await fixture.waitForCompleteFrameAfter("beta", beforeCompletion);
     let output = fixture.output().slice(beforeCompletion);
-    expect(output).toContain("\u001b[38;2;203;166;247m> $alpha");
-    expect(output).toContain("\u001b[38;2;166;227;161m$beta\u001b[39m");
+    expect(output).toContain("\u001b[38;2;203;166;247m> alpha");
+    expect(output).toContain("\u001b[38;2;166;227;161mbeta\u001b[39m");
     expectSemanticCompletionRow(output, {
       description: "project:. · alpha completion procedure.",
-      label: "$alpha",
+      label: "alpha",
       selected: true,
     });
     expectSemanticCompletionRow(output, {
       description: "project:. · beta completion procedure.",
-      label: "$beta",
+      label: "beta",
       selected: false,
     });
 
@@ -982,16 +982,16 @@ test("Skill completion restores Green and Overlay roles when Mauve selection mov
     fixture.write("\u001b[B");
     await fixture.resize(79, 24);
     output = fixture.output().slice(beforeMove);
-    expect(output).toContain("\u001b[38;2;166;227;161m$alpha\u001b[39m");
-    expect(output).toContain("\u001b[38;2;203;166;247m> $beta");
+    expect(output).toContain("\u001b[38;2;166;227;161malpha\u001b[39m");
+    expect(output).toContain("\u001b[38;2;203;166;247m> beta");
     expectSemanticCompletionRow(output, {
       description: "project:. · alpha completion procedure.",
-      label: "$alpha",
+      label: "alpha",
       selected: false,
     });
     expectSemanticCompletionRow(output, {
       description: "project:. · beta completion procedure.",
-      label: "$beta",
+      label: "beta",
       selected: true,
     });
     fixture.write("\u0011");
@@ -1029,13 +1029,13 @@ test("NO_COLOR Skill completion retains marker, order, columns, and source label
   try {
     const beforeCompletion = fixture.output().length;
     fixture.write(" Use $");
-    await fixture.waitForCompleteFrameAfter("$beta", beforeCompletion);
+    await fixture.waitForCompleteFrameAfter("beta", beforeCompletion);
     const frame = latestSynchronizedFrame(fixture.output().slice(beforeCompletion));
     const text = frame.join("\n");
-    expect(text).toContain("> $alpha");
-    expect(text).toContain("$beta");
+    expect(text).toContain("> alpha");
+    expect(text).toContain("beta");
     expect(text).toContain("project:. · alpha completion procedure.");
-    expect(text.indexOf("$alpha")).toBeLessThan(text.indexOf("$beta"));
+    expect(text.indexOf("alpha")).toBeLessThan(text.indexOf("beta"));
     expect(frame.every((line) => visibleWidth(line) <= 80)).toBe(true);
     expect(text).not.toContain("\u001b[38;2;");
     expect(text).not.toContain("\u001b[48;2;");
@@ -1054,7 +1054,7 @@ test("Tab accepts one exact Skill atom without changing an adjacent Text atom", 
   });
   try {
     fixture.write(" Use $fir");
-    await fixture.waitForRecordedOutput("$first");
+    await fixture.waitForRecordedOutput("> first");
     const beforeAccept = fixture.output().length;
     fixture.write("\t");
     await fixture.waitForCompleteFrameAfter("Use $first", beforeAccept);
@@ -1074,7 +1074,7 @@ test("Enter accepts one exact Skill atom without submitting an adjacent Text ato
   });
   try {
     fixture.write(" Use $fir");
-    await fixture.waitForRecordedOutput("$first");
+    await fixture.waitForRecordedOutput("> first");
     const beforeAccept = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Use $first", beforeAccept);
@@ -1115,7 +1115,7 @@ test("an accepted path atom stays adjacent to Text and Backspace removes it whol
   });
   try {
     fixture.write(" Inspect @srca");
-    await fixture.waitForRecordedOutput("@alpha.ts");
+    await fixture.waitForRecordedOutput("> alpha.ts");
     const beforeAccept = fixture.output().length;
     fixture.write("\t");
     await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
@@ -4795,7 +4795,7 @@ test("Tab completes and admits a Skill mention from the current first-draft cata
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
     await fixture.waitForScreen("Adam · New session");
     fixture.write("Use $fir");
-    await fixture.waitForRecordedOutput("$first");
+    await fixture.waitForRecordedOutput("> first");
     fixture.write("\t");
     await fixture.waitForRecordedOutput("Use $first");
     fixture.write("\r");
@@ -4844,8 +4844,8 @@ test("accepted Skill completion preserves its exact identity across a recoverabl
     await first.waitForScreen("Adam · New session");
     const beforeCompletion = first.output().length;
     first.write("Use $sha");
-    await first.waitForCompleteFrameAfter("$shared-name", beforeCompletion);
-    const selected = (first.screen() ?? []).find((line) => line.includes("> $shared-name"));
+    await first.waitForCompleteFrameAfter("> shared-name", beforeCompletion);
+    const selected = (first.screen() ?? []).find((line) => line.includes("> shared-name"));
     if (selected !== undefined && !selected.includes("project:.")) {
       first.write("\u001b[B");
       await first.resize(79, 24);
@@ -4907,9 +4907,10 @@ test("a Skill atom navigates as one token and Backspace removes its exact occurr
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
     await fixture.waitForScreen("Adam · New session");
     fixture.write("$fir");
-    await fixture.waitForRecordedOutput("$first");
+    await fixture.waitForRecordedOutput("> first");
+    const beforeAccept = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForRecordedOutput("$first");
+    await fixture.waitForCompleteFrameAfter("$first", beforeAccept);
     fixture.write("\u001b[Dx");
     await fixture.waitForRecordedOutput("x$first");
     fixture.write("\u001b[Cy");
@@ -4944,7 +4945,7 @@ test("Delete immediately before a Skill atom removes the whole occurrence", asyn
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
     await fixture.waitForScreen("Adam · New session");
     fixture.write("$fir");
-    await fixture.waitForRecordedOutput("$first");
+    await fixture.waitForRecordedOutput("> first");
     fixture.write("\ty");
     await fixture.waitForRecordedOutput("$firsty");
     fixture.write("\u001b[D\u001b[D\u001b[3~");
@@ -4983,7 +4984,7 @@ test("copying an accepted Skill atom and pasting those bytes loses identity auth
     });
     await source.waitForScreen("Adam · New session");
     source.write("$fir");
-    await source.waitForRecordedOutput("$first");
+    await source.waitForRecordedOutput("> first");
     const beforeAccept = source.output().length;
     source.write("\t");
     await source.waitForCompleteFrameAfter("$first", beforeAccept);
@@ -4994,8 +4995,9 @@ test("copying an accepted Skill atom and pasting those bytes loses identity auth
 
     const pasted = startFixture({ stateRoot: pastedStateRoot, workspaceRoot });
     await pasted.waitForScreen("Adam · New session");
+    const beforePaste = pasted.output().length;
     pasted.write(`\u001b[200~${copiedText}\u001b[201~`);
-    await pasted.waitForRecordedOutput("$first");
+    await pasted.waitForCompleteFrameAfter("$first", beforePaste);
     pasted.write("\u0011");
     await expect(pasted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const pastedManifest = await readFilesRecursively(join(pastedStateRoot, "drafts"));
@@ -5030,7 +5032,7 @@ test("an unavailable recovered Skill atom stays visible and blocks submission wi
     first.write("\r");
     await first.waitForScreen("Adam · New session");
     first.write("Use $fir");
-    await first.waitForRecordedOutput("$first");
+    await first.waitForRecordedOutput("> first");
     const beforeAccept = first.output().length;
     first.write("\t");
     await first.waitForCompleteFrameAfter("Use $first", beforeAccept);
@@ -7345,24 +7347,24 @@ test("the real TUI opens inline project path completion from the at trigger", as
     await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("Open @");
-    await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
+    await fixture.waitForCompleteFrameAfter("> README.md", beforeCompletion);
     const frame = fixture.output().slice(beforeCompletion);
     let screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+\[File\] README\.md/u);
-    expect(screen).toMatch(/@alpha\.ts\s+\[File\] src\/alpha\.ts/u);
+    expect(screen).toMatch(/README\.md\s+\[File\] README\.md/u);
+    expect(screen).toMatch(/alpha\.ts\s+\[File\] src\/alpha\.ts/u);
 
     await fixture.resize(120, 40);
     screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+\[File\] README\.md/u);
-    expect(screen).toMatch(/@alpha\.ts\s+\[File\] src\/alpha\.ts/u);
+    expect(screen).toMatch(/README\.md\s+\[File\] README\.md/u);
+    expect(screen).toMatch(/alpha\.ts\s+\[File\] src\/alpha\.ts/u);
 
     await fixture.resize(40, 12);
     screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("@README.md");
+    expect(screen).toContain("> README.md");
     expect((fixture.screen() ?? []).every((line) => visibleWidth(line) <= 40)).toBe(true);
     fixture.write("\u0011");
     await fixture.closed;
-    expect(frame).toContain("@README.md");
+    expect(frame).toContain("> README.md");
     expect(frame).not.toContain("Private source bytes.");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -7383,7 +7385,7 @@ test("the real TUI fuzzy-selects one durable project path atom without reading i
     fixture.write("\r");
     await fixture.waitForScreen("Adam · New session");
     fixture.write("Inspect @srca");
-    await fixture.waitForRecordedOutput("@alpha.ts");
+    await fixture.waitForRecordedOutput("> alpha.ts");
     const beforeAccept = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
@@ -7421,7 +7423,7 @@ test("project path insertion renders terminal controls from filenames as inert t
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitForScreen("Adam · New session");
     fixture.write("Inspect @");
-    await fixture.waitForRecordedOutput("@.ts");
+    await fixture.waitForRecordedOutput("> .ts");
     fixture.write("\r");
     await fixture.waitForRecordedOutput("Inspect @src/.ts");
     fixture.write("\u0011");
@@ -8430,7 +8432,7 @@ test("slash Todos opens the authoritative read-only list and exact detail", asyn
     expect(permissionFrame).not.toContain("Allow unavailable");
     fixture.write("\r");
     await fixture.waitForRecordedOutput("Todo fixture created.");
-    await fixture.waitForRecordedOutput("Todo 1/0/0 · 0 blocked");
+    await fixture.waitForRecordedOutput("Todo 1 remaining");
     await fixture.resize(40, 12);
     const beforeTodos = fixture.output().length;
     fixture.write("/todos\r");
@@ -8466,7 +8468,7 @@ test("atomic Todo completion reaches the compact status and read-only navigator"
     const beforeSubmit = fixture.output().length;
     fixture.write("Complete the atomic Todo fixture\r");
     await fixture.waitForCompleteFrameAfter("Atomic Todo batch completed.", beforeSubmit);
-    await fixture.waitForScreen("Todo 0/0/4 · 0 blocked");
+    await fixture.waitForScreen("Todo 0 remaining");
     const beforeList = fixture.output().length;
     fixture.write("/todos\r");
     await fixture.waitForCompleteFrameAfter("Todos · revision 5", beforeList);
@@ -8481,7 +8483,7 @@ test("atomic Todo completion reaches the compact status and read-only navigator"
     await fixture.waitForCompleteFrameAfter("Todos · revision 5", beforeReturn);
     const beforeMain = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForCompleteFrameAfter("Todo 0/0/4 · 0 blocked", beforeMain);
+    await fixture.waitForCompleteFrameAfter("Todo 0 remaining", beforeMain);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -8508,7 +8510,7 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
     await fixture.waitForScreen("Adam · New session");
     fixture.write("Create one active Todo fixture\r");
     await waitForFileContents(join(controlRoot, "todo-active-parent-held"), "held\n");
-    await fixture.waitForRecordedOutput("Todo 1/0/0 · 0 blocked");
+    await fixture.waitForRecordedOutput("Todo 1 remaining");
     await fixture.waitForRecordedOutput("● Todos (0/1)");
     expect(fixture.screen()?.join("\n") ?? "").toContain("● Todos (0/1)");
     expect(fixture.screen()?.join("\n") ?? "").toContain("○ Active Todo fixture");
@@ -9158,6 +9160,38 @@ test("ordinary Enter stays visibly pending until durable admission before provid
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await writeFile(join(controlRoot, "release-prompt"), "release\n").catch(() => {});
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("argument menus complete agents and copy while preserving the command text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-command-arguments-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "settings-decoy.txt"), "decoy");
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitForScreen("Adam · New session");
+    let before = fixture.output().length;
+    fixture.write("/agents ");
+    await fixture.waitForCompleteFrameAfter("Browse agent history", before);
+    before = fixture.output().length;
+    fixture.write("s");
+    await fixture.waitForCompleteFrameAfter("Configure agent views", before);
+    before = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForCompleteFrameAfter("/agents settings", before);
+    expect(fixture.screen()?.join("\n")).not.toContain("settings-decoy.txt");
+    before = fixture.output().length;
+    fixture.write("\u0001\u000b/copy ");
+    await fixture.waitForCompleteFrameAfter("Copy the current draft", before);
+    before = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForCompleteFrameAfter("/copy draft", before);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });

@@ -1134,7 +1134,8 @@ test("Agents history opens each exact turn and keeps closed threads inspectable 
     await h.press("\r", "Input is unavailable");
     expect(h.conversationText()).not.toContain("New turn");
     await h.press("\u001b", "Agents history");
-    await h.press("h", "Agents workspace");
+    // Streaming evidence does not prove the current turn has settled enough to close.
+    await h.press("h", "c close");
     await h.press("c", "c again to close");
     await h.press("c", "Closed");
     await h.press("h", "Agents history");

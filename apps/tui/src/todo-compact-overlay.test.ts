@@ -111,3 +111,28 @@ function todoItem(
     blocked: title === "Run Quality",
   };
 }
+
+test("completed Todo feedback is one line and new or reopened work restores the tree", () => {
+  const view = new TodoCompactViewModel();
+  const overlay = new TodoCompactOverlay(view, createAdamTuiTheme(true));
+  const completed = todoItem("10000000-0000-4000-8000-000000000001", "Read contract", "completed");
+  const set = (
+    items: readonly TodoPageResource["items"][number][],
+    pending: number,
+    done: number,
+  ) =>
+    view.setState({
+      sessionId: "a",
+      turnKey: "one",
+      items,
+      summary: todoSummary({ pending, inProgress: 0, completed: done }, 1),
+    });
+  set([completed], 0, 1);
+  for (const width of [40, 80, 120])
+    expect(overlay.render(width)).toEqual(["✓ Todos (1/1 completed)"]);
+  const created = todoItem("20000000-0000-4000-8000-000000000002", "Verify", "pending");
+  set([completed, created], 1, 1);
+  expect(overlay.render(80)).toContain("└─ ○ Verify");
+  set([{ ...completed, status: "pending" }], 1, 0);
+  expect(overlay.render(80)).toContain("└─ ○ Read contract");
+});

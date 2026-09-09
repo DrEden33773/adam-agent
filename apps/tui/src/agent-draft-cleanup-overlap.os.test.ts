@@ -58,7 +58,7 @@ test.each(["success", "failure"] as const)(
         }),
       ).toMatchObject({ status: "admitted" });
       await started.promise;
-      await h.press("@explore-1", "> [Agent] @explore-1");
+      await h.press("@explore-1", "> explore-1");
       await h.press("\t", "@explore-1");
       await h.press(" Accepted original input.", "Accepted original input.");
       await h.press("\r", "Send to @explore-1");

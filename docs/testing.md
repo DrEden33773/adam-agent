@@ -48,7 +48,7 @@ The ordinary Enter admission test blocks at the durable run boundary and checks 
 
 The text-read OS suite exercises large-file line selection, bounded source scanning, UTF-8/BOM pagination, changed-file rejection, cancellation, and interrupted historical adapter recovery under Plan. Atomic Todo suites cover full-candidate dependency validation, permission decisions, durable commit boundaries, compaction and branch recovery; the TUI suite verifies the resulting compact status and read-only navigator through fresh frames.
 
-Todo fidelity tests cover explicit activeForm/CAS/old profiles, canonical completing-turn visibility on cold read and branch, the pinned 2-of-7 hierarchy, twelve content lines plus spacer, completed-first overflow and grouped navigation. `todo-fidelity.os.test.ts` uses real JSONL and the real TUI with an external fixture model to prove both toggle keys, draft preservation, 40/80/120-column frames, minimum/intermediate heights, NO_COLOR, restart and no Todo mutation from UI actions. The ordinary CLI PTY case checks configured binding discovery and invalid line-budget refusal.
+Todo fidelity tests cover explicit activeForm/CAS/old profiles, canonical active-run completion feedback and terminal hiding on cold read and branch, the pinned 2-of-7 hierarchy, twelve content lines plus spacer, completed-first overflow and grouped navigation. `todo-fidelity.os.test.ts` uses real JSONL and the real TUI with an external fixture model to prove both toggle keys, draft preservation, 40/80/120-column frames, minimum/intermediate heights, NO_COLOR, restart and no Todo mutation from UI actions. The ordinary CLI PTY case checks configured binding discovery and invalid line-budget refusal.
 
 ## Streaming phase diagnostics
 

@@ -37,6 +37,15 @@ export class TodoCompactOverlay implements Component {
     if (!snapshot.visible) {
       return [];
     }
+    if (snapshot.unfinishedCount === 0)
+      return [
+        boundedTodoLine(
+          this.#theme.statusSuccess(
+            `✓ Todos (${snapshot.completedCount}/${snapshot.totalCount} completed)`,
+          ),
+          width,
+        ),
+      ];
     const heading = this.#theme.toolTitle(
       `${snapshot.unfinishedCount > 0 ? "●" : "○"} Todos (${snapshot.completedCount}/${snapshot.totalCount})`,
     );

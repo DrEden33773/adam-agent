@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openJsonlSessionStore, type SessionRecord } from "@adam-agent/agent/internal-testing";
@@ -57,7 +57,7 @@ test.each(["alt+t", "ctrl+shift+t"] as const)(
     };
     try {
       await terminal.waitForScreen("Adam · New session");
-      await press("Prepare the Todo hierarchy\r", "● Todos (2/7)");
+      await press("Prepare the Todo hierarchy\r", "Todo hierarchy ready.");
       await terminal.waitForScreen("Implement owner (Implementing owner)");
       const sessionId = presentation?.getState().authoritative.active?.session.id;
       if (sessionId === undefined) throw new Error("Missing durable Todo Session");
@@ -91,11 +91,11 @@ test.each(["alt+t", "ctrl+shift+t"] as const)(
       ] as const) {
         const before = terminal.output().length;
         terminal.resize(columns, rows);
-        await terminal.waitForFrameAfter("Todos (2/7)", before);
+        await terminal.waitForFrameAfter("Todos (0/5)", before);
         expect(terminal.lines().join("\n").toLowerCase().replace(/\s+/gu, " ")).toContain(
-          "todo 4/1/2",
+          "todo 5 remaining",
         );
-        if (rows === 12) expect(terminal.lines().join("\n")).toContain("7 hidden");
+        if (rows === 12) expect(terminal.lines().join("\n")).toContain("5 hidden");
       }
       await press("/todos\r", "Pending");
       expect(terminal.lines().join("\n")).toContain("In Progress");
@@ -103,17 +103,17 @@ test.each(["alt+t", "ctrl+shift+t"] as const)(
       await press("\r", "Todo detail · read-only");
       expect(terminal.lines().join("\n")).toContain("Implementing owner");
       await press("\u001b[27;1;27~", "Todos · revision");
-      await press("\u001b[27;1;27~", "Todos (2/7)");
+      await press("\u001b[27;1;27~", "Todos (0/5)");
       await press("/hotkeys\r", registry.keybinding("toggle_todo_overlay").keys);
       await press("\u001b[27;1;27~", "Adam Help");
-      await press("\u001b[27;1;27~", "Todos (2/7)");
+      await press("\u001b[27;1;27~", "Todos (0/5)");
       expect(todoRecords(await store.read())).toEqual(baseline);
       if (key === "alt+t") expect(terminal.output()).not.toContain("\u001b[38;2;");
       await closeFixture(terminal, running);
       terminal = new VirtualTerminal({ columns: 80, rows: 24 });
       running = runTuiFixture({ ...options, terminal, sessionId });
       void running.catch(() => undefined);
-      await terminal.waitForScreen("Todos (2/7)");
+      await terminal.waitForScreen("Todos (0/5)");
       expect(terminal.lines().join("\n")).toContain("Implementing owner");
       await press("Continue Main\r", "Next Main ready.");
       await terminal.waitForScreen("Todos (0/5)");
@@ -129,3 +129,41 @@ test.each(["alt+t", "ctrl+shift+t"] as const)(
     }
   },
 );
+
+test("completed Todo feedback occupies one live line and exits on the Main terminal frame", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-todo-completed-frame-"));
+  const workspaceRoot = join(root, "workspace");
+  const controlRoot = join(root, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new VirtualTerminal({ columns: 80, rows: 24 });
+  const running = runTuiFixture({
+    workspaceRoot,
+    stateRoot: join(root, "state"),
+    controlRoot,
+    scenario: "todo-batch",
+    terminal,
+  });
+  void running.catch(() => undefined);
+  try {
+    await terminal.waitForScreen("Adam · New session");
+    const before = terminal.output().length;
+    terminal.input("Complete the Todo batch\r");
+    await terminal.waitForFrameAfter("✓ Todos (4/4 completed)", before);
+    const lines = terminal.lines();
+    expect(lines.filter((line) => line.includes("Todos ("))).toHaveLength(1);
+    expect(lines.some((line) => /[└├]─ ✓ Atomic Task/u.test(line))).toBe(false);
+    const terminalBefore = terminal.output().length;
+    await writeFile(join(controlRoot, "release-todo-batch"), "release\n", "utf8");
+    await terminal.waitForFrameAfter("Atomic Todo batch completed.", terminalBefore);
+    await terminal.waitForScreen("idle");
+    expect(terminal.lines().join("\n")).not.toContain("Todos (");
+    const historyBefore = terminal.output().length;
+    terminal.input("/todos\r");
+    await terminal.waitForFrameAfter("Atomic Task 0", historyBefore);
+    expect(terminal.lines().join("\n")).toContain("Atomic Task 0");
+  } finally {
+    await closeFixture(terminal, running);
+    await rm(root, { recursive: true, force: true });
+  }
+});

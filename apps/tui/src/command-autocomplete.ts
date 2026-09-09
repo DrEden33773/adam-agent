@@ -64,6 +64,11 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly triggerCharacters = ["$", "@"];
   readonly #getAttachmentsAvailable: () => boolean;
   readonly #getProjectPaths: () => readonly string[];
+  readonly #getResources: () => readonly {
+    readonly index: number;
+    readonly label: string;
+    readonly status: string;
+  }[];
   readonly #getRunActive: () => boolean;
   readonly #getSkills: () => readonly SkillCompletion[];
   readonly #getThinkingLevelIds: () => readonly string[];
@@ -79,6 +84,11 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     readonly getRoles?: () => NonNullable<PresentationDisplayState["agentRoles"]>;
     readonly getAttachmentsAvailable?: () => boolean;
     readonly getProjectPaths: () => readonly string[];
+    readonly getResources?: () => readonly {
+      readonly index: number;
+      readonly label: string;
+      readonly status: string;
+    }[];
     readonly getRunActive: () => boolean;
     readonly getSkills: () => readonly SkillCompletion[];
     readonly getThinkingLevelIds?: () => readonly string[];
@@ -93,6 +103,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     this.#getMain = options.getMain ?? (() => false);
     this.#mention = options.mention ?? ((text) => text);
     this.#getProjectPaths = options.getProjectPaths;
+    this.#getResources = options.getResources ?? (() => []);
     this.#getRunActive = options.getRunActive;
     this.#getSkills = options.getSkills;
     this.#getThinkingLevelIds = options.getThinkingLevelIds ?? (() => []);
@@ -149,6 +160,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         }));
       return Promise.resolve(items.length === 0 ? null : { items, prefix: beforeCursor });
     }
+    let pathArgument = false;
     const helpPrefix =
       cursorLine === 0 ? /^\/help[ \t]+([^\s]*)$/.exec(beforeCursor)?.[1] : undefined;
     if (helpPrefix !== undefined) {
@@ -164,7 +176,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         helpItems.length === 0 ? null : { items: helpItems, prefix: helpPrefix },
       );
     }
-    const argumentMatch = cursorLine === 0 ? /^\/([a-z]+)[ \t]+(.*)$/u.exec(beforeCursor) : null;
+    const argumentMatch =
+      cursorLine === 0 ? /^\/([a-z]+(?:-[a-z]+)*)[ \t]+(.*)$/u.exec(beforeCursor) : null;
     if (argumentMatch !== null) {
       const commandName = argumentMatch[1] ?? "";
       const argumentsText = argumentMatch[2] ?? "";
@@ -183,6 +196,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         attachmentsAvailable: this.#getAttachmentsAvailable(),
         runActive,
         thinkingLevelIds: this.#getThinkingLevelIds(),
+        resources: this.#getResources(),
       });
       const completion = resolution.kind === "owned" ? resolution.completion : null;
       if (completion?.exact === true) {
@@ -198,24 +212,28 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
                 description: safeTerminalText(skill.description),
               }))
           : [];
-      const items = [...(completion?.items ?? []), ...skillItems];
+      const items = [...(completion?.items ?? []), ...skillItems].map((item) => ({
+        ...item,
+        description: safeTerminalText(item.description ?? ""),
+      }));
       if (items.length > 0) {
         return Promise.resolve({ items, prefix: completion?.prefix ?? argumentsText });
       }
-      if (resolution.kind === "owned") {
+      if (resolution.kind !== "path") {
         return Promise.resolve(null);
       }
+      pathArgument = true;
     }
     const mention = /(?:^|[^A-Za-z0-9_$\\])(\$([a-z0-9-]*))$/u.exec(beforeCursor);
     const mentionPrefix = mention?.[1];
     const mentionNamePrefix = mention?.[2];
-    if (mentionPrefix !== undefined && mentionNamePrefix !== undefined) {
+    if (!pathArgument && mentionPrefix !== undefined && mentionNamePrefix !== undefined) {
       const skillItems = this.#getSkills()
         .filter((skill) => skill.name.startsWith(mentionNamePrefix))
         .map<SkillAutocompleteItem>((skill) => ({
           adamSkill: { name: skill.name, qualifiedId: skill.qualifiedId },
           value: `$${skill.name}`,
-          label: this.#skill(`$${skill.name}`),
+          label: this.#skill(safeTerminalText(skill.name)),
           description: safeTerminalText(`${skillSourceLabel(skill.source)} · ${skill.description}`),
         }));
       return Promise.resolve(
@@ -225,7 +243,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     const pathMention = /(?:^|\s)(@([^\s@]*))$/u.exec(beforeCursor);
     const pathPrefix = pathMention?.[1];
     const pathValuePrefix = pathMention?.[2];
-    if (pathPrefix !== undefined && pathValuePrefix !== undefined) {
+    if (!pathArgument && pathPrefix !== undefined && pathValuePrefix !== undefined) {
       const normalizedPrefix = pathValuePrefix.toLocaleLowerCase();
       const candidates = this.#getProjectPaths()
         .map((path, index) => {
@@ -241,7 +259,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         return {
           adamPath: { path: safePath },
           value: `@${safePath}`,
-          label: this.#path(`[File] @${columns.fileName}`),
+          label: this.#path(columns.fileName),
           description: `[File] ${safePath}`,
         };
       });
@@ -270,8 +288,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
             definitionDigest: role.definitionDigest,
           } satisfies AtMentionAtom,
           value: `@${alias}`,
-          label: this.#mention(`New agent ${safeTerminalText(`@${alias}`)}`),
-          description: `New agent · ${safeTerminalText(role.description)}`,
+          label: this.#mention(safeTerminalText(role.name)),
+          description: `New agent · ${safeTerminalText(role.description)} · ${safeTerminalText(role.qualifiedId)}`,
         }));
       const threads = this.#getThreads()
         .filter((thread) => thread.lifecycle === "open")
@@ -290,7 +308,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
                 handle: thread.handle,
               } satisfies AtMentionAtom,
               value: literal,
-              label: this.#mention(`[Agent] ${safeTerminalText(literal)}`),
+              label: this.#mention(safeTerminalText(literal.replace(/^@/u, ""))),
               description: `[Agent] ${safeTerminalText(thread.handle)} · ${safeTerminalText(thread.description)} · ${safeTerminalText(thread.turn.label)}`,
             })),
         );
@@ -304,7 +322,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
                   literal: "@main",
                 } satisfies AtMentionAtom,
                 value: "@main",
-                label: this.#mention(`[Agent] @main`),
+                label: this.#mention("main"),
                 description: "[Agent] @main · Main conversation",
               },
             ]
@@ -312,7 +330,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       const items = [...roles, ...threads, ...main, ...pathItems];
       return Promise.resolve(items.length === 0 ? null : { items, prefix: pathPrefix });
     }
-    if (options.force !== true) {
+    if (options.force !== true && !pathArgument) {
       return Promise.resolve(null);
     }
     const prefix = beforeCursor.match(/(?:^|\s)([^\s]*)$/)?.[1] ?? "";
