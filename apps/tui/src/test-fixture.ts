@@ -1763,6 +1763,11 @@ function createFixtureModelTargets(options: {
           type: "text_delta",
           text: `Assistant artifact page one\n${"a".repeat(20_000)}\nAssistant artifact page two\n${"b".repeat(250_000)}${responseIdentity}`,
         };
+      } else if (options.scenario === "scroll-viewport") {
+        yield {
+          type: "text_delta",
+          text: `\`\`\`text\n${Array.from({ length: 120 }, (_, index) => `MAIN_SCROLL_${String(index).padStart(3, "0")}`).join("\n")}\n\`\`\``,
+        };
       } else if (options.scenario === "copy-large-assistant") {
         yield {
           type: "text_delta",

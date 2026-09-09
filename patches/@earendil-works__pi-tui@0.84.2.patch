@@ -1083,7 +1083,7 @@ index 848119411c1ff2885b8d1efe97f2f297bd4cd470..c49053c1e2060b5e2ebb11210debde0b
      private readonly searchCurrentMatchStyle;
      private readonly openUrl?;
 diff --git a/dist/tui-alt-screen.js b/dist/tui-alt-screen.js
-index 4edcf845ba7866782a8ec7219508a2dce0073a91..8a0c375cec7bbb80c1b2e97279ab3b128434e75a 100644
+index 4edcf845ba7866782a8ec7219508a2dce0073a91..364f2e14cbd4e8bc7890d89686da0a45b235792c 100644
 --- a/dist/tui-alt-screen.js
 +++ b/dist/tui-alt-screen.js
 @@ -59,6 +59,7 @@ export class TuiAltScreen extends TuiBase {
@@ -1102,6 +1102,15 @@ index 4edcf845ba7866782a8ec7219508a2dce0073a91..8a0c375cec7bbb80c1b2e97279ab3b12
          this.searchMatchStyle = options.searchMatchStyle ?? ((text) => `\x1b[4m${text}\x1b[24m`);
          this.searchCurrentMatchStyle = options.searchCurrentMatchStyle ?? ((text) => `\x1b[1;7m${text}\x1b[22;27m`);
          this.openUrl = options.openUrl;
+@@ -406,7 +408,7 @@ export class TuiAltScreen extends TuiBase {
+             if (this.shouldDeferViewportInputToOverlay())
+                 return undefined;
+             this.routeWheel(wheelEvent);
+-            return { consume: true };
++            return { consume: true, immediateRender: true };
+         }
+         const mouseEvent = this.parseSgrMouseEvent(data);
+         if (mouseEvent) {
 @@ -423,7 +425,12 @@ export class TuiAltScreen extends TuiBase {
              return { consume: true };
          const keybindings = getKeybindings();
@@ -1116,6 +1125,70 @@ index 4edcf845ba7866782a8ec7219508a2dce0073a91..8a0c375cec7bbb80c1b2e97279ab3b12
              if (!isRelease)
                  this.openSearch();
              return { consume: true };
+@@ -451,53 +458,53 @@ export class TuiAltScreen extends TuiBase {
+             if (!isRelease) {
+                 this.scrollBy(-Math.max(1, this.getPrimaryScrollView().viewportHeight - PAGE_SCROLL_OVERLAP));
+             }
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.pageDown")) {
+             if (!isRelease) {
+                 this.scrollBy(Math.max(1, this.getPrimaryScrollView().viewportHeight - PAGE_SCROLL_OVERLAP));
+             }
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.halfPageUp")) {
+             if (!isRelease)
+                 this.scrollBy(-Math.max(1, Math.floor(this.getPrimaryScrollView().viewportHeight / 2)));
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.halfPageDown")) {
+             if (!isRelease)
+                 this.scrollBy(Math.max(1, Math.floor(this.getPrimaryScrollView().viewportHeight / 2)));
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.lineUp")) {
+             if (!isRelease)
+                 this.scrollBy(-1);
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.lineDown")) {
+             if (!isRelease)
+                 this.scrollBy(1);
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.previousPrompt")) {
+             if (!isRelease)
+                 this.scrollToPrompt(-1);
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.nextPrompt")) {
+             if (!isRelease)
+                 this.scrollToPrompt(1);
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.top")) {
+             if (!isRelease)
+                 this.scrollToTop();
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         if (keybindings.matches(data, "tui.altScreen.bottom")) {
+             if (!isRelease)
+                 this.scrollToBottom();
+-            return { consume: true };
++            return { consume: true, immediateRender: !isRelease };
+         }
+         return undefined;
+     }
 @@ -824,7 +831,6 @@ export class TuiAltScreen extends TuiBase {
                  this.requestRender();
                  return;
@@ -1137,3 +1210,29 @@ index 4edcf845ba7866782a8ec7219508a2dce0073a91..8a0c375cec7bbb80c1b2e97279ab3b12
          let sourceLines = this.previousScreen;
          if (selection.start.scrollView) {
              if (!this.currentLayout)
+diff --git a/dist/tui.d.ts b/dist/tui.d.ts
+index 5b9b224586c313d8e3d42c9a2f0f05b7a1107f40..812a596eb8fc6b2bb8d280dbe46f8b5fe410ce58 100644
+--- a/dist/tui.d.ts
++++ b/dist/tui.d.ts
+@@ -30,6 +30,8 @@ export interface Component {
+     invalidate(): void;
+ }
+ export type TuiInputListenerResult = {
++    /** Render consumed user input on the same immediate path as focused input. */
++    immediateRender?: boolean;
+     consume?: boolean;
+     data?: string;
+ } | undefined;
+diff --git a/dist/tui.js b/dist/tui.js
+index 94adbdcffd98b770d34ee55771f57ec8004df2eb..13db4bb16728fd0d1a1f03657ce91baab368abe7 100644
+--- a/dist/tui.js
++++ b/dist/tui.js
+@@ -562,6 +562,8 @@ export class TuiBase extends Container {
+             for (const listener of this.inputListeners) {
+                 const result = listener(current);
+                 if (result?.consume) {
++                    if (result.immediateRender)
++                        this.requestImmediateRender();
+                     return;
+                 }
+                 if (result?.data !== undefined) {
