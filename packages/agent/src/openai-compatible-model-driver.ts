@@ -1,9 +1,7 @@
-import OpenAI, {
-  APIConnectionError,
-  APIError,
-  APIUserAbortError,
-  AuthenticationError,
-} from "openai";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import type OpenAI from "openai";
+import type { APIError } from "openai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -52,6 +50,7 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
       throw new RangeError("The model request deadline must be a positive safe integer.");
     }
+    const { default: OpenAI } = loadOpenAiSdk();
     this.#client = new OpenAI({
       apiKey: options.apiKey,
       baseURL: options.baseURL,
@@ -374,6 +373,7 @@ function classifyModelDriverError(
   error: unknown,
   sensitiveValues: readonly string[],
 ): ModelDriverError {
+  const { APIConnectionError, APIError, APIUserAbortError, AuthenticationError } = loadOpenAiSdk();
   if (error instanceof APIUserAbortError) {
     return new ModelDriverError("aborted", "The model provider request was aborted.", {
       cause: error,
@@ -547,4 +547,10 @@ function mapMessage(message: ModelMessage, isDeepSeekV4: boolean): ChatCompletio
         content: JSON.stringify(message.result),
       };
   }
+}
+
+function loadOpenAiSdk(): typeof import("openai") {
+  // Node 24 can require this synchronous ESM entry. Resolve with ESM conditions so
+  // SDK errors retain the same identity as errors imported by public consumers.
+  return createRequire(import.meta.url)(fileURLToPath(import.meta.resolve("openai")));
 }

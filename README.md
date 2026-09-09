@@ -6,14 +6,15 @@ Adam Agent is a lightweight, inspectable TypeScript coding agent for local softw
 
 ## Quick start
 
-Adam supports Linux with Node.js 24 and pnpm 11. Clone the source, enable the package manager declared by the repository, install the frozen lockfile, and launch the TUI:
+Adam supports Linux with Node.js 24 and pnpm 11. Clone the source, enable the package manager declared by the repository, install the frozen lockfile, build once, and launch the TUI:
 
 ```bash
 git clone https://github.com/DrEden33773/adam-agent.git
 cd adam-agent
 corepack enable
 pnpm install --frozen-lockfile
-pnpm tui
+pnpm build
+node apps/tui/dist/main.js
 ```
 
 The TUI lists durable sessions first and otherwise offers an explicit target picker. For a deterministic local headless check with no provider credential, use an isolated state root:
@@ -22,7 +23,16 @@ The TUI lists durable sessions first and otherwise offers an explicit target pic
 ADAM_AGENT_STATE_ROOT="$(mktemp -d)" ADAM_AGENT_TARGET=fake.local pnpm --silent adam "What is this repository?"
 ```
 
-Run `pnpm tui --help` or `pnpm --silent adam --help` for copyable entry and lifecycle commands. Live Direct DeepSeek setup remains below.
+For source development, `pnpm tui` and `pnpm adam` refresh the build before launching. After `pnpm build`, `node apps/tui/dist/main.js` and `node apps/cli/dist/main.js` run the existing output without a package manager or compilation. Rebuild after source changes. The `pnpm tui:run` and `pnpm adam:run` shortcuts also use existing output, but still pass through pnpm and its dependency validation.
+
+To open another project, keep that project as your current directory and invoke the absolute entry path:
+
+```bash
+cd /path/to/your-project
+node /path/to/adam-agent/apps/tui/dist/main.js
+```
+
+Adam reads that project's `.env` and uses your user configuration directory; the application checkout does not become the project. Help and invalid arguments are handled before runtime or renderer loading. Run `node apps/tui/dist/main.js --help` or `node apps/cli/dist/main.js --help` from the built checkout for entry and lifecycle commands. Live Direct DeepSeek setup remains below.
 
 ## Evidence
 
