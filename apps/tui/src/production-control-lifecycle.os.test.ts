@@ -239,7 +239,8 @@ test("ordinary blank Plan draft confirms Research and exact Web authority before
     expect(mainRequests).toEqual([]);
     expect(childRequests).toEqual([]);
     expect(fetched).toEqual([]);
-    await h.press("\r", "Attention Center");
+    await h.press("\r", "1 pending");
+    await h.press("\u001ba", "Attention Center");
     await h.waitForState(
       () =>
         h.presentation

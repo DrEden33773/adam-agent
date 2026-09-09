@@ -49,6 +49,7 @@ export type AdamCommandDefinition = {
 };
 
 export type AdamKeybindingAction =
+  | "open_attention"
   | "back"
   | "exit"
   | "fork_from_target"
@@ -617,6 +618,13 @@ type KeybindingProjection = {
 );
 
 const keybindingProjections: readonly KeybindingProjection[] = [
+  {
+    action: "open_attention",
+    adamInputs: ["alt+a"],
+    keys: "Alt+A",
+    description: "Open pending permissions and replies; defer a Main permission panel",
+    section: "application",
+  },
   {
     action: "toggle_todo_overlay",
     adamInputs: ["alt+t"],

@@ -6845,7 +6845,7 @@ test("active-run finite argument families stay unavailable without forced path f
   }
 });
 
-test("permission preempts Help and restores its exact page after settlement", async () => {
+test("permission preserves Help until Alt+A and restores its exact page after settlement", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-permission-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -6868,8 +6868,27 @@ test("permission preempts Help and restores its exact page after settlement", as
     await fixture.waitForRecordedOutput("Show the fixed effective keyboard map.");
     fixture.write("\t\r");
     await fixture.waitForRecordedOutput("Effective Hotkeys");
+    const beforeRequest = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitForCompleteFrameAfter("1 pending", beforeRequest, "Permission required");
+    fixture.write("\u001ba");
     await fixture.waitForRecordedOutput("Permission required");
+    let beforeDefer = fixture.output().length;
+    fixture.write("\u001ba");
+    await fixture.waitForCompleteFrameAfter(
+      "Effective Hotkeys",
+      beforeDefer,
+      "Permission required",
+    );
+    beforeDefer = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await fixture.waitForCompleteFrameAfter(
+      "Effective Hotkeys",
+      beforeDefer,
+      "Permission required",
+    );
+    fixture.write("\u001ba");
+    await fixture.waitForCompleteFrameAfter("Permission required", beforeDefer);
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForRecordedOutput("Effective Hotkeys", beforeRestore);
@@ -6911,6 +6930,8 @@ test("permission settlement restores an existing ordinary overlay as the exact f
 
     const beforePermission = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitForCompleteFrameAfter("1 pending", beforePermission, "Permission required");
+    fixture.write("\u001ba");
     await fixture.waitForCompleteFrameAfter("Permission required", beforePermission);
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");

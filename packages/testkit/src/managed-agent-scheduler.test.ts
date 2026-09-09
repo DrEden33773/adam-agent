@@ -2743,3 +2743,42 @@ test("a funded candidate closing request uses existing evidence and records its 
     await f.close();
   }
 });
+
+test.each(["all", "any"] as const)(
+  "live %s waits expose exact targets and disappear on cancellation",
+  async (mode) => {
+    const f = await schedulerFixture({
+      async *stream(request) {
+        await new Promise<void>((resolve) => {
+          if (request.signal.aborted) resolve();
+          else request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        yield { type: "finish", reason: "stop" };
+      },
+    });
+    const abort = new AbortController();
+    try {
+      expect(await f.control.dispatch(batch(2))).toMatchObject({ status: "admitted" });
+      const targets = (await f.control.inspect({ parentSessionId })).threads.map((thread) => ({
+        threadId: thread.threadId,
+        expectedTurnId: thread.turn.turnId,
+      }));
+      const observed = observeUntil(f.control, (snapshot) => snapshot.waits?.length === 1);
+      const pending = f.control.dispatch(
+        { type: "wait_agents", parentSessionId, targets, mode },
+        { signal: abort.signal },
+      );
+      await observed;
+      expect((await f.control.inspect({ parentSessionId })).waits).toEqual([{ mode, targets }]);
+      const settled = observeUntil(f.control, (snapshot) => snapshot.waits?.length === 0);
+      abort.abort();
+      expect(await pending).toMatchObject({ status: "rejected", code: "action_unavailable" });
+      await settled;
+      expect((await f.control.inspect({ parentSessionId })).waits).toEqual([]);
+      expect((await f.control.inspect({ parentSessionId })).completions).toEqual([]);
+    } finally {
+      abort.abort();
+      await f.close();
+    }
+  },
+);

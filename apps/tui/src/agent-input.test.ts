@@ -189,8 +189,8 @@ test("child composer answers the exact Parent input request without a Main turn"
       }),
     ).toMatchObject({ status: "admitted" });
     await h.terminal.waitForScreen("Waiting for you");
-    await h.terminal.waitForScreen("Attention Center");
-    await h.press("\u001b[27u", "Attention pending");
+    await h.press("\u001ba", "Attention Center");
+    await h.press("\u001b[27u", "1 pending", "Attention Center");
     await h.openFirstAgent();
     expect(h.conversationText()).toContain("Which scope should I inspect?");
     await h.press("\r", "Reply to parent input");

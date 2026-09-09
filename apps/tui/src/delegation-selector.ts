@@ -7,6 +7,8 @@ import type {
 import {
   type Component,
   Input,
+  isKeyRelease,
+  isKeyRepeat,
   matchesKey,
   SelectList,
   truncateToWidth,
@@ -29,6 +31,7 @@ export class DelegationSelector implements Component {
   #selected = new Set<number>();
   #page: "review" | "context" | "messages" | "skills" | "limits" | "identity" | "custom" = "review";
   #pending = false;
+  #rendered = false;
   #notice = "";
   #description: string;
   #descriptionInput: Input | undefined;
@@ -43,6 +46,7 @@ export class DelegationSelector implements Component {
       readonly messages?: readonly ManagedDelegationMessage[];
       readonly canChangeMode?: boolean;
       readonly theme: AdamTuiTheme;
+      readonly deferHint?: string;
       readonly onConfirm: (
         envelope: ManagedDelegationEnvelope,
         context: ManagedDelegationContext,
@@ -520,7 +524,13 @@ export class DelegationSelector implements Component {
       });
   }
   handleInput(data: string): void {
-    if (this.#pending) return;
+    if (
+      this.#pending ||
+      !this.#rendered ||
+      isKeyRelease(data) ||
+      (isKeyRepeat(data) && (matchesKey(data, "enter") || matchesKey(data, "escape")))
+    )
+      return;
     if (this.#numericInput !== undefined) {
       if (matchesKey(data, "escape")) this.#numericInput = undefined;
       else this.#numericInput.handleInput(data);
@@ -532,7 +542,11 @@ export class DelegationSelector implements Component {
   invalidate(): void {
     this.#list.invalidate();
   }
+  get isSubmitting(): boolean {
+    return this.#pending;
+  }
   render(width: number): string[] {
+    this.#rendered = true;
     const { theme } = this.options;
     if (this.#numericInput !== undefined) {
       const bound = this.#numericBound(this.#numericField);
@@ -585,6 +599,9 @@ export class DelegationSelector implements Component {
                   ? "Execution and limits"
                   : "Select parent messages",
       ),
+      ...(this.options.deferHint === undefined
+        ? []
+        : [truncateToWidth(this.options.deferHint, width)]),
       truncateToWidth(safeTerminalText(this.#description), width),
       truncateToWidth(
         `${envelope.mode} · ${envelope.threads} thread · ${envelope.running} running`,

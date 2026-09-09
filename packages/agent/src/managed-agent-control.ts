@@ -571,6 +571,7 @@ export function createManagedAgentControl(options: {
     }
   >();
   const subscribers = new Set<(frame: ManagedWorkspaceFrame) => void>();
+  const liveWaits = new Set<NonNullable<ManagedWorkspaceSnapshot["waits"]>[number]>();
   const serialized = <T>(operation: () => Promise<T>): Promise<T> => {
     const next = serial.then(operation);
     serial = next.then(
@@ -912,6 +913,7 @@ export function createManagedAgentControl(options: {
       policy: structuredClone(policy),
       threads,
       storage: await storageUsage(records, undefined, true),
+      waits: [...liveWaits],
       budget: fleetBudget(
         records,
         fleetSessionCeiling(records, policy),
@@ -934,6 +936,10 @@ export function createManagedAgentControl(options: {
     return {
       ...snapshot,
       threads,
+      waits:
+        snapshot.waits?.filter((wait) =>
+          wait.targets.every((target) => ids.has(target.threadId)),
+        ) ?? [],
       completions: snapshot.completions.filter((completion) => ids.has(completion.threadId)),
       ...(snapshot.exports === undefined
         ? {}
@@ -3164,7 +3170,12 @@ export function createManagedAgentControl(options: {
       const abort = () => observer.abort();
       if (dispatchOptions?.signal?.aborted) observer.abort();
       else dispatchOptions?.signal?.addEventListener("abort", abort, { once: true });
+      const wait = { mode: command.mode, targets: command.targets };
+      liveWaits.add(wait);
       try {
+        const waitingSnapshot = await control.inspect({ parentSessionId: command.parentSessionId });
+        for (const subscriber of subscribers)
+          subscriber({ type: "reset", snapshot: waitingSnapshot });
         for await (const frame of control.observe({
           parentSessionId: command.parentSessionId,
           signal: observer.signal,
@@ -3195,8 +3206,12 @@ export function createManagedAgentControl(options: {
         }
         return rejected("action_unavailable", "The wait was cancelled.");
       } finally {
+        liveWaits.delete(wait);
         observer.abort();
         dispatchOptions?.signal?.removeEventListener("abort", abort);
+        const settledSnapshot = await control.inspect({ parentSessionId: command.parentSessionId });
+        for (const subscriber of subscribers)
+          subscriber({ type: "reset", snapshot: settledSnapshot });
       }
     }
     if (command.type === "reply_agent") {
