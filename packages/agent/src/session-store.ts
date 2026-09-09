@@ -1149,6 +1149,8 @@ export interface SessionStoreDirectoryEntry {
 
 export interface SessionStoreDirectory<RecordType extends SessionRecord = SessionRecord> {
   byteLength?(sessionId: string): Promise<number | undefined>;
+  /** Read and validate a fresh record snapshot without opening an append-capable store. */
+  readRecords?(sessionId: string): Promise<readonly RecordType[] | undefined>;
   create(sessionId: string): Promise<SessionStore<RecordType>>;
   listSessionEntries(): Promise<readonly SessionStoreDirectoryEntry[]>;
   listSessionIds(): Promise<readonly string[]>;
@@ -3601,6 +3603,12 @@ export function createJsonlSessionStoreDirectory<
         }
         throw error;
       }
+    },
+    async readRecords(sessionId) {
+      validateSessionId(sessionId);
+      const sessionPath = await resolveSessionPath({ ...options, sessionId });
+      const log = await readLog(sessionPath);
+      return log?.records as readonly RecordType[] | undefined;
     },
     async open(sessionId) {
       validateSessionId(sessionId);

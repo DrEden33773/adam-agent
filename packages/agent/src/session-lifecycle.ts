@@ -197,6 +197,7 @@ import {
   type ModelResponseArtifactInspection,
   planCycleSnapshotFromRecords,
   promptContextRecordFromRecords,
+  type SessionNamingHistoryState,
   sessionNamingStateFromRecords,
   skillContextRecordFromRecords,
   skillResourceBytesFromRecords,
@@ -569,6 +570,19 @@ export type ProjectSessionCatalogPage = {
   readonly diagnostics: SessionHistoryDiagnostics;
 };
 
+export type ProjectSessionSummary =
+  | Exclude<SessionSnapshot, CurrentSessionSnapshot>
+  | (Pick<
+      CurrentSessionSnapshot,
+      "schemaVersion" | "sessionId" | "projectId" | "lastSequence" | "status" | "targetIdentity"
+    > & {
+      readonly naming: SessionNamingHistoryState;
+    });
+
+export type ProjectSessionSummaryPage = Omit<ProjectSessionCatalogPage, "items"> & {
+  readonly items: readonly ProjectSessionSummary[];
+};
+
 export type SessionHistoryDiagnosticCode = "invalid_history" | "invalid_log" | "log_too_large";
 
 export type SessionHistoryDiagnostic = {
@@ -929,6 +943,11 @@ export interface SessionLifecycle {
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<ProjectSessionCatalogPage>;
+  /** Display metadata from the full validated catalog; opening a session still requires inspect/resume. */
+  listProjectSessionSummaries(input?: {
+    readonly cursor?: string;
+    readonly limit?: number;
+  }): Promise<ProjectSessionSummaryPage>;
   previewNewSession(input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
@@ -2528,7 +2547,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   ): Promise<SessionSnapshot> => {
     const records: readonly SessionRecord[] =
       suppliedRecords === undefined
-        ? await storeDirectory.open(input.sessionId).then((store) => store?.read() ?? [])
+        ? await readSessionRecords(options, input.sessionId)
         : suppliedRecords;
     const first = records[0];
     if (first === undefined) {
@@ -3230,6 +3249,110 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
     }
     return plan;
+  };
+
+  const collectProjectSessionCatalog = async (input: {
+    readonly cursor?: string;
+    readonly limit?: number;
+  }) => {
+    const limit = input.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
+    const projectId = await canonicalProjectId(options.workspaceRoot);
+    const directoryEntries = await storeDirectory.listSessionEntries();
+    const catalogEntries: Array<{
+      readonly sessionId: string;
+      readonly modifiedAtMilliseconds: number;
+      readonly snapshot: SessionSnapshot;
+      readonly naming: SessionNamingHistoryState;
+    }> = [];
+    const diagnostics: SessionHistoryDiagnostic[] = [];
+    for (const entry of directoryEntries) {
+      let records: readonly SessionRecord[];
+      try {
+        records = await readSessionRecords(options, entry.sessionId);
+      } catch (error) {
+        const diagnostic = sessionHistoryDiagnosticFromError(entry.sessionId, error);
+        if (diagnostic === undefined) {
+          throw error;
+        }
+        diagnostics.push(diagnostic);
+        continue;
+      }
+      if (
+        !records.some((entry) =>
+          entry.schemaVersion === 3
+            ? entry.record.type === "logical_run_started"
+            : entry.event.type === "user_message",
+        )
+      ) {
+        continue;
+      }
+      try {
+        // Keep the fresh authoritative boundary after admission filtering. The
+        // same validated version supplies both the full snapshot and its naming.
+        const freshRecords = await readSessionRecords(options, entry.sessionId);
+        if (
+          !freshRecords.some((record) =>
+            record.schemaVersion === 3
+              ? record.record.type === "logical_run_started"
+              : record.event.type === "user_message",
+          )
+        )
+          continue;
+        const snapshot = await inspectSession(
+          { sessionId: entry.sessionId },
+          undefined,
+          freshRecords,
+        );
+        catalogEntries.push({
+          ...entry,
+          snapshot,
+          naming: sessionNamingStateFromRecords(freshRecords),
+        });
+      } catch (error) {
+        if (error instanceof SessionLifecycleError && error.code === "session_not_found") {
+          continue;
+        }
+        const diagnostic = sessionHistoryDiagnosticFromError(entry.sessionId, error);
+        if (diagnostic === undefined) {
+          throw error;
+        }
+        diagnostics.push(diagnostic);
+      }
+    }
+    catalogEntries.sort(
+      (left, right) =>
+        right.modifiedAtMilliseconds - left.modifiedAtMilliseconds ||
+        (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0),
+    );
+    const cursorIndex =
+      afterSessionId === undefined
+        ? -1
+        : catalogEntries.findIndex((entry) => entry.sessionId === afterSessionId);
+    const start =
+      afterSessionId === undefined ? 0 : cursorIndex < 0 ? catalogEntries.length : cursorIndex + 1;
+    const selectedEntries = catalogEntries.slice(start, start + limit);
+    const selectedIds = selectedEntries.map((entry) => entry.sessionId);
+    const lastSessionId = selectedIds.at(-1);
+    diagnostics.sort((left, right) =>
+      left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
+    );
+    return {
+      projectId,
+      items: selectedEntries,
+      nextCursor:
+        lastSessionId !== undefined && start + selectedIds.length < catalogEntries.length
+          ? encodeProjectSessionCatalogCursor(lastSessionId)
+          : null,
+      diagnostics: {
+        items: diagnostics.slice(0, 100),
+        totalCount: diagnostics.length,
+        truncated: diagnostics.length > 100,
+      },
+    };
   };
 
   return {
@@ -5576,89 +5699,27 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
     },
     async listProjectSessions(input = {}) {
-      const limit = input.limit ?? 100;
-      if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
-        throw new SessionLifecycleError("session_invalid");
-      }
-      const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
-      const projectId = await canonicalProjectId(options.workspaceRoot);
-      const directoryEntries = await storeDirectory.listSessionEntries();
-      const catalogEntries: Array<{
-        readonly sessionId: string;
-        readonly modifiedAtMilliseconds: number;
-        readonly snapshot: SessionSnapshot;
-      }> = [];
-      const diagnostics: SessionHistoryDiagnostic[] = [];
-      for (const entry of directoryEntries) {
-        let records: readonly SessionRecord[];
-        try {
-          records = await readSessionRecords(options, entry.sessionId);
-        } catch (error) {
-          const diagnostic = sessionHistoryDiagnosticFromError(entry.sessionId, error);
-          if (diagnostic === undefined) {
-            throw error;
-          }
-          diagnostics.push(diagnostic);
-          continue;
-        }
-        if (
-          !records.some((entry) =>
-            entry.schemaVersion === 3
-              ? entry.record.type === "logical_run_started"
-              : entry.event.type === "user_message",
-          )
-        ) {
-          continue;
-        }
-        try {
-          catalogEntries.push({
-            ...entry,
-            snapshot: await inspectSession({ sessionId: entry.sessionId }),
-          });
-        } catch (error) {
-          if (error instanceof SessionLifecycleError && error.code === "session_not_found") {
-            continue;
-          }
-          const diagnostic = sessionHistoryDiagnosticFromError(entry.sessionId, error);
-          if (diagnostic === undefined) {
-            throw error;
-          }
-          diagnostics.push(diagnostic);
-        }
-      }
-      catalogEntries.sort(
-        (left, right) =>
-          right.modifiedAtMilliseconds - left.modifiedAtMilliseconds ||
-          (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0),
-      );
-      const cursorIndex =
-        afterSessionId === undefined
-          ? -1
-          : catalogEntries.findIndex((entry) => entry.sessionId === afterSessionId);
-      const start =
-        afterSessionId === undefined
-          ? 0
-          : cursorIndex < 0
-            ? catalogEntries.length
-            : cursorIndex + 1;
-      const selectedEntries = catalogEntries.slice(start, start + limit);
-      const selectedIds = selectedEntries.map((entry) => entry.sessionId);
-      const lastSessionId = selectedIds.at(-1);
-      diagnostics.sort((left, right) =>
-        left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
-      );
+      const page = await collectProjectSessionCatalog(input);
+      return { ...page, items: page.items.map(({ snapshot }) => snapshot) };
+    },
+    async listProjectSessionSummaries(input = {}) {
+      const page = await collectProjectSessionCatalog(input);
       return {
-        projectId,
-        items: selectedEntries.map((entry) => entry.snapshot),
-        nextCursor:
-          lastSessionId !== undefined && start + selectedIds.length < catalogEntries.length
-            ? encodeProjectSessionCatalogCursor(lastSessionId)
-            : null,
-        diagnostics: {
-          items: diagnostics.slice(0, 100),
-          totalCount: diagnostics.length,
-          truncated: diagnostics.length > 100,
-        },
+        ...page,
+        items: page.items.map(
+          ({ snapshot, naming }): ProjectSessionSummary =>
+            snapshot.schemaVersion !== 3
+              ? snapshot
+              : {
+                  schemaVersion: 3,
+                  sessionId: snapshot.sessionId,
+                  projectId: snapshot.projectId,
+                  lastSequence: snapshot.lastSequence,
+                  status: snapshot.status,
+                  targetIdentity: snapshot.targetIdentity,
+                  naming,
+                },
+        ),
       };
     },
     async previewNewSession(input) {
@@ -8974,7 +9035,9 @@ async function readSessionRecords(
   options: SessionLifecycleOptions,
   sessionId: string,
 ): Promise<readonly SessionRecord[]> {
-  const store = await sessionStoreDirectoryFrom(options).open(sessionId);
+  const directory = sessionStoreDirectoryFrom(options);
+  if (directory.readRecords !== undefined) return (await directory.readRecords(sessionId)) ?? [];
+  const store = await directory.open(sessionId);
   return store?.read() ?? [];
 }
 

@@ -156,6 +156,8 @@ export {
   type McpConfigurationResult,
   type McpSessionSnapshot,
   type ProjectSessionCatalogPage,
+  type ProjectSessionSummary,
+  type ProjectSessionSummaryPage,
   type RepositoryInstructionsReloadResult,
   type SessionBranchInput,
   type SessionCommand,
