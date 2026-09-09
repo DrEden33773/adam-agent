@@ -111,9 +111,11 @@ test.each([40, 80, 120])(
         ]);
         const lines = widget.render(width);
         const text = stripTerminalSequences(lines.join("\n"));
-        expect(text).toContain("审查 · 核查 e\u0301 证据");
+        if (width >= 80) expect(text).toContain("审查 · 核查 e\u0301 证据");
+        expect(text).toContain("读取 e\u0301 文件");
+        expect(text).toContain("@explore-1");
         expect(text).toContain("Permission required");
-        expect(text).toContain("Queued @explore-2");
+        expect(text).toContain("@explore-2 · Queued");
         expect(text).not.toMatch(/used|reserved|fixture-target|sha256:/u);
         expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
         if (noColor) expect(lines.join("\n").replaceAll("\u001b[0m", "")).toBe(text);
@@ -252,7 +254,7 @@ test.each([2, 3])(
       expect(lines.join("\n")).toContain("1 error");
       expect(lines.join("\n")).not.toContain("running");
       if (maximum === 2) expect(lines[0]).toBe("● Agents 4 · 2 attention · 1 error");
-      else expect(lines[1]).toBe("└─ Failed · Explore · Evidence 4");
+      else expect(lines[1]).toBe("└─ @explore-4 · Failed · Evidence 4");
       expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
     } finally {
       widget.dispose();
@@ -352,3 +354,150 @@ test("Widget animation redraws while linger expiration separately changes member
     widget.dispose();
   }
 });
+
+test.each([false, true])(
+  "Widget preserves literal tree glyphs and connects final visible children (noColor=%s)",
+  (noColor) => {
+    const threads = [agentViewThread(1), agentViewThread(2)];
+    let maximum = 12;
+    const widget = new AgentWidget(createAdamTuiTheme(noColor), () => maximum, {
+      settings: () => ({ ...defaultAgentUiSettings, showModel: true }),
+      scheduler: {
+        schedule() {
+          return { cancel() {} };
+        },
+      },
+    });
+    try {
+      widget.setSnapshot({
+        parentSessionId: "parent",
+        revision: 1,
+        status: "ready",
+        completions: [],
+        threads,
+      });
+      widget.setActivity(
+        threads.map((thread) => ({
+          agentId: thread.threadId,
+          attemptId: thread.turn.attemptId,
+          childSessionId: thread.turn.childSessionId,
+          activity: "replying",
+          assistant: { itemId: "literal", text: "literal tree: ├─ child └─ leaf │ trunk" },
+        })),
+      );
+      const lines = () => widget.render(120).map(stripTerminalSequences);
+      const full = lines();
+      expect(full).toHaveLength(7);
+      expect(full[1]).toMatch(/^├─ /u);
+      expect(full[2]).toBe("│  ├─ literal tree: ├─ child └─ leaf │ trunk");
+      expect(full[3]).toBe("│  └─ fixture-target · thinking default");
+      expect(full[4]).toMatch(/^└─ /u);
+      expect(full[5]).toBe("   ├─ literal tree: ├─ child └─ leaf │ trunk");
+      expect(full[6]).toBe("   └─ fixture-target · thinking default");
+      maximum = 4;
+      const compressed = lines();
+      expect(compressed).toHaveLength(4);
+      expect(compressed[1]).toMatch(/^└─ /u);
+      expect(compressed[2]).toBe("   └─ literal tree: ├─ child └─ leaf │ trunk");
+      expect(compressed[3]).toMatch(/^… /u);
+      maximum = 3;
+      expect(lines()[1]).toMatch(/^└─ /u);
+      expect(lines().some((line) => /^ {3}[├└]/u.test(line))).toBe(false);
+    } finally {
+      widget.dispose();
+    }
+  },
+);
+
+test.each([40, 80, 120])(
+  "Widget recomputes all child branches and queued roots within %i cells",
+  (width) => {
+    for (const noColor of [false, true]) {
+      const first = agentViewThread();
+      let maximum = 7;
+      const widget = new AgentWidget(createAdamTuiTheme(noColor), () => maximum, {
+        settings: () => ({ ...defaultAgentUiSettings, showModel: true }),
+        scheduler: {
+          schedule() {
+            return { cancel() {} };
+          },
+        },
+      });
+      try {
+        widget.setSnapshot({
+          parentSessionId: "parent",
+          revision: 1,
+          status: "ready",
+          completions: [],
+          threads: [
+            {
+              ...first,
+              turn: {
+                ...first.turn,
+                phase: "settling",
+                label: "Settling",
+                lastOutcome: "failed",
+                outcome: {
+                  type: "outcome",
+                  status: "failed",
+                  summary: "Failed",
+                  error: { code: "E", message: "literal │" },
+                  usage: {
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    reasoningTokens: 0,
+                    providerCalls: 0,
+                    unknownCalls: 0,
+                  },
+                  transcript: { sequence: 0, digest: `sha256:${"a".repeat(64)}` },
+                },
+              },
+            },
+            ...[2, 3, 4].map((index) => {
+              const thread = agentViewThread(index);
+              const { hasStarted: _hasStarted, ...turn } = thread.turn;
+              return {
+                ...thread,
+                turn: {
+                  ...turn,
+                  phase: "queued" as const,
+                  label: "Queued",
+                },
+              };
+            }),
+          ],
+        });
+        widget.setActivity([
+          {
+            agentId: first.threadId,
+            attemptId: first.turn.attemptId,
+            childSessionId: first.turn.childSessionId,
+            activity: "replying",
+            assistant: { itemId: "body", text: "├─ └─ │ e\u0301 中" },
+          },
+        ]);
+        const rendered = widget.render(width);
+        const full = rendered.map(stripTerminalSequences);
+        expect(full).toHaveLength(7);
+        expect(full[1]).toMatch(/^├─ /u);
+        expect(full[2]).toBe("│  ├─ Settling · ├─ └─ │ e\u0301 中");
+        expect(full[3]).toBe("│  ├─ E: literal │");
+        expect(full[4]).toBe("│  └─ fixture-target · thinking default");
+        expect(full[5]).toBe("└─ 3 queued · /agents");
+        expect(full[6]).toMatch(/^… /u);
+        expect(rendered.every((line) => visibleWidth(line) <= width)).toBe(true);
+        maximum = 5;
+        const partial = widget.render(width).map(stripTerminalSequences);
+        expect(partial[2]).toBe("│  └─ Settling · ├─ └─ │ e\u0301 中");
+        expect(partial[3]).toBe("└─ 3 queued · /agents");
+        maximum = 4;
+        const parents = widget.render(width).map(stripTerminalSequences);
+        expect(parents[1]).toMatch(/^├─ /u);
+        expect(parents[2]).toBe("└─ 3 queued · /agents");
+        expect(parents.some((line) => /^│ {2}[├└]/u.test(line))).toBe(false);
+      } finally {
+        widget.dispose();
+      }
+    }
+  },
+);

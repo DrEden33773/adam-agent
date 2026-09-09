@@ -20,9 +20,16 @@ import {
   matchesKey,
   SelectList,
   truncateToWidth,
+  visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { agentElapsedLabel } from "./agent-widget.js";
+import {
+  agentElapsedLabel,
+  agentHeading,
+  agentSelectionRow,
+  agentStatus,
+  agentTimedLine,
+} from "./agent-view-format.js";
 import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
@@ -107,11 +114,18 @@ export class AgentFleet implements Component {
     const rows = this.rows();
     if (rows.length === 0) return [];
     const maximum = this.options.maximumLines?.() ?? 7;
+    const theme = this.options.theme;
     const entries = [
-      { id: null, text: "Main" },
+      { id: null, text: theme.text("Main"), identity: "Main" },
       ...rows.map((thread) => ({
         id: thread.threadId,
-        text: `${thread.handle} · ${safeTerminalText(thread.displayName)} · ${thread.turn.label}${agentElapsedLabel(thread)} · ${safeTerminalText(thread.description)}${this.drafts.get(thread.threadId)?.text || this.options.hasDraft?.(thread) ? ` · Draft to ${thread.handle}` : ""}`,
+        identity: thread.handle,
+        text: agentTimedLine(
+          theme,
+          `${theme.reference(safeTerminalText(thread.handle))} · ${agentStatus(theme, thread)}${width >= 72 ? ` · ${theme.muted(safeTerminalText(thread.displayName))}` : ""} · ${theme.text(safeTerminalText(thread.description))}${this.drafts.get(thread.threadId)?.text || this.options.hasDraft?.(thread) ? theme.muted(` · Draft to ${thread.handle}`) : ""}`,
+          thread,
+          Math.max(0, width - 2),
+        ),
       })),
     ];
     const selectedIndex = Math.max(
@@ -121,11 +135,14 @@ export class AgentFleet implements Component {
     if (maximum === 1) {
       const entry = entries[this.#active ? selectedIndex : 0];
       this.#visibleIds = new Set([entry?.id ?? null]);
+      const line = truncateToWidth(
+        `${(this.#active ? theme.toolTitle : theme.muted)("Fleet")} ${this.#active ? theme.toolTitle(">") : " "} ${theme.reference(entry?.identity ?? "Main")} · ${theme.muted(`+${entries.length - 1} · ${this.#active ? "Enter/Esc" : "↓ navigate"}`)}`,
+        width,
+      );
       return [
-        truncateToWidth(
-          `Fleet ${this.#active ? "●" : "○"} ${entry?.text.split(" · ")[0] ?? "Main"} · +${entries.length - 1} · ${this.#active ? "Enter/Esc" : "↓ navigate"}`,
-          width,
-        ),
+        this.#active
+          ? theme.selectionBackground(line + " ".repeat(Math.max(0, width - visibleWidth(line))))
+          : line,
       ];
     }
     const body = Math.max(1, maximum - 1);
@@ -133,12 +150,12 @@ export class AgentFleet implements Component {
     const visible = entries.slice(start, start + body);
     const below = entries.length - start - visible.length;
     this.#visibleIds = new Set(visible.map((entry) => entry.id));
+    const overflow = `${start ? ` · ${start} above` : ""}${below ? ` · ${below} below` : ""}`;
+    const hint = this.#active ? (width < 60 ? "Enter/Esc" : "Enter open · Esc Main") : "↓ navigate";
     return [
-      this.options.theme.muted(
-        `${this.#active ? "Fleet · Enter open · Esc Main" : "Fleet · ↓ navigate"}${start ? ` · ↑${start}` : ""}${below ? ` · ↓${below}` : ""}`,
-      ),
-      ...visible.map(
-        (entry) => `${this.#active && this.#selected === entry.id ? "●" : "○"} ${entry.text}`,
+      (this.#active ? theme.toolTitle : theme.muted)(`Fleet · ${hint}${overflow}`),
+      ...visible.map((entry) =>
+        agentSelectionRow(theme, entry.text, this.#active && this.#selected === entry.id, width),
       ),
     ].map((line) => truncateToWidth(line, width));
   }
@@ -582,9 +599,9 @@ export class AgentWorkspace implements Component {
       this.#helpMaximumScroll = Math.max(0, lines.length - height);
       this.#helpScroll = Math.min(this.#helpScroll, this.#helpMaximumScroll);
       return [
-        this.options.theme.primary("Agents help"),
+        this.options.theme.toolTitle("Agents help"),
         ...lines.slice(this.#helpScroll, this.#helpScroll + height),
-        "↑↓ / wheel scroll · Esc back",
+        this.options.theme.muted("↑↓ / wheel scroll · Esc back"),
       ].map((line) => truncateToWidth(line, width));
     }
     if (this.#settingsOpen) {
@@ -603,12 +620,23 @@ export class AgentWorkspace implements Component {
         entries.slice(start, start + maximum).map((_, index) => start + index),
       );
       return [
-        this.options.theme.primary("Agent settings"),
+        this.options.theme.toolTitle("Agent settings"),
         ...entries
           .slice(start, start + maximum)
-          .map((entry, index) => `${start + index === this.#settingIndex ? "●" : "○"} ${entry}`),
-        this.#pending ? "Saving…" : this.#notice || "User-local display preferences",
-        `↑↓ select · Enter change · Esc close${entries.length > maximum ? ` · ${entries.length - Math.min(maximum, entries.length)} hidden` : ""}`,
+          .map((entry, index) =>
+            agentSelectionRow(
+              this.options.theme,
+              this.options.theme.text(entry),
+              start + index === this.#settingIndex,
+              width,
+            ),
+          ),
+        this.options.theme.muted(
+          this.#pending ? "Saving…" : this.#notice || "User-local display preferences",
+        ),
+        this.options.theme.muted(
+          `↑↓ select · Enter change · Esc close${entries.length > maximum ? ` · ${entries.length - Math.min(maximum, entries.length)} hidden` : ""}`,
+        ),
       ].map((line) => truncateToWidth(line, width));
     }
     const thread = this.rows().find((entry) => this.key(entry) === this.#selected);
@@ -617,14 +645,16 @@ export class AgentWorkspace implements Component {
       const config = thread.turn.configuration;
       const budget = thread.budget;
       lines.push(
-        this.options.theme.primary(`Agent details · ${thread.handle} · ${thread.displayName}`),
-        safeTerminalText(thread.description),
-        `${thread.turn.label}${agentElapsedLabel(thread)}`,
+        agentHeading(this.options.theme, "Agent details", thread),
+        this.options.theme.text(safeTerminalText(thread.description)),
+        `${agentStatus(this.options.theme, thread)}${this.options.theme.muted(agentElapsedLabel(thread))}`,
       );
       if (config !== undefined)
         lines.push(
-          `${safeTerminalText(config.targetId)} · thinking ${safeTerminalText(config.thinking)}`,
-          `${config.contextWindowTokens ?? "unknown"} context tokens`,
+          this.options.theme.muted(
+            `${safeTerminalText(config.targetId)} · thinking ${safeTerminalText(config.thinking)}`,
+          ),
+          this.options.theme.muted(`${config.contextWindowTokens ?? "unknown"} context tokens`),
         );
       if (budget !== undefined)
         lines.push(
@@ -632,12 +662,14 @@ export class AgentWorkspace implements Component {
           `${budget.unknownReserved} unknown · ${budget.available === null ? "no cumulative budget" : `${budget.available} available`}`,
         );
       if (thread.turn.diagnostic !== undefined)
-        lines.push(safeTerminalText(thread.turn.diagnostic));
+        lines.push(this.options.theme.statusWarning(safeTerminalText(thread.turn.diagnostic)));
       if (thread.turn.attention?.question !== undefined)
-        lines.push(safeTerminalText(thread.turn.attention.question));
+        lines.push(
+          this.options.theme.statusWarning(safeTerminalText(thread.turn.attention.question)),
+        );
       if (thread.turn.outcome !== undefined) {
         if (!thread.turn.hasStarted) lines.push("No agent session was started.");
-        lines.push(safeTerminalText(thread.turn.outcome.summary));
+        lines.push(this.options.theme.text(safeTerminalText(thread.turn.outcome.summary)));
       }
       lines.push(
         `Role: ${thread.role}`,
@@ -667,7 +699,9 @@ export class AgentWorkspace implements Component {
         0,
         lines.length,
         title,
-        `↑↓ detail · ${Math.max(0, details.length - height)} lines hidden`,
+        this.options.theme.muted(
+          `↑↓ detail · ${Math.max(0, details.length - height)} lines hidden`,
+        ),
         ...details.slice(this.#detailScroll, this.#detailScroll + height),
         `${thread.turn.hasStarted ? "Enter conversation · " : thread.turn.outcome !== undefined ? "Enter result / export · " : ""}${thread.actions?.includes("cancel") ? "x x cancel · " : ""}Esc list`,
       );
@@ -695,10 +729,12 @@ export class AgentWorkspace implements Component {
           : "Enter open · d details · h history · t types · s settings · ? help · Esc back",
         ...(controls ? [controls] : []),
       ];
+      const separated = this.options.maximumLines() >= 12;
       const maximum = Math.max(
         1,
         this.options.maximumLines() -
           2 -
+          (separated ? 2 : 0) -
           hints.length -
           Number(this.#armed !== undefined || Boolean(this.#notice)),
       );
@@ -710,21 +746,40 @@ export class AgentWorkspace implements Component {
       const visible = threads.slice(start, start + maximum);
       this.#visibleIds = new Set(visible.map((entry) => this.key(entry)));
       lines.push(
-        this.options.theme.primary(
+        this.options.theme.toolTitle(
           `${this.#history ? "Agents history" : "Agents workspace"} · ${threads.length} ${this.#history ? "turns" : "threads"}`,
         ),
       );
-      lines.push(...hints);
+      if (separated) lines.push("");
       lines.push(
-        ...visible.map(
-          (entry) =>
-            `${this.key(entry) === this.#selected ? "●" : "○"} ${entry.handle} · ${width < 48 ? `${entry.turn.label.split(" · ")[0]} · ${safeTerminalText(entry.description)}` : `${safeTerminalText(entry.displayName)} · ${safeTerminalText(entry.description)} · ${entry.turn.label}`}${agentElapsedLabel(entry)}${entry.lifecycle === "closed" ? " · Closed" : ""}${this.options.hasDraft?.(entry) ? ` · Draft to ${entry.handle}` : ""}`,
+        ...visible.map((entry) =>
+          agentSelectionRow(
+            this.options.theme,
+            agentTimedLine(
+              this.options.theme,
+              `${this.options.theme.reference(safeTerminalText(entry.handle))} · ${agentStatus(this.options.theme, entry)}${width >= 72 ? ` · ${this.options.theme.muted(safeTerminalText(entry.displayName))}` : ""} · ${this.options.theme.text(safeTerminalText(entry.description))}${entry.lifecycle === "closed" ? this.options.theme.muted(" · Closed") : ""}${this.options.hasDraft?.(entry) ? this.options.theme.muted(` · Draft to ${entry.handle}`) : ""}`,
+              entry,
+              Math.max(0, width - 2),
+            ),
+            this.key(entry) === this.#selected,
+            width,
+          ),
         ),
       );
       if (start > 0 || start + visible.length < threads.length)
-        lines.push(`↑ ${start} hidden · ↓ ${threads.length - start - visible.length} hidden`);
+        lines.push(
+          this.options.theme.muted(
+            `${start} above · ${threads.length - start - visible.length} below`,
+          ),
+        );
       if (threads.length === 0)
-        lines.push(this.#snapshot.diagnostic ?? "No agents in this Session.");
+        lines.push(
+          this.options.theme.muted(
+            safeTerminalText(this.#snapshot.diagnostic ?? "No agents in this Session."),
+          ),
+        );
+      if (separated) lines.push("");
+      lines.push(...hints.map(this.options.theme.muted));
     }
     if (this.#armed !== undefined)
       lines.push(
@@ -784,7 +839,7 @@ export class AgentSessionTransition implements Component {
   }
   render(width: number): string[] {
     return [
-      this.options.theme.primary("Switch Session"),
+      this.options.theme.toolTitle("Switch Session"),
       `${this.options.transition.runningCount} running · ${this.options.transition.queuedCount} queued`,
       ...(this.#pending === undefined
         ? this.#list.render(width)
@@ -794,7 +849,7 @@ export class AgentSessionTransition implements Component {
               : "Suspending queued and settling running agents…",
           ]),
       ...(this.#notice ? wrapTextWithAnsi(this.#notice, width) : []),
-      "Enter choose · Esc stay",
+      this.options.theme.muted("Enter choose · Esc stay"),
     ].map((line) => truncateToWidth(line, width));
   }
 }

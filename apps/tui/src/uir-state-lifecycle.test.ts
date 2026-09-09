@@ -5,10 +5,12 @@ import { expect, test } from "vitest";
 import { startManagedTui } from "./agent-fleet.test-support.js";
 
 test.each(["Explore", "Research"] as const)(
-  "%s remains selectable and admits a child after Main reasoning, tool, text and naming updates",
+  "%s remains selectable through Main updates, live preview modes, completion and continued Main",
   async (role) => {
     let requests = 0;
     const generated = Promise.withResolvers<void>();
+    const childReady = Promise.withResolvers<void>();
+    const finishChild = Promise.withResolvers<void>();
     const h = await startManagedTui(
       {
         async *stream(request) {
@@ -39,8 +41,17 @@ test.each(["Explore", "Research"] as const)(
           }
           yield {
             type: "text_delta",
-            text: requests === 2 ? "Main inspection complete." : "Role child completed.",
+            text:
+              requests === 2
+                ? "Main inspection complete."
+                : requests === 3
+                  ? "# Child evidence\n\n**Live answer**\n\n```diff\n+literal change\n```"
+                  : "Main continued after child.",
           };
+          if (requests === 3) {
+            childReady.resolve();
+            await finishChild.promise;
+          }
           yield { type: "usage", inputTokens: 100, outputTokens: 20 };
           yield { type: "finish", reason: "stop" };
         },
@@ -73,7 +84,37 @@ test.each(["Explore", "Research"] as const)(
       await h.press(`@${role}`, `New agent · ${role}`);
       await h.press("\t", `@${role}`);
       await h.press(" Inspect the evidence.\r", "Delegation");
-      await h.press("\r", "Completed");
+      const handle = `@${role.toLowerCase()}-1`;
+      await h.press("\r", `${handle} · Running`);
+      await childReady.promise;
+      await h.openFirstAgent(handle);
+      await h.press("m", "m full Markdown");
+      expect(h.conversationText()).toContain("Live answer");
+      expect(h.conversationText()).not.toContain("**Live answer**");
+      expect(h.conversationText()).toContain("+literal change");
+      await h.press("m", "m raw");
+      expect(h.conversationText()).toContain("**Live answer**");
+      await h.press("m", "m assistant Markdown");
+      expect(h.conversationText()).not.toContain("**Live answer**");
+      await h.press("d", "Conversation details");
+      await h.press("\u001b[27u", `Conversation · ${handle}`, "Conversation details");
+      await h.press("\u001b[27u", "Fleet", "Conversation ·");
+      const child = h.presentation.getState().authoritative.managedControl?.threads[0];
+      if (child === undefined) throw new Error("Missing role child");
+      finishChild.resolve();
+      await h.presentation.dispatch({
+        type: "managed_control",
+        commandId: `${role}-combined-completion`,
+        command: {
+          type: "wait_agents",
+          parentSessionId: h.parent.sessionId,
+          mode: "all",
+          targets: [{ threadId: child.threadId, expectedTurnId: child.turn.turnId }],
+        },
+      });
+      await h.terminal.waitForScreen(`${handle} · Completed`);
+      await h.press("\u001b[27u", "Fleet · ↓ navigate");
+      await h.press("Continue Main after the child.\r", "Main continued after child.");
       expect(droppedRoles).toEqual([]);
       expect(
         (await h.store.read()).filter((record) => record.event.type === "admitted"),
@@ -82,6 +123,7 @@ test.each(["Explore", "Research"] as const)(
         `builtin:${role.toLowerCase()}`,
       );
     } finally {
+      finishChild.resolve();
       unsubscribe();
       await h.close();
     }

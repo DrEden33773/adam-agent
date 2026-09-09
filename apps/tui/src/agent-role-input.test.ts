@@ -80,7 +80,7 @@ test("direct delegation reads only its explicitly attached immutable resource", 
     ).toMatchObject({ status: "admitted" });
     await h.press("\r", "Delegation");
     await h.press("\r", "Input accepted for @explore-1");
-    await h.terminal.waitForScreen("○ @explore-1 · Explore · Completed");
+    await h.terminal.waitForScreen("  @explore-1 · Completed · Explore");
     expect(requests).toHaveLength(4);
     expect(JSON.stringify(requests[3]?.messages)).toContain("EXPLICIT LATER ATTACHMENT");
     const sessionId = h.presentation.getState().authoritative.active?.session.id;
@@ -176,7 +176,7 @@ test("model delegation links only an exact explicitly selected parent attachment
       });
     await h.press(" Delegate one selected artifact.\r", "Delegation");
     await h.press("\r", "Parent delegated one artifact.");
-    await h.terminal.waitForScreen("○ @explore-1 · Explore · Completed");
+    await h.terminal.waitForScreen("  @explore-1 · Completed · Explore");
     expect(children).toHaveLength(2);
     expect(JSON.stringify(children)).toContain("SELECTED IMMUTABLE BODY");
     expect(JSON.stringify(children)).not.toContain("unselected.txt");
@@ -234,7 +234,7 @@ test("direct role and exact-thread messages preserve folded pasted evidence", as
       ).toBe(true);
       await h.press("\r", "Delegation");
       await h.press("\r", mention === "@Explore" ? "Completed" : "Input accepted for @explore-1");
-      await h.terminal.waitForScreen("○ @explore-1 · Explore · Completed");
+      await h.terminal.waitForScreen("  @explore-1 · Completed · Explore");
       expect(h.terminal.lines().join("\n")).not.toContain("Submitting prompt…");
       expect(JSON.stringify(requests.at(-1)?.messages)).toContain(marker);
       expect(h.presentation.getState().composer.renderedText).toBe("");
@@ -303,7 +303,7 @@ test("requested Skill preactivation is atomic and preserves the rest of the chil
         entries: [entry],
       }),
     ).toMatchObject({ status: "admitted" });
-    await h.terminal.waitForScreen("@explore-1 · Explore · Completed");
+    await h.terminal.waitForScreen("@explore-1 · Completed · Explore");
     expect(requests).toHaveLength(2);
     expect(JSON.stringify(requests[0]?.messages)).toContain("REQUESTED SKILL BODY");
     expect(JSON.stringify(requests[0]?.messages)).toContain("skill:v1:project:.:independent");
@@ -341,7 +341,7 @@ test("the direct delegation overlay shares an explicitly selected older message"
     await h.press("\x1b[B\x1b[B\x1b[B\x1b[B\r", "[x] user");
     await h.press("\x1b[A\x1b[A\x1b[A\x1b[A\r", "Context updated.");
     expect(requests).toHaveLength(2);
-    await h.press("\r", "@explore-1 · Explore · Completed");
+    await h.press("\r", "@explore-1 · Completed · Explore");
     expect(requests).toHaveLength(3);
     expect(JSON.stringify(requests[2]?.messages)).toContain("EXPLICIT OLDER CONTEXT");
     expect(JSON.stringify(requests[2]?.messages)).toContain("Inspect this direct task.");
@@ -441,7 +441,7 @@ test("delegation shares only the selected initial context and does not absorb la
     await h.press("LATER MAIN MESSAGE MUST STAY IN MAIN\r", "Main context recorded.");
     await h.terminal.waitForScreen("provider reported · idle");
     release.resolve();
-    await h.terminal.waitForScreen("@explore-3 · Explore · Completed");
+    await h.terminal.waitForScreen("@explore-3 · Completed · Explore");
     expect(requests.map((request) => JSON.stringify(request.messages))).toEqual(texts);
     expect(texts.join("\n")).not.toContain("LATER MAIN MESSAGE");
     const admissions = (await h.store.read()).filter((record) => record.event.type === "admitted");
@@ -521,7 +521,7 @@ test("a lifetime alias restores the exact thread and cannot be rebound after clo
         entries: [entry],
       }),
     ).toMatchObject({ status: "admitted" });
-    await h.terminal.waitForScreen("@explore-1 · Explore · Completed");
+    await h.terminal.waitForScreen("@explore-1 · Completed · Explore");
     const thread = h.presentation.getState().authoritative.managedControl?.threads[0];
     if (thread === undefined) throw new Error("Missing thread.");
     await h.press("@证据", "[Agent] @explore-1 · Alias evidence");
@@ -545,7 +545,7 @@ test("a lifetime alias restores the exact thread and cannot be rebound after clo
     );
     await cold.press("\r", "Delegation");
     await cold.press("\r", "Input accepted for @explore-1");
-    await cold.terminal.waitForScreen("@explore-1 · Explore · Completed");
+    await cold.terminal.waitForScreen("@explore-1 · Completed · Explore");
     const resumedControl = await cold.lifecycle[sessionManagedControl](h.parent.sessionId);
     if (resumedControl === undefined) throw new Error("Missing restored control.");
     const current = (await resumedControl.inspect({ parentSessionId: h.parent.sessionId }))
@@ -613,7 +613,7 @@ test.each(["cooperative", "interrupt"] as const)(
       await h.press("\t", "@Explore");
       await h.press(" Inspect evidence.", "Inspect evidence.");
       await h.press("\r", "Delegation");
-      await h.press("\r", "@explore-1 · Explore · Running");
+      await h.press("\r", "@explore-1 · Running · Explore");
       await h.press("@explore-1", "[Agent] @explore-1 · Inspect evidence.");
       await h.press("\t", "@explore-1");
       await h.press(" Use this explicit later context.", "Use this explicit later context.");
@@ -752,7 +752,7 @@ test("a selected exact handle starts a confirmed new turn in that thread", async
     await h.press("\r", "Delegation");
     expect(requests).toHaveLength(1);
     await h.press("\r", "Input accepted for @explore-1");
-    await h.terminal.waitForScreen("○ @explore-1 · Explore · Completed");
+    await h.terminal.waitForScreen("  @explore-1 · Completed · Explore");
     await h.openFirstAgent();
     await h.terminal.waitForScreen("Exact handle continued.");
     const threads = h.presentation.getState().authoritative.managedControl?.threads;
@@ -830,7 +830,7 @@ test.each(["default", "plan"] as const)(
       await h.press("\x1b", "Inspect this direct request.");
       expect(await h.sessions.listSessionIds()).toEqual(before);
       await h.press("\r", "Delegation");
-      await h.press("\r", "Completed");
+      await h.press("\r", "Completed", "Admitting agent…");
       const active = h.presentation.getState().authoritative.active;
       expect(active?.session.id).toBeDefined();
       expect(active?.session.id).not.toBe(h.parent.sessionId);

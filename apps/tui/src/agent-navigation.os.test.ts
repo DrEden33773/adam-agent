@@ -27,13 +27,13 @@ test("production child viewer wheel preserves manual tail control and the indepe
       await fixture.waitForCompleteFrameAfter(expected, offset, absentText);
     };
     const openViewer = async () => {
-      await press("\u001b[B", "● Main");
-      await press("\u001b[B", "● @explore-1");
+      await press("\u001b[B", "> Main");
+      await press("\u001b[B", "> @explore-1");
       await press("\r", "Child-live-49");
     };
     const closeViewer = async () => {
       await press("\u001b[27;1;27~", "Fleet", "Conversation ·");
-      await press("\u001b[27;1;27~", "Fleet", "● @explore-1");
+      await press("\u001b[27;1;27~", "Fleet", "> @explore-1");
     };
     const mainViewport = () => fixture.screen()?.filter((line) => line.includes("Main-evidence-"));
     await fixture.waitForScreen("Adam · New session");

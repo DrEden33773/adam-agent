@@ -31,7 +31,7 @@ test("TodoNavigator renders authoritative counts and opens exact read-only detai
       itemRevision: 2,
       status: "pending",
       title: item.title,
-      details: "Exact detail",
+      details: "# Todo heading\n\n**Exact detail**",
       dependencyIds: ["10000000-0000-4000-8000-000000000002"],
     },
   };
@@ -64,6 +64,8 @@ test("TodoNavigator renders authoritative counts and opens exact read-only detai
   const detailed = navigator.render(80).join("\n");
   expect(detailed).toContain("Todo detail · read-only");
   expect(detailed).toContain("Exact detail");
+  expect(detailed).not.toContain("**Exact detail**");
+  expect(detailed).toContain("\u001b[1m");
   expect(detailed).toContain("10000000-0000-4000-8000-000000000002");
   expect(detailed).toContain("Esc back");
 });

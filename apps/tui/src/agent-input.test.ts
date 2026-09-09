@@ -53,7 +53,7 @@ test("actual child Enter accepts one exact input, delivers at the read boundary,
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     await h.press("\r", "To @explore-1");
     await h.press("Use this exact later evidence.", "Use this exact later evidence.");
@@ -129,7 +129,7 @@ test.each(["cooperative", "interrupt"] as const)(
         }),
       ).toMatchObject({ status: "admitted" });
       await started.promise;
-      await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+      await h.terminal.waitForScreen("@explore-1 · Running · Explore");
       await h.openFirstAgent();
       await h.press("\r", "Cooperative");
       if (mode === "interrupt") await h.press("\t", "Interrupt after current effect");
@@ -246,7 +246,7 @@ test("a retained child draft rejects after another turn starts without rebinding
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     await h.press("\r", "Cooperative");
     await h.press("Draft for the first turn only.", "Draft for the first turn only.");
@@ -271,7 +271,7 @@ test("a retained child draft rejects after another turn starts without rebinding
       }),
     ).toMatchObject({ status: "admitted", control: { status: "accepted" } });
     await secondStarted.promise;
-    await h.terminal.waitForFrameAfter("@explore-1 · Explore · Running", before);
+    await h.terminal.waitForFrameAfter("@explore-1 · Running · Explore", before);
     await h.press("\u001b[B\r", "Conversation");
     await h.press("\r", "Draft for the first turn only.");
     await h.press("\r", "The selected turn changed.");
@@ -341,7 +341,7 @@ test.each(["wait", "suspend"] as const)(
       expect(h.presentation.getState().authoritative.managedControl?.threads[8]?.turn.phase).toBe(
         "queued",
       );
-      await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+      await h.terminal.waitForScreen("@explore-1 · Running · Explore");
       await h.openFirstAgent();
       await h.press("\r", "Cooperative");
       await h.press("Only the source child draft.", "Only the source child draft.");
@@ -416,7 +416,7 @@ test("two deliberate Enter submissions with identical text admit two distinct ch
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     await h.press("\r", "Cooperative");
     await h.press("Check again.", "Check again.");
@@ -481,7 +481,7 @@ test("late durable acceptance cannot clear a draft explicitly retargeted to a ne
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     await h.press("\r", "Cooperative");
     await h.press("Still the intended draft.", "Still the intended draft.");

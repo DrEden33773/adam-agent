@@ -157,7 +157,7 @@ test.each([40, 80, 120])(
       expect(childCalls).toBe(0);
       await h.press("\r", "Batch admitted; Main ready.");
       await prepared.promise;
-      await h.terminal.waitForScreen("⎿ Starting");
+      await h.terminal.waitForScreen("└─ Starting");
       const screen = h.terminal.lines().join("\n");
       const lines = h.terminal.lines().map((line) => line.trim());
       // The physical terminal exposes the continuation cell after each wide character.
@@ -521,7 +521,7 @@ test("ConversationViewer follows live output, preserves manual scroll, and survi
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     expect(h.conversationText()).toContain("First live line.");
     await h.press("d", "Conversation details");
@@ -748,7 +748,7 @@ test("live transcript elision is counted separately from the bounded Markdown co
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     expect(h.presentation.getState().managedAgentActivity?.[0]?.assistant).toMatchObject({
       totalByteCount: 20000,
@@ -820,7 +820,7 @@ test("child permission preempts and restores the exact independent composer with
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     await h.press("\r", "Cooperative");
     await h.press("Kept child draft", "Kept child draft");
@@ -884,7 +884,7 @@ test("viewer x x cancels the exact turn only on two presses and retains unknown 
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
     await h.press("\u001b[120;1:1u", "x again to cancel");
     h.terminal.input("\u001b[120;1:2u\u001b[120;1:3u");
@@ -1247,7 +1247,10 @@ test("Widget retains elapsed and optional model while details expose current usa
       },
     });
     await started.promise;
-    await h.terminal.waitForScreen("elapsed");
+    await h.terminal.waitForScreen("@explore-1 · Running");
+    expect(
+      h.terminal.lines().find((line) => line.includes("└─") && line.includes("Timed child")),
+    ).toMatch(/\d+s\s*$/u);
     await h.press("/agents settings\r", "Agent settings");
     await h.press("\u001b[B\u001b[B\r", "Model/thinking · shown");
     await h.press("\u001b", "thinking default");
@@ -1808,8 +1811,9 @@ test("a queued cancellation keeps per-thread export available without creating a
     await h.press("x", "x again to cancel");
     await h.press("x", "Cancelled");
     await h.press("\r", "Enter result / export");
-    await h.press("\r", "e export");
-    expect(h.terminal.lines().join("\n")).toContain("e export");
+    await h.press("\r", "Conversation · @explore-9");
+    await h.press("?", "e: export");
+    await h.press("\u001b", "Conversation · @explore-9");
     await h.press("e", "Export agent");
     await h.press("\r", "Confirm export");
     await h.press("\r", "Export ready");
@@ -1998,7 +2002,7 @@ test.each([false, true])(
       // Pi's input frame must run on the next-tick path without waiting for a render timer.
       await new Promise<void>((resolve) => process.nextTick(resolve));
       expect(h.terminal.output().slice(inputOffset)).toContain("@explore-1");
-      expect(h.terminal.lines().join("\n")).toContain("● @explore-1");
+      expect(h.terminal.lines().join("\n")).toContain("> @explore-1");
       if (openViewer) await h.press("\r", "Conversation");
       const first = h.presentation.getState().authoritative.managedControl?.threads[0];
       if (first === undefined) throw new Error("Missing selected thread");
@@ -2026,9 +2030,9 @@ test.each([false, true])(
         expect(fleet()).not.toContain("@explore-1");
         await h.press("m", "Conversation");
         expect(fleet()).not.toContain("@explore-1");
-        await h.press("\u001b[27u", "● Main");
+        await h.press("\u001b[27u", "> Main");
       }
-      expect(fleet()).toContain("● Main");
+      expect(fleet()).toContain("> Main");
       expect(fleet()).not.toContain("@explore-1");
       expect(fleet()).toContain("@explore-2");
       await h.press("\r", "Fleet · ↓ navigate");

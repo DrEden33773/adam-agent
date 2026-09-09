@@ -3,9 +3,10 @@ import type {
   ManagedControlThread,
   ManagedWorkspaceSnapshot,
 } from "@adam-agent/presentation";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { expect, test } from "vitest";
 import { AgentConversationViewer } from "./agent-conversation-viewer.js";
-import { AgentWorkspace } from "./agent-fleet.js";
+import { AgentFleet, AgentWorkspace } from "./agent-fleet.js";
 import { agentViewThread } from "./agent-view.test-support.js";
 import { createAdamTuiTheme } from "./theme.js";
 
@@ -43,14 +44,16 @@ test("d opens exact details without changing list selection; focused wheel and E
   const { view, opened } = workspace(threads);
   view.render(80);
   view.handleInput("\u001b[<65;10;8M");
-  const selected = view.render(80).join("\n");
-  expect(selected).toContain("● @explore-2");
+  const selected = view.render(80).map(stripTerminalSequences).join("\n");
+  expect(selected).toContain("> @explore-2");
   view.handleInput("d");
-  expect(view.render(80).join("\n")).toContain("Agent details · @explore-2");
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toContain(
+    "Agent details · @explore-2",
+  );
   view.handleInput("\u001b[F");
-  expect(view.render(80).join("\n")).toContain("thread-2");
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toContain("thread-2");
   view.handleInput("\u001b");
-  expect(view.render(80).join("\n")).toBe(selected);
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toBe(selected);
   expect(opened).toEqual([]);
 });
 
@@ -82,13 +85,17 @@ test("never-started cancelled turns open an overview and historical started turn
   const { view, opened } = workspace([thread]);
   view.render(80);
   view.handleInput("\r");
-  expect(view.render(80).join("\n")).toContain("Agent details · @explore-1");
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toContain(
+    "Agent details · @explore-1",
+  );
   expect(opened).toEqual([]);
   view.handleInput("\u001b");
   view.handleInput("h");
   view.render(80);
   view.handleInput("d");
-  expect(view.render(80).join("\n")).toContain("Agent details · @explore-1");
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toContain(
+    "Agent details · @explore-1",
+  );
   view.handleInput("\u001b");
   view.render(80);
   view.handleInput("\r");
@@ -124,7 +131,10 @@ async function conversation(text = "Retained child draft") {
     isMainCommand: (input) => input === "/agents",
     onChange: () => {
       read.resolve();
-      if (resourceRequested && viewer.render(80).join("\n").includes("Artifact page"))
+      if (
+        resourceRequested &&
+        viewer.render(80).map(stripTerminalSequences).join("\n").includes("Artifact page")
+      )
         resourceRead.resolve();
     },
     onClose() {},
@@ -188,24 +198,26 @@ async function conversation(text = "Retained child draft") {
 test("viewer details retain drafts and wheel pauses tail across details and help", async () => {
   const { viewer, drafts } = await conversation();
   try {
-    const tail = viewer.render(80).join("\n");
+    const tail = viewer.render(80).map(stripTerminalSequences).join("\n");
     expect(tail).toContain("Transcript line 30");
     viewer.handleInput("\u001b[<64;8;9M");
-    const scrolled = viewer.render(80).join("\n");
+    const scrolled = viewer.render(80).map(stripTerminalSequences).join("\n");
     expect(scrolled).not.toContain("Transcript line 30");
     viewer.handleInput("d");
-    expect(viewer.render(80).join("\n")).toContain("Conversation details");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toContain(
+      "Conversation details",
+    );
     expect(drafts.get("thread-1")?.text).toBe("Retained child draft");
     viewer.handleInput("\u001b");
-    expect(viewer.render(80).join("\n")).toBe(scrolled);
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toBe(scrolled);
     viewer.handleInput("?");
-    expect(viewer.render(80).join("\n")).toContain("Conversation help");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toContain("Conversation help");
     viewer.handleInput("\u001b");
-    expect(viewer.render(80).join("\n")).toBe(scrolled);
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toBe(scrolled);
     viewer.handleInput("\u001b[<65;8;9M");
-    expect(viewer.render(80).join("\n")).toBe(tail);
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toBe(tail);
     viewer.handleInput("\u0004");
-    expect(viewer.render(80).join("\n")).not.toContain("Draft to");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).not.toContain("Draft to");
     expect(drafts.has("thread-1")).toBe(false);
   } finally {
     viewer.dispose();
@@ -217,14 +229,16 @@ test("viewer Enter rejects a Main command before creating an input receipt and r
   try {
     viewer.handleInput("\r");
     viewer.handleInput("\r");
-    expect(viewer.render(80).join("\n")).toContain(
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toContain(
       "Run this command in Main. Child draft retained.",
     );
     expect(sent).toEqual([]);
     expect(drafts.get("thread-1")).toMatchObject({ text: "/agents" });
     expect(drafts.get("thread-1")).not.toHaveProperty("inputId");
     viewer.handleInput("\u001b");
-    expect(viewer.render(80).join("\n")).toContain("Draft to @explore-1");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toContain(
+      "Draft to @explore-1",
+    );
   } finally {
     viewer.dispose();
   }
@@ -235,23 +249,149 @@ test("resource focus consumes details/help keys and wheel without changing the c
   try {
     viewer.render(80);
     viewer.handleInput("\u001b[<64;8;9M");
-    const conversationFrame = viewer.render(80).join("\n");
+    const conversationFrame = viewer.render(80).map(stripTerminalSequences).join("\n");
     viewer.handleInput("v");
-    expect(viewer.render(80).join("\n")).toContain("Conversation resources");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toContain(
+      "Conversation resources",
+    );
     viewer.handleInput("\r");
     await resourceRead;
-    const resourceFrame = viewer.render(80).join("\n");
+    const resourceFrame = viewer.render(80).map(stripTerminalSequences).join("\n");
     expect(resourceFrame).toContain("Resource line 1\n");
     viewer.handleInput("d");
     viewer.handleInput("?");
-    expect(viewer.render(80).join("\n")).toBe(resourceFrame);
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toBe(resourceFrame);
     viewer.handleInput("\u001b[<65;8;9M");
-    expect(viewer.render(80).join("\n")).not.toContain("Resource line 1\n");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).not.toContain(
+      "Resource line 1\n",
+    );
     viewer.handleInput("\u001b");
-    expect(viewer.render(80).join("\n")).toContain("Conversation resources");
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toContain(
+      "Conversation resources",
+    );
     viewer.handleInput("\u001b");
-    expect(viewer.render(80).join("\n")).toBe(conversationFrame);
+    expect(viewer.render(80).map(stripTerminalSequences).join("\n")).toBe(conversationFrame);
   } finally {
     viewer.dispose();
   }
+});
+
+test.each([40, 80, 120])(
+  "Fleet selection uses the current theme and readable overflow at %i columns",
+  (width) => {
+    for (const noColor of [false, true]) {
+      const view = new AgentFleet({
+        theme: createAdamTuiTheme(noColor),
+        onChange() {},
+        onOpen() {},
+        maximumLines: () => 4,
+      });
+      view.setSnapshot({
+        parentSessionId: "parent",
+        revision: 1,
+        status: "ready",
+        completions: [],
+        threads: Array.from({ length: 8 }, (_, index) => agentViewThread(index + 1)),
+      });
+      view.render(width);
+      for (let index = 0; index < 5; index += 1) {
+        view.handleMainInput("\u001b[B", true);
+        view.render(width);
+      }
+      const lines = view.render(width);
+      const plain = lines.map(stripTerminalSequences);
+      expect(plain[0]).toContain("2 above");
+      expect(plain[0]).toContain("4 below");
+      const selected = lines.find((line) =>
+        stripTerminalSequences(line).startsWith("> @explore-4"),
+      );
+      expect(selected).toBeDefined();
+      expect(stripTerminalSequences(selected ?? "")).toContain("Running");
+      expect(visibleWidth(selected ?? "")).toBe(width);
+      expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+      if (noColor) expect(lines.join("\n")).not.toContain("\u001b[");
+      else {
+        expect(selected).toContain("\u001b[48;2;49;50;68m");
+        expect(selected).toContain("\u001b[38;2;137;220;235m@explore-4");
+      }
+    }
+  },
+);
+
+test("truncated Fleet selection keeps its surface through every terminal cell", () => {
+  const thread = agentViewThread();
+  const view = new AgentFleet({ theme: createAdamTuiTheme(false), onChange() {}, onOpen() {} });
+  view.setSnapshot({
+    parentSessionId: "parent",
+    revision: 1,
+    status: "ready",
+    completions: [],
+    threads: [
+      {
+        ...thread,
+        description: "long description ".repeat(10),
+        turn: { ...thread.turn, startedAtUnixMilliseconds: Date.now() - 1000 },
+      },
+    ],
+  });
+  view.render(40);
+  view.handleMainInput("\u001b[B", true);
+  view.render(40);
+  view.handleMainInput("\u001b[B", true);
+  const row = view
+    .render(40)
+    .find((line) => stripTerminalSequences(line).startsWith("> @explore-1"));
+  expect(row).toBeDefined();
+  expect(stripTerminalSequences(row ?? "")).toContain("...");
+  let background = "default";
+  const cells: string[] = [];
+  // Interpret the SGR adapter output, including foreground RGB parameters which may contain zeros.
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: interpret actual terminal SGR sequences in this adapter assertion.
+  for (const token of (row ?? "").split(/(\x1b\[[0-9;]*m)/u)) {
+    if (!token.startsWith("\u001b[")) {
+      cells.push(...Array.from(token, () => background));
+      continue;
+    }
+    const parameters = token.slice(2, -1).split(";").map(Number);
+    for (let index = 0; index < parameters.length; index += 1) {
+      const code = parameters[index];
+      if ((code === 38 || code === 48) && parameters[index + 1] === 2) {
+        if (code === 48) background = parameters.slice(index + 2, index + 5).join(";");
+        index += 4;
+      } else if (code === 0 || code === 49) background = "default";
+    }
+  }
+  expect(cells).toHaveLength(40);
+  expect(new Set(cells)).toEqual(new Set(["49;50;68"]));
+});
+
+test("historical completed outcomes without an end timestamp retain unknown elapsed", () => {
+  const original = agentViewThread();
+  const completed: ManagedControlThread = {
+    ...original,
+    turn: {
+      ...original.turn,
+      phase: "idle",
+      label: "Completed",
+      lastOutcome: "completed",
+      startedAtUnixMilliseconds: 1000,
+      outcome: {
+        type: "outcome",
+        status: "completed",
+        summary: "Historical completion",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          providerCalls: 0,
+          unknownCalls: 0,
+        },
+        transcript: { sequence: 0, digest: `sha256:${"a".repeat(64)}` },
+      },
+    },
+  };
+  const { view } = workspace([completed]);
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toContain("?s");
+  view.handleInput("d");
+  expect(view.render(80).map(stripTerminalSequences).join("\n")).toContain("elapsed unknown");
 });

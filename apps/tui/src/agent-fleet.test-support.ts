@@ -318,8 +318,8 @@ export async function startManagedTui(
     },
     async openFirstAgent(handle = "@explore-1") {
       await terminal.waitForScreen("Fleet");
-      await press("\u001b[B", "● Main");
-      await press("\u001b[B", `● ${handle}`);
+      await press("\u001b[B", "> Main");
+      await press("\u001b[B", `> ${handle}`);
       await press("\r", `Conversation · ${handle}`);
     },
     press,

@@ -36,7 +36,12 @@ import {
   truncateToWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { agentElapsedLabel } from "./agent-widget.js";
+import {
+  agentElapsedLabel,
+  agentHeading,
+  agentSelectionRow,
+  agentStatus,
+} from "./agent-view-format.js";
 import { focusedWheelDirection } from "./focused-wheel-input.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
@@ -879,17 +884,23 @@ export class AgentConversationViewer implements Component {
     if (
       this.#renderMode === "raw" ||
       kind === "literal" ||
-      (kind === "tool" && this.#renderMode !== "full") ||
-      /^(?:diff --git |@@ |--- |\+\+\+ |#!|\$ |\d{4}-\d\d-\d\d[T ])/mu.test(safe)
+      (kind === "tool" && this.#renderMode !== "full")
     )
       return [...wrapTextWithAnsi(safe, width), ...omission];
     let entry = this.#markdown.get(id);
     if (entry === undefined) {
       entry = {
-        component: new Markdown(safe, 0, 0, this.options.theme.markdown, undefined, {
-          preserveOrderedListMarkers: true,
-          preserveBackslashEscapes: true,
-        }),
+        component: new Markdown(
+          protectBareEvidence(safe),
+          0,
+          0,
+          this.options.theme.markdown,
+          undefined,
+          {
+            preserveOrderedListMarkers: true,
+            preserveBackslashEscapes: true,
+          },
+        ),
         text: safe,
         failed: false,
       };
@@ -897,7 +908,7 @@ export class AgentConversationViewer implements Component {
     } else if (entry.text !== safe) {
       if (!safe.startsWith(entry.text)) entry.failed = false;
       entry.text = safe;
-      entry.component.setText(safe);
+      entry.component.setText(protectBareEvidence(safe));
     }
     if (!entry.failed) {
       try {
@@ -989,27 +1000,33 @@ export class AgentConversationViewer implements Component {
     const maximum = this.options.maximumLines();
     if (state.phase === "pending")
       return [
-        "Exporting confirmed fields…",
-        `${state.thread.handle} · ${state.thread.turn.turnId.slice(0, 8)}`,
-        "Esc close",
+        this.options.theme.toolTitle("Exporting confirmed fields…"),
+        this.options.theme.reference(
+          `${state.thread.handle} · ${state.thread.turn.turnId.slice(0, 8)}`,
+        ),
+        this.options.theme.muted("Esc close"),
       ].map((line) => truncateToWidth(line, width));
     if (state.phase === "ready" && state.result !== undefined)
       return [
-        this.options.theme.primary(`Export ready · ${state.thread.handle}`),
-        `${state.result.artifact.byteCount} bytes · JSON`,
-        ...wrapTextWithAnsi(state.result.artifact.id, width),
-        "v open export · Esc back",
+        agentHeading(this.options.theme, "Export ready", state.thread),
+        this.options.theme.muted(`${state.result.artifact.byteCount} bytes · JSON`),
+        ...wrapTextWithAnsi(this.options.theme.text(state.result.artifact.id), width),
+        this.options.theme.muted("v open export · Esc back"),
       ].map((line) => truncateToWidth(line, width));
     if (state.phase === "confirm") {
       const lines = [
-        this.options.theme.primary("Confirm export"),
-        `${state.thread.handle} · turn ${state.thread.turn.turnId.slice(0, 8)}`,
+        this.options.theme.toolTitle("Confirm export"),
+        this.options.theme.reference(
+          `${state.thread.handle} · turn ${state.thread.turn.turnId.slice(0, 8)}`,
+        ),
         ...wrapTextWithAnsi(
           `Fields: ${agentExportFields.filter((field) => state.fields.has(field)).join(", ")}`,
           width,
         ),
-        state.fields.has("reasoning") ? "Reasoning INCLUDED" : "Reasoning excluded",
-        "Enter export · Esc fields",
+        this.options.theme.statusWarning(
+          state.fields.has("reasoning") ? "Reasoning INCLUDED" : "Reasoning excluded",
+        ),
+        this.options.theme.muted("Enter export · Esc fields"),
       ];
       state.confirmRendered = lines.length <= maximum;
       return lines.map((line) => truncateToWidth(line, width));
@@ -1026,14 +1043,20 @@ export class AgentConversationViewer implements Component {
     const visible = agentExportFields.slice(start, start + count);
     state.visible = new Set(visible.map((_, index) => start + index));
     return [
-      this.options.theme.primary(`Export agent · ${state.thread.handle}`),
-      `16 KiB / 32 items · ${agentExportFields.length - visible.length} hidden`,
-      ...visible.map(
-        (field, index) =>
-          `${start + index === state.selected ? "●" : "○"} [${state.fields.has(field) ? "x" : " "}] ${labels[field]}`,
+      agentHeading(this.options.theme, "Export agent", state.thread),
+      this.options.theme.muted(
+        `16 KiB / 32 items · ${agentExportFields.length - visible.length} hidden`,
+      ),
+      ...visible.map((field, index) =>
+        agentSelectionRow(
+          this.options.theme,
+          this.options.theme.text(`[${state.fields.has(field) ? "x" : " "}] ${labels[field]}`),
+          start + index === state.selected,
+          width,
+        ),
       ),
       ...(state.notice ? [safeTerminalText(state.notice)] : []),
-      "Space toggle · Enter review · Esc back",
+      this.options.theme.muted("Space toggle · Enter review · Esc back"),
     ].map((line) => truncateToWidth(line, width));
   }
   private resourceEntries(): readonly AgentConversationResource[] {
@@ -1182,24 +1205,30 @@ export class AgentConversationViewer implements Component {
       const entries = state.entries.slice(start, start + count);
       state.visible = new Set(entries.map((_, index) => start + index));
       return [
-        this.options.theme.primary(
-          `${state.inputOnly ? "Input receipts" : "Conversation resources"} · ${state.thread.handle}`,
+        agentHeading(
+          this.options.theme,
+          state.inputOnly ? "Input receipts" : "Conversation resources",
+          state.thread,
         ),
-        ...entries.map(
-          (entry, index) =>
-            `${start + index === state.selected ? "●" : "○"} ${safeTerminalText(entry.label)}`,
+        ...entries.map((entry, index) =>
+          agentSelectionRow(
+            this.options.theme,
+            this.options.theme.text(safeTerminalText(entry.label)),
+            start + index === state.selected,
+            width,
+          ),
         ),
         ...(entries.length === 0 ? ["No resources on this transcript page."] : []),
         ...(start > 0 || start + entries.length < state.entries.length
           ? [`↑ ${start} hidden · ↓ ${state.entries.length - start - entries.length} hidden`]
           : []),
         ...(state.notice ? [safeTerminalText(state.notice)] : []),
-        "Enter open · Esc conversation",
+        this.options.theme.muted("Enter open · Esc conversation"),
       ].map((line) => truncateToWidth(line, width));
     }
     const entry = state.entries[state.selected];
     const page = state.page;
-    const body = wrapTextWithAnsi(safeTerminalText(page.text), width);
+    const body = wrapTextWithAnsi(this.options.theme.text(safeTerminalText(page.text)), width);
     const footer = [
       ...(entry?.kind === "input" &&
       state.thread.turn.turnId === this.#thread.turn.turnId &&
@@ -1215,10 +1244,10 @@ export class AgentConversationViewer implements Component {
     state.maximumScroll = Math.max(0, body.length - height);
     state.scroll = Math.min(state.scroll, state.maximumScroll);
     return [
-      this.options.theme.primary(
-        `${entry?.kind === "reasoning" ? "Reasoning" : entry?.kind === "tool" ? "Tool" : entry?.kind === "input" ? "Input" : "Artifact"} page · ${state.thread.handle} · literal`,
+      `${agentHeading(this.options.theme, `${entry?.kind === "reasoning" ? "Reasoning" : entry?.kind === "tool" ? "Tool" : entry?.kind === "input" ? "Input" : "Artifact"} page`, state.thread)}${this.options.theme.muted(" · literal")}`,
+      this.options.theme.muted(
+        `Bytes ${page.offset}-${page.offset + page.byteCount} of ${page.totalByteCount}`,
       ),
-      `Bytes ${page.offset}-${page.offset + page.byteCount} of ${page.totalByteCount}`,
       ...body.slice(state.scroll, state.scroll + height),
       ...footer,
     ].map((line) => truncateToWidth(line, width));
@@ -1232,6 +1261,7 @@ export class AgentConversationViewer implements Component {
         "d: exact agent details · Ctrl+D: discard retained draft",
         "t: confirm retarget to the current turn",
         "x x: cancel the exact turn",
+        "e: export a completed turn · s: suppress its pending Main delivery",
         "v: bounded resources · i: exact input receipts",
         "m: raw/assistant/full Markdown",
         "Home/End: scroll start/follow tail",
@@ -1243,9 +1273,9 @@ export class AgentConversationViewer implements Component {
       this.#helpMaximumScroll = Math.max(0, lines.length - height);
       this.#helpScroll = Math.min(this.#helpScroll, this.#helpMaximumScroll);
       return [
-        this.options.theme.primary("Conversation help"),
-        ...lines.slice(this.#helpScroll, this.#helpScroll + height),
-        "↑↓ / wheel scroll · Esc conversation",
+        this.options.theme.toolTitle("Conversation help"),
+        ...lines.slice(this.#helpScroll, this.#helpScroll + height).map(this.options.theme.text),
+        this.options.theme.muted("↑↓ / wheel scroll · Esc conversation"),
       ].map((line) => truncateToWidth(line, width));
     }
     const completion = this.#completion;
@@ -1297,11 +1327,14 @@ export class AgentConversationViewer implements Component {
         ? undefined
         : toolArgumentPhaseLabel(this.#activity.tool.status);
     const header = [
-      this.options.theme.primary(`Conversation · ${thread.handle} · ${thread.displayName}`),
-      safeTerminalText(thread.description),
-      `${thread.turn.label}${agentElapsedLabel(thread)}`,
+      `${agentHeading(this.options.theme, "Conversation", thread)} · ${this.options.theme.muted(safeTerminalText(thread.displayName))}`,
+      `${agentStatus(this.options.theme, thread)}${completion === undefined || width >= 60 ? this.options.theme.muted(agentElapsedLabel(thread)) : ""}${completion === undefined ? "" : this.options.theme.muted(` · ${completion.userSeen ? "Seen" : "Unseen"} · Main ${completion.consumption}`)}`,
       ...(argumentPhase !== undefined && this.#activity?.tool !== undefined
-        ? [`${argumentPhase} · ${safeTerminalText(this.#activity.tool.name)}`]
+        ? [
+            this.options.theme.toolTitle(
+              `${argumentPhase} · ${safeTerminalText(this.#activity.tool.name)}`,
+            ),
+          ]
         : []),
       ...(thread.turn.diagnostic === undefined
         ? []
@@ -1311,25 +1344,15 @@ export class AgentConversationViewer implements Component {
         : wrapTextWithAnsi(safeTerminalText(thread.turn.attention.question), width)),
     ];
     const footer = [
-      ...(completion === undefined
-        ? []
-        : [
-            `${completion.userSeen ? "Seen" : "Unseen"} · Main ${completion.consumption}`,
-            ...(!this.#composing ? ["e export"] : []),
-          ]),
       ...(this.#suppressTarget !== undefined
         ? [
             "Suppress from Main? s confirm · Esc cancel",
             "Skip automatic delivery of this completion.",
           ]
-        : completion?.consumption === "pending" && !this.#composing
-          ? ["s Suppress from Main"]
-          : []),
+        : []),
       ...(this.#cancelTarget === undefined
-        ? !this.#composing && thread.actions?.includes("cancel")
-          ? ["x x cancel"]
-          : []
-        : [`x again to cancel ${thread.handle}`]),
+        ? []
+        : [this.options.theme.statusWarning(`x again to cancel ${thread.handle}`)]),
       ...(this.#retargetPending
         ? ["Retarget draft to the current turn? Enter confirm · Esc cancel"]
         : []),
@@ -1341,7 +1364,7 @@ export class AgentConversationViewer implements Component {
       `${this.#followTail ? "Following tail" : "Manual scroll · End tail"} · m ${this.#renderMode === "raw" ? "raw" : `${this.#renderMode} Markdown`}`,
       ...(olderCursor === null ? [] : ["PgUp at top: older transcript page"]),
       ...(this.#newerCursors.length === 0 ? [] : ["PgDown at bottom: newer page · End latest"]),
-      ...(this.#notice ? [safeTerminalText(this.#notice)] : []),
+      ...(this.#notice ? [this.options.theme.statusWarning(safeTerminalText(this.#notice))] : []),
       ...(liveOmittedBytes > 0 ? [`Live preview · ${liveOmittedBytes} bytes omitted`] : []),
       ...(this.resourceEntries().length > 0 ? ["v resources · i input receipts"] : []),
       ...(() => {
@@ -1380,30 +1403,34 @@ export class AgentConversationViewer implements Component {
         return this.textLines(item.id, item.text ?? "Assistant output in artifact", width);
       if (item.type === "tool_call") {
         const lines = wrapTextWithAnsi(
-          safeTerminalText(
-            `Tool · ${item.label} · ${item.status}${item.resultSummary === null ? "" : ` · ${item.resultSummary}`}`,
-          ),
+          `${this.options.theme.toolTitle(safeTerminalText(`Tool · ${item.label}`))} · ${this.options.theme.muted(safeTerminalText(item.status))}${item.resultSummary === null ? "" : ` · ${this.options.theme.text(safeTerminalText(item.resultSummary))}`}`,
           width,
         );
-        if (item.preview?.kind === "read_text") {
+        if (
+          item.preview?.kind === "read_text" &&
+          this.#renderMode === "full" &&
+          (item.preview.language === null ||
+            item.preview.language === "text" ||
+            item.preview.language === "markdown")
+        ) {
           const preview = item.preview;
           lines.push(
             ...this.textLines(
               `${item.id}:result`,
               preview.lines.map((line) => line.text).join("\n"),
               width,
-              preview.language === null ||
-                preview.language === "text" ||
-                preview.language === "markdown"
-                ? "tool"
-                : "literal",
+              "tool",
             ),
           );
           if (preview.omittedBytes > 0)
-            lines.push(`… ${preview.omittedBytes} bytes omitted · v resources`);
-          if (preview.sourceTruncated) lines.push("Tool output truncated at source");
-        } else if (item.preview !== null)
+            lines.push(
+              this.options.theme.muted(`… ${preview.omittedBytes} bytes omitted · v resources`),
+            );
+          if (preview.sourceTruncated)
+            lines.push(this.options.theme.muted("Tool output truncated at source"));
+        } else if (item.preview !== null) {
           lines.push(...new ToolPreview(item.preview, true, this.options.theme).render(width));
+        }
         return lines;
       }
       if (item.type === "reasoning_block") return [`Reasoning · ${item.status}`];
@@ -1420,6 +1447,7 @@ export class AgentConversationViewer implements Component {
     const maximum = this.options.maximumLines();
     if (this.#details) {
       const details = [
+        this.options.theme.text(safeTerminalText(thread.description)),
         ...header.slice(1),
         ...configurationDetails,
         `Role: ${thread.role}`,
@@ -1427,12 +1455,12 @@ export class AgentConversationViewer implements Component {
         `Turn: ${thread.turn.turnId}`,
         `Attempt: ${thread.turn.attemptId}`,
         ...(config === undefined ? [] : [`Configuration: ${config.digest}`]),
-      ].flatMap((line) => wrapTextWithAnsi(safeTerminalText(line), width));
+      ].flatMap((line) => wrapTextWithAnsi(line, width));
       const height = Math.max(1, maximum - 2);
       this.#detailMaximumScroll = Math.max(0, details.length - height);
       this.#detailScroll = Math.min(this.#detailScroll, this.#detailMaximumScroll);
       return [
-        this.options.theme.primary(`Conversation details · ${thread.handle}`),
+        agentHeading(this.options.theme, "Conversation details", thread),
         ...details.slice(this.#detailScroll, this.#detailScroll + height),
         `↑↓ scroll · ${details.length - Math.min(height, details.length)} hidden · Esc back`,
       ].map((line) => truncateToWidth(line, width));
@@ -1494,21 +1522,83 @@ export class AgentConversationViewer implements Component {
         Math.max(0, footer.length - essential.length) +
         Math.max(0, compactBody.length - this.#bodyHeight);
       return [
-        this.options.theme.primary(`Conversation · ${thread.handle}`),
+        agentHeading(this.options.theme, "Conversation", thread),
         `${this.#followTail ? "Tail" : "Manual · End tail"} · d details · ? help · ${hidden} lines hidden · m ${this.#renderMode}`,
         ...compactBody.slice(this.#scrollOffset, this.#scrollOffset + this.#bodyHeight),
         ...essential,
       ].map((line) => truncateToWidth(line, width));
     }
-    this.#bodyHeight = Math.max(1, this.options.maximumLines() - header.length - footer.length);
+    const separated = maximum >= header.length + footer.length + 3;
+    this.#bodyHeight = Math.max(1, maximum - header.length - footer.length - (separated ? 2 : 0));
     this.#maximumScroll = Math.max(0, body.length - this.#bodyHeight);
     this.#scrollOffset = this.#followTail
       ? this.#maximumScroll
       : Math.min(this.#scrollOffset, this.#maximumScroll);
     return [
       ...header,
+      ...(separated ? [""] : []),
       ...body.slice(this.#scrollOffset, this.#scrollOffset + this.#bodyHeight),
-      ...footer,
+      ...(separated ? [""] : []),
+      ...footer.map(this.options.theme.muted),
     ].map((line) => truncateToWidth(line, width));
   }
+}
+
+/** Keep unfenced evidence blocks literal without disabling Markdown elsewhere in the answer. */
+function protectBareEvidence(text: string): string {
+  const lines = text.split("\n");
+  const result: string[] = [];
+  let fence: { character: string; length: number } | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence !== undefined) {
+      result.push(line);
+      if (
+        marker?.[1]?.[0] === fence.character &&
+        marker[1].length >= fence.length &&
+        marker[2]?.trim() === ""
+      )
+        fence = undefined;
+      continue;
+    }
+    if (marker?.[1] !== undefined) {
+      fence = { character: marker[1][0] ?? "`", length: marker[1].length };
+      result.push(line);
+      continue;
+    }
+    if (!/^(?:diff --git |@@ |--- |\+\+\+ |#!|\$ |\d{4}-\d\d-\d\d[T ])/u.test(line)) {
+      result.push(line);
+      continue;
+    }
+    const kind = /^(?:#!|\$ )/u.test(line) ? "shell" : /^\d{4}-/u.test(line) ? "log" : "diff";
+    const literal = [line];
+    while (index + 1 < lines.length) {
+      const next = lines[index + 1] ?? "";
+      if (/^ {0,3}(?:`{3,}|~{3,})/u.test(next)) break;
+      if (kind === "shell") {
+        // Blank lines are valid source. Explicit Markdown starts a new section after a blank.
+        if (literal.at(-1)?.trim() === "" && /^(?:#{1,6}\s|(?:\*\*|__)\S)/u.test(next)) break;
+      } else if (kind === "log") {
+        if (!/^(?:\d{4}-\d\d-\d\d[T ]|[ \t]+\S|at )/u.test(next)) break;
+      } else if (
+        !/^(?:[ +\-\\]|@@|diff --git |index |(?:new|deleted) file mode |(?:old|new) mode |(?:dis)?similarity index |(?:rename|copy) (?:from|to) |$)/u.test(
+          next,
+        )
+      )
+        break;
+      literal.push(next);
+      index += 1;
+    }
+    const delimiter = "~".repeat(
+      Math.max(
+        3,
+        ...literal.flatMap((entry) =>
+          [...entry.matchAll(/~+/gu)].map((match) => match[0].length + 1),
+        ),
+      ),
+    );
+    result.push(`${delimiter}text`, ...literal, delimiter);
+  }
+  return result.join("\n");
 }

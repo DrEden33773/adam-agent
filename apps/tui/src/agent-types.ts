@@ -15,6 +15,7 @@ import {
   truncateToWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { agentSelectionRow } from "./agent-view-format.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
 
@@ -500,12 +501,18 @@ export class AgentTypes implements Component {
       const capacity = Math.max(1, this.options.maximumLines() - 10);
       const start = Math.max(0, this.#selected - capacity + 1);
       content = [
-        "n create · d duplicate · e eject built-in · Space enable/disable · r Reload · ! diagnostics · Esc",
+        this.options.theme.muted(
+          "n create · d duplicate · e eject built-in · Space enable/disable · r Reload · ! diagnostics · Esc",
+        ),
         ...this.#catalog.definitions
           .slice(start, start + capacity)
-          .map(
-            (entry, index) =>
-              `${index + start === this.#selected ? "●" : "○"} ${entry.name} · ${entry.enabled ? (entry.available ? "enabled" : "shadowed") : "disabled"} · ${entry.source?.kind ?? "builtin"}`,
+          .map((entry, index) =>
+            agentSelectionRow(
+              this.options.theme,
+              `${this.options.theme.reference(safeTerminalText(entry.name))} · ${(entry.enabled ? (entry.available ? this.options.theme.statusSuccess : this.options.theme.statusWarning) : this.options.theme.muted)(entry.enabled ? (entry.available ? "enabled" : "shadowed") : "disabled")} · ${this.options.theme.muted(safeTerminalText(entry.source?.kind ?? "builtin"))}`,
+              index + start === this.#selected,
+              width,
+            ),
           ),
         ...(role === undefined
           ? []
@@ -515,10 +522,16 @@ export class AgentTypes implements Component {
               `Tools: ${role.tools.join(", ")}`,
               `Skills: ${role.skills ? "frozen catalog" : "none"} · Web: ${role.web ? "effective Main" : "none"}`,
               `Target: ${role.model ?? "inherit Main"} · ${role.thinking ?? "effective thinking"}`,
-            ]),
+            ].map((line) =>
+              this.options.theme.text(safeTerminalText(line).replace(/[\r\n]/gu, " ")),
+            )),
         ...this.#catalog.diagnostics
           .slice(0, 2)
-          .map((diagnostic) => `! ${diagnostic.source}: ${diagnostic.message}`),
+          .map((diagnostic) =>
+            this.options.theme.statusWarning(
+              safeTerminalText(`! ${diagnostic.source}: ${diagnostic.message}`),
+            ),
+          ),
       ];
     }
     if (this.#step === 11 || this.#diagnostics) {
@@ -543,9 +556,7 @@ export class AgentTypes implements Component {
     }
     return [
       this.options.theme.toolTitle(safeTerminalText(heading)),
-      ...(this.#step === undefined || this.#step === 11
-        ? content.map((line) => safeTerminalText(line).replace(/[\r\n]/gu, " "))
-        : content),
+      ...content,
       this.options.theme.muted(safeTerminalText(this.#pending ? "Saving…" : this.#notice)),
     ].map((line) => truncateToWidth(line, width));
   }
