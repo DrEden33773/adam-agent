@@ -1374,7 +1374,7 @@ test("SessionLifecycle isolates one invalid session from the project catalog", a
     if (validEntry === undefined) {
       throw new Error("Expected the valid catalog directory entry.");
     }
-    let validOpenCount = 0;
+    let validEntryPresent = true;
     disappearing = createSessionLifecycle({
       modelTargets: modelTargetsWithDriver(new FakeModelDriver([])),
       stateRoot,
@@ -1387,8 +1387,17 @@ test("SessionLifecycle isolates one invalid session from the project catalog", a
         },
         listSessionIds: () => harness.sessions.listSessionIds(),
         async open(sessionId) {
-          validOpenCount += 1;
-          return validOpenCount === 1 ? harness.sessions.open(sessionId) : undefined;
+          if (!validEntryPresent) return undefined;
+          const store = await harness.sessions.open(sessionId);
+          if (store === undefined) return undefined;
+          return {
+            ...store,
+            async read() {
+              const records = await store.read();
+              validEntryPresent = false;
+              return records;
+            },
+          };
         },
       },
     });

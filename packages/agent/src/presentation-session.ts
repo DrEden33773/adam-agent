@@ -96,6 +96,7 @@ import {
   effectiveSessionStateRoot,
   type ManagedAgentNotification,
   type ManagedAgentTranscriptRecords,
+  type ProjectSessionSummary,
   type SessionContextUsageSnapshot,
   type SessionHistoryDiagnostics,
   type SessionLifecycle,
@@ -493,27 +494,18 @@ export async function createPresentationSession(
     ) {
       knownTargets.set(options.targetIdentity.targetId, options.targetIdentity);
     }
-    const catalogPage = await options.lifecycle.listProjectSessions({ limit: catalogPageSize });
+    const catalogPage = await options.lifecycle.listProjectSessionSummaries({
+      limit: catalogPageSize,
+    });
     const workspaceTrustSnapshot = await options.lifecycle.inspectWorkspaceTrust();
     const projectPaths = await listProjectPaths(options.workspaceRoot);
-    const catalogItems = (
-      await Promise.all(
-        catalogPage.items.map(async (snapshot) => {
-          if (snapshot.schemaVersion !== 3) {
-            return null;
-          }
-          if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
-            knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
-          }
-          return sessionSummaryFromSnapshot(
-            snapshot,
-            snapshot.sessionId === created?.sessionId
-              ? records
-              : await readActiveBranchRecords(options, snapshot.sessionId),
-          );
-        }),
-      )
-    ).filter((candidate): candidate is SessionSummary => candidate !== null);
+    const catalogItems = catalogPage.items.flatMap((snapshot) => {
+      if (snapshot.schemaVersion !== 3) return [];
+      if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
+        knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+      }
+      return [sessionSummaryFromCatalog(snapshot)];
+    });
     const summary =
       created === undefined
         ? undefined
@@ -6056,22 +6048,13 @@ export async function createPresentationSession(
           };
         }
         try {
-          const page = await options.lifecycle.listProjectSessions({
+          const page = await options.lifecycle.listProjectSessionSummaries({
             cursor: command.after,
             limit: catalogPageSize,
           });
-          const additions = (
-            await Promise.all(
-              page.items.map(async (snapshot) =>
-                snapshot.schemaVersion === 3
-                  ? sessionSummaryFromSnapshot(
-                      snapshot,
-                      await readActiveBranchRecords(options, snapshot.sessionId),
-                    )
-                  : null,
-              ),
-            )
-          ).filter((candidate): candidate is SessionSummary => candidate !== null);
+          const additions = page.items.flatMap((snapshot) =>
+            snapshot.schemaVersion === 3 ? [sessionSummaryFromCatalog(snapshot)] : [],
+          );
           const knownSessionIds = new Set(
             state.authoritative.sessions.items.map((session) => session.id),
           );
@@ -7331,6 +7314,22 @@ function projectSessionHistoryDiagnostics(
     })),
     totalCount: diagnostics.totalCount,
     truncated: diagnostics.truncated,
+  };
+}
+
+function sessionSummaryFromCatalog(
+  snapshot: Extract<ProjectSessionSummary, { schemaVersion: 3 }>,
+): SessionSummary {
+  const naming = {
+    ...snapshot.naming,
+    generation: projectSessionTitleGeneration(snapshot.naming.generation),
+  };
+  return {
+    id: snapshot.sessionId,
+    label: naming.displayLabel,
+    naming,
+    targetId: snapshot.targetIdentity.targetId,
+    status: snapshot.status,
   };
 }
 

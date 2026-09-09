@@ -620,6 +620,10 @@ test.each(["missing", "corrupt"] as const)(
       ) {
         throw new Error("Expected an artifact-backed response fixture.");
       }
+      const warmCatalog = await lifecycle.listProjectSessions();
+      expect(warmCatalog.items).toMatchObject([
+        { sessionId: created.sessionId, status: "settled" },
+      ]);
       const artifactId = response.record.response.text.reference.id;
       const artifactPath = join(stateRoot, "artifacts", artifactId.slice("sha256:".length));
       if (damage === "missing") {
@@ -630,6 +634,27 @@ test.each(["missing", "corrupt"] as const)(
       }
 
       const restarted = createSessionLifecycle(options);
+      for (const catalogLifecycle of [lifecycle, restarted]) {
+        const catalog = await catalogLifecycle.listProjectSessions();
+        expect(catalog.items).toMatchObject([
+          {
+            sessionId: created.sessionId,
+            degradation: {
+              code:
+                damage === "missing"
+                  ? "model_response_artifact_missing"
+                  : "model_response_artifact_corrupt",
+              artifactId,
+              field: "text",
+            },
+          },
+        ]);
+        const summaries = await catalogLifecycle.listProjectSessionSummaries();
+        expect(summaries.items).toMatchObject([
+          { sessionId: created.sessionId, status: "settled" },
+        ]);
+        expect(summaries.diagnostics).toEqual(catalog.diagnostics);
+      }
       await expect(restarted.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
         status: "settled",
         degradation: {

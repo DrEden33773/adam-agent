@@ -11961,11 +11961,11 @@ test("PresentationSession rejects a failed catalog page inside CommandReceipt", 
     });
     const presentationLifecycle: SessionLifecycle = {
       ...lifecycle,
-      async listProjectSessions(input) {
+      async listProjectSessionSummaries(input) {
         if (input?.cursor !== undefined) {
           throw new Error("injected catalog read failure");
         }
-        return lifecycle.listProjectSessions(input);
+        return lifecycle.listProjectSessionSummaries(input);
       },
     };
     const presentation = await createPresentationSession({
