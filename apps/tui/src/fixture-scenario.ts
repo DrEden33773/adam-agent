@@ -43,6 +43,7 @@ export const fixtureScenarios = [
   "review-operation-long-provenance",
   "review-recovery",
   "review-unavailable",
+  "scroll-viewport",
   "search",
   "resume",
   "session-selection-history",

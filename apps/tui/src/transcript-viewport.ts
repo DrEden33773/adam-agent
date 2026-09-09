@@ -19,6 +19,51 @@ type ViewportPosition = {
   readonly screenRow: number;
 };
 
+type ComponentGeometry = { readonly top: number; readonly height: number };
+
+class TranscriptDocument extends Container {
+  readonly #geometry = new Map<Component, ComponentGeometry>();
+  #layoutWidth: number | undefined;
+
+  override addChild(component: Component): void {
+    super.addChild(component);
+    this.#layoutWidth = undefined;
+  }
+
+  override removeChild(component: Component): void {
+    super.removeChild(component);
+    this.#layoutWidth = undefined;
+  }
+
+  override clear(): void {
+    super.clear();
+    this.#geometry.clear();
+    this.#layoutWidth = undefined;
+  }
+
+  override render(width: number): string[] {
+    const lines: string[] = [];
+    this.#geometry.clear();
+    for (const component of this.children) {
+      const rendered = component.render(width);
+      if (!this.#geometry.has(component)) {
+        this.#geometry.set(component, { top: lines.length, height: rendered.length });
+      }
+      for (const line of rendered) lines.push(line);
+    }
+    this.#layoutWidth = width;
+    return lines;
+  }
+
+  geometry(component: Component, width: number): ComponentGeometry | undefined {
+    const boundedWidth = Math.max(1, width);
+    // Record offsets with the same render that produces the document. A query before
+    // the first layout at this width materializes it once; every new frame refreshes it.
+    if (this.#layoutWidth !== boundedWidth) this.render(boundedWidth);
+    return this.#geometry.get(component);
+  }
+}
+
 class AnchoredScrollView extends ScrollView {
   readonly #captureBeforeWidthChange: () => void;
   readonly #desiredScrollTop: () => number | null;
@@ -61,10 +106,14 @@ class AnchoredScrollView extends ScrollView {
     viewportHeight: number,
     requestRender: () => void,
   ): void {
+    const wasFollowingEnd = this.isFollowingEnd;
     super.updateLayout(contentHeight, viewportHeight, requestRender);
     const scrollTop = this.#desiredScrollTop();
     if (scrollTop !== null) {
       super.scrollTo(scrollTop, { disableFollow: true });
+    } else if (!wasFollowingEnd) {
+      // Layout may clamp a manual position to the new bottom without user navigation.
+      super.scrollTo(this.scrollTop, { disableFollow: true });
     }
   }
 
@@ -106,7 +155,7 @@ class AnchoredScrollView extends ScrollView {
 }
 
 export class TranscriptViewport {
-  readonly document = new Container();
+  readonly document = new TranscriptDocument();
   readonly #anchors = new Map<string, Anchor>();
   readonly #semanticAnchors = new Map<string, Anchor>();
   #pendingPosition: ViewportPosition | null = null;
@@ -295,10 +344,12 @@ export class TranscriptViewport {
     const anchor =
       this.#anchors.get(position.anchorId) ?? this.#semanticAnchors.get(position.anchorId);
     if (anchor === undefined) {
+      this.#pendingPosition = null;
       return null;
     }
     const anchorTop = this.#anchorTop(anchor, this.scrollView.contentWidth);
     if (anchorTop === null) {
+      this.#pendingPosition = null;
       return null;
     }
     const height = this.#anchorHeight(anchor, this.scrollView.contentWidth);
@@ -307,26 +358,17 @@ export class TranscriptViewport {
   }
 
   #anchorTop(anchor: Anchor, width: number): number | null {
-    const index = this.document.children.indexOf(anchor.component);
-    return index < 0 ? null : this.#lineOffset(index, resolveMetric(anchor.line, width), width);
+    const geometry = this.document.geometry(anchor.component, width);
+    return geometry === undefined ? null : geometry.top + resolveMetric(anchor.line, width);
   }
 
   #anchorHeight(anchor: Anchor, width: number): number {
     return Math.max(
       1,
       anchor.height === undefined
-        ? anchor.component.render(Math.max(1, width)).length - resolveMetric(anchor.line, width)
+        ? (this.document.geometry(anchor.component, width)?.height ?? 0) -
+            resolveMetric(anchor.line, width)
         : resolveMetric(anchor.height, width),
-    );
-  }
-
-  #lineOffset(index: number, anchorLine: number, width: number): number {
-    const boundedWidth = Math.max(1, width);
-    return (
-      this.document.children
-        .slice(0, index)
-        .reduce((lineCount, component) => lineCount + component.render(boundedWidth).length, 0) +
-      anchorLine
     );
   }
 }
