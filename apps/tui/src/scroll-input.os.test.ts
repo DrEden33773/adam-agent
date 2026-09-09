@@ -45,7 +45,8 @@ test("PTY Main viewport scroll preserves drafts and resize anchors and restores 
     await fixture.waitForScreen("Show Main rows");
     fixture.write("\r");
     await fixture.waitForScreen("MAIN_SCROLL_119");
-    await fixture.waitForScreen("Adam · Streaming session");
+    const answerOffset = fixture.output().lastIndexOf("MAIN_SCROLL_119");
+    await fixture.waitForCompleteFrameAfter(" · idle", answerOffset);
     const draftOffset = fixture.output().length;
     fixture.write("retained draft");
     await fixture.waitForCompleteFrameAfter("retained draft", draftOffset);

@@ -3711,8 +3711,21 @@ test("the production session picker opens the exact focused existing session", a
     await fixture.waitForRecordedOutput("Select a project session");
     const beforeSelection = fixture.output().length;
     fixture.write("\u001b[B\r");
-    await fixture.waitForRecordedOutput("Adam · Streaming session", beforeSelection);
+    await fixture.waitForCompleteFrameAfter(
+      "Seeded project session for deepseek-v4-flash.direct",
+      beforeSelection,
+      "Select a project session",
+    );
     await fixture.waitForRecordedOutput("deepseek-v4-flash.direct · Certified", beforeSelection);
+    expect(
+      fixture
+        .screen()
+        ?.some(
+          (line) =>
+            line.includes("Seeded project session for deepseek-v4-flash.direct") &&
+            !line.includes("Adam ·"),
+        ),
+    ).toBe(true);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4473,9 +4486,9 @@ test("the footer exposes authoritative project context and run facts", async () 
     });
     await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitForRecordedOutput("Adam · Streaming session");
-    await fixture.waitForRecordedOutput("Assistant response stored as artifact");
+    await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
     const afterFirstAnswer = fixture.output().lastIndexOf("Assistant response stored as artifact");
     await fixture.waitForCompleteFrameAfter(" · idle", afterFirstAnswer);
     const beforeCompaction = fixture.output().length;
@@ -5612,9 +5625,11 @@ test("thinking selection changed during a run applies only to the next prompt", 
       beforeNextSelection,
     );
     await fixture.waitForRecordedOutput("Next thinking Off", beforeNextSelection);
+    const beforeCompletion = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitForRecordedOutput("Thinking policy: max.");
-    await fixture.waitForRecordedOutput("Adam · Streaming session");
+    await fixture.waitForCompleteFrameAfter("Thinking policy: max.", beforeCompletion);
+    const firstResult = fixture.output().lastIndexOf("Thinking policy: max.");
+    await fixture.waitForCompleteFrameAfter(" · idle", firstResult);
     const beforeSecondPrompt = fixture.output().length;
     fixture.write("Second prompt\r");
     await fixture.waitForRecordedOutput("Thinking policy: off.", beforeSecondPrompt);
@@ -5800,8 +5815,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await fixture.waitForRecordedOutput("Thinking done · adam");
     await fixture.waitForRecordedOutput("Reasoning answer.");
-    await fixture.waitForRecordedOutput(" · idle", beforeCompletion);
-    await fixture.waitForRecordedOutput("Adam · Streaming session", beforeCompletion);
+    await fixture.waitForCompleteFrameAfter(" · idle", beforeCompletion);
     beforeFrame = fixture.output().length;
     await fixture.resize(80, 24);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
@@ -5862,7 +5876,7 @@ test("repeated completed reasoning folds keep the selected block visible without
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
-    await waitForPhysicalText(terminal, "Adam · Streaming session");
+    await waitForPhysicalText(terminal, "Reasoning answer.");
     const durableStateBeforeFolds = await readFilesRecursively(stateRoot);
 
     for (let cycle = 0; cycle < 4; cycle += 1) {
@@ -6197,7 +6211,6 @@ test("Ctrl+T reads artifact-backed provider reasoning without placing it in the 
     fixture.write("Store provider reasoning out of line\r");
     await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
-    await fixture.waitForRecordedOutput("Adam · Streaming session");
     let frame = latestSynchronizedFrame(fixture.output().slice(beforePrompt)).join("\n");
     expect(frame).not.toContain("Artifact reasoning evidence");
     const durableStateBeforeExpand = await readFilesRecursively(stateRoot);
@@ -6272,7 +6285,6 @@ test("continued scrolling loads only the adjacent oversized reasoning range", as
     terminal.input("Traverse provider reasoning ranges\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
-    await waitForPhysicalText(terminal, "Adam · Streaming session");
     const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
@@ -6315,7 +6327,6 @@ test("a late downward reasoning range cannot replace the page selected while it 
     terminal.input("Keep a reordered reasoning range out of the viewport\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
-    await waitForPhysicalText(terminal, "Adam · Streaming session");
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
     await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270028 bytes");
@@ -6469,7 +6480,6 @@ test("folding oversized reasoning rejects a late range before a clean retry", as
     terminal.input("Hold one provider reasoning range\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
-    await waitForPhysicalText(terminal, "Adam · Streaming session");
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "reasoning-page-read-pending"));
 
@@ -6566,7 +6576,6 @@ test.each(["missing", "truncated", "same-size corrupt"] as const)(
       fixture.write("Recover one unavailable reasoning range\r");
       await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
       await waitForPath(join(controlRoot, "reasoning-session-settled"));
-      await fixture.waitForRecordedOutput("Adam · Streaming session");
       const artifactRoot = join(stateRoot, "artifacts");
       const artifactRelativePaths = (await readdir(artifactRoot, { recursive: true })).filter(
         (path): path is string => typeof path === "string" && !path.endsWith(".tmp"),
@@ -8076,7 +8085,7 @@ test("an older asynchronous copy receipt cannot survive a newer overlay action",
     await terminal.waitForFrameAfter("Session facts", beforeCopyReceipt);
     const beforeClose = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
-    await terminal.waitForFrameAfter("Adam · Streaming session", beforeClose);
+    await terminal.waitForFrameAfter("Read complete", beforeClose, "Session facts");
 
     expect(terminal.lines().join("\n")).not.toContain("Copied last assistant response.");
     terminal.input("\u0011");
@@ -8364,8 +8373,9 @@ test("an artifact-backed assistant response remains visible in the transcript", 
       workspaceRoot,
     });
     await fixture.waitForScreen("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitForRecordedOutput("Adam · Streaming session");
+    await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
     expect(fixture.output()).toContain("Assistant response stored as artifact");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -8653,9 +8663,9 @@ test("completed durable-context compaction renders an explicit chronology marker
       workspaceRoot,
     });
     await fixture.waitForScreen("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitForRecordedOutput("Assistant response stored as artifact");
-    await fixture.waitForRecordedOutput("Adam · Streaming session");
+    await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
     const afterFirstAnswer = fixture.output().lastIndexOf("Assistant response stored as artifact");
     await fixture.waitForCompleteFrameAfter(" · idle", afterFirstAnswer);
     const beforeCompaction = fixture.output().length;
