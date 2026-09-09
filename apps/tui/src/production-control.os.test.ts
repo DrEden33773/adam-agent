@@ -124,11 +124,11 @@ test("ordinary production at an intermediate height keeps Agent, Todo, Plan, Att
     terminal.resize(40, 12);
     await terminal.waitForFrameAfter("/help", before);
     for (const [keys, visible, absent] of [
-      ["\u001b[B", "Fleet ● Main", undefined],
-      ["\u001b[B", "Fleet ● @explore-1", undefined],
+      ["\u001b[B", "Fleet > Main", undefined],
+      ["\u001b[B", "Fleet > @explore-1", undefined],
       ["\r", "Conversation · @explore-1", undefined],
       ["\u001b[27;1;27~", "Fleet", "Conversation ·"],
-      ["\u001b[27;1;27~", "Fleet ○ Main", undefined],
+      ["\u001b[27;1;27~", "Fleet   Main", undefined],
       ["Main after child navigation", "Main after child navigation", undefined],
     ] as const) {
       before = terminal.output().length;

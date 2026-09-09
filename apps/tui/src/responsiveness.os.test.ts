@@ -301,7 +301,7 @@ test("ordinary production keeps representative history, Todo and two unfinished 
     await press("permission", "Start two performance children\r", "Confirm delegation");
     expect(childRequests).toBe(0);
     expect(await controlStore.read()).toEqual([]);
-    await press("admission", "\r", "@explore-2 · Explore · Running");
+    await press("admission", "\r", "@explore-2 · Running · Explore");
     await terminal.waitForScreen("Main responsiveness ready.");
     await awaitEveReceipt(
       childrenStarted.promise,
@@ -343,8 +343,8 @@ test("ordinary production keeps representative history, Todo and two unfinished 
       await press("todoClose", "\u001b[27;1;27~", "Main responsiveness ready.", "Todos · revision");
       await press("agents", "/agents\r", "Agents workspace");
       await press("agentsClose", "\u001b[27;1;27~", "Fleet", "Agents workspace");
-      await press("fleet", "\u001b[B", "● Main");
-      await press("childSelect", "\u001b[B", "● @explore-1");
+      await press("fleet", "\u001b[B", "> Main");
+      await press("childSelect", "\u001b[B", "> @explore-1");
       await press("childOpen", "\r", "Conversation · @explore-1");
       const state = presentation.getState();
       const selected = state.authoritative.managedControl?.threads.find(
@@ -361,7 +361,7 @@ test("ordinary production keeps representative history, Todo and two unfinished 
         status: "generating_arguments",
       });
       await press("childBack", "\u001b[27;1;27~", "Fleet", "Conversation ·");
-      await press("fleetClose", "\u001b[27;1;27~", "Fleet", "● @explore-1");
+      await press("fleetClose", "\u001b[27;1;27~", "Fleet", "> @explore-1");
     }
     await press(
       "mainConcurrentEnter",
@@ -374,8 +374,8 @@ test("ordinary production keeps representative history, Todo and two unfinished 
         .authoritative.managedControl?.threads.map((thread) => thread.turn.phase),
     ).toEqual(["executing", "executing"]);
     release.resolve();
-    await terminal.waitForScreen("@explore-1 · Explore · Completed");
-    await terminal.waitForScreen("@explore-2 · Explore · Completed");
+    await terminal.waitForScreen("@explore-1 · Completed · Explore");
+    await terminal.waitForScreen("@explore-2 · Completed · Explore");
     await press("mainEnter", "Final Main response\r", "Final Main response durably accepted.");
     await terminal.waitForScreen(" · idle");
     phase("final durable history");

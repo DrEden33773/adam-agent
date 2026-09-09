@@ -80,7 +80,7 @@ test.each(["saturated", "short_ack"] as const)(
       expect(threads).toHaveLength(16);
       expect(threads.filter((thread) => thread.turn.phase === "executing")).toHaveLength(8);
       expect(threads.filter((thread) => thread.turn.phase === "queued")).toHaveLength(8);
-      await h.press("\x1b[B", "● Main");
+      await h.press("\x1b[B", "> Main");
       if (profiler !== undefined) {
         profiler.connect();
         await profiler.post("Profiler.enable");
@@ -91,7 +91,7 @@ test.each(["saturated", "short_ack"] as const)(
       for (let wave = 0; wave < waveCount; wave += 1) {
         const waveStart = performance.now();
         const offset = h.terminal.output().length;
-        const expected = wave % 2 === 0 ? "● @explore-1" : "● Main";
+        const expected = wave % 2 === 0 ? "> @explore-1" : "> Main";
         const input = new Promise<{
           scheduledInputMilliseconds: number;
           frameMilliseconds: number;

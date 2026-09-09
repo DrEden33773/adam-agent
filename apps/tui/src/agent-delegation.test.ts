@@ -72,7 +72,7 @@ test("direct delegation reviews finite execution and token bounds before one exa
     await h.press("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r", "Enter apply");
     await h.press("\x01\x0bNamed evidence work\r", "Description updated.");
     expect(requests).toHaveLength(0);
-    await h.press("\r", "@explore-1 · Explore · Completed");
+    await h.press("\r", "@explore-1 · Completed · Explore");
     expect(requests).toHaveLength(1);
     const admission = (await h.store.read()).find((record) => record.event.type === "admitted");
     expect(admission?.event).toMatchObject({
@@ -144,7 +144,7 @@ test("a Main model delegation uses the exact editable grant in its pending permi
     expect(
       (await h.store.read()).filter((record) => record.event.type === "admitted"),
     ).toHaveLength(0);
-    await h.press("\r", "@explore-1 · Explore · Completed");
+    await h.press("\r", "@explore-1 · Completed · Explore");
     const admission = (await h.store.read()).find((record) => record.event.type === "admitted");
     expect(admission?.event).toMatchObject({
       context: { mode: "task" },
@@ -286,7 +286,7 @@ test.each([
         await h.press("\x1b[A\r", "Context updated.");
       }
       expect(requests).toHaveLength(0);
-      await h.press("\r", "@explore-1 · Explore · Completed");
+      await h.press("\r", "@explore-1 · Completed · Explore");
       expect(requests).toHaveLength(1);
       const text = JSON.stringify(requests[0]?.messages);
       if (choice === "keep") expect(text).toContain("REQUESTED CHILD SKILL BODY");

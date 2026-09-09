@@ -9,6 +9,7 @@ import {
   getKeybindings,
   isKeyRelease,
   isKeyRepeat,
+  Markdown,
   matchesKey,
   SelectList,
   truncateToWidth,
@@ -38,6 +39,7 @@ export class TodoNavigator implements Component {
   #cursor: string | null = null;
   #compactCollapsed: boolean;
   #detail: TodoEntityResource | null = null;
+  #detailMarkdown: { text: string; component: Markdown } | undefined;
   #generation = 0;
   #list: GroupedTodoList;
   #notice: string | null = null;
@@ -134,14 +136,14 @@ export class TodoNavigator implements Component {
     if (this.#detail !== null) {
       const { item } = this.#detail;
       const bodyLines = [
-        safeTerminalText(item.title),
-        `${item.status} · item revision ${item.itemRevision} · created ${item.createdOrdinal}`,
-        `ID ${item.id}`,
+        this.#theme.text(safeTerminalText(item.title)),
+        `${(item.status === "completed" ? this.#theme.statusSuccess : item.status === "in_progress" ? this.#theme.reference : this.#theme.statusWarning)(item.status)}${this.#theme.muted(` · item revision ${item.itemRevision} · created ${item.createdOrdinal}`)}`,
+        this.#theme.muted(`ID ${item.id}`),
         ...(item.activeForm === undefined ? [] : [`Active: ${safeTerminalText(item.activeForm)}`]),
         "",
         ...(item.details === undefined
           ? [this.#theme.muted("No details.")]
-          : safeTerminalText(item.details).split("\n")),
+          : this.#renderDetails(item.details, width)),
         "",
         item.dependencyIds.length === 0
           ? this.#theme.muted("Dependencies: none")
@@ -174,6 +176,23 @@ export class TodoNavigator implements Component {
     ]
       .slice(0, maximumContentHeight)
       .map((line) => truncateToWidth(line, width));
+  }
+
+  #renderDetails(text: string, width: number): string[] {
+    const safe = safeTerminalText(text);
+    if (this.#detailMarkdown?.text !== safe)
+      this.#detailMarkdown = {
+        text: safe,
+        component: new Markdown(safe, 0, 0, this.#theme.markdown, undefined, {
+          preserveOrderedListMarkers: true,
+          preserveBackslashEscapes: true,
+        }),
+      };
+    try {
+      return this.#detailMarkdown.component.render(Math.max(1, width));
+    } catch {
+      return wrapTextWithAnsi(safe, Math.max(1, width));
+    }
   }
 
   #createList(page: TodoPageResource): GroupedTodoList {

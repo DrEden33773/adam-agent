@@ -5,11 +5,11 @@
  */
 import type {
   AgentUiSettings,
-  ManagedControlThread,
   ManagedWorkspaceSnapshot,
   PresentationDisplayState,
 } from "@adam-agent/presentation";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { agentStatus, agentStatusStyle, agentTimedLine } from "./agent-view-format.js";
 import {
   type DeadlineHandle,
   type DeadlineScheduler,
@@ -18,20 +18,6 @@ import {
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
 import { toolArgumentPhaseLabel } from "./tool-argument-phase.js";
-
-export function agentElapsedLabel(thread: ManagedControlThread): string {
-  const start = thread.turn.startedAtUnixMilliseconds;
-  if (start === undefined) return "";
-  const end =
-    thread.turn.outcome === undefined
-      ? thread.residency === "live"
-        ? Date.now()
-        : undefined
-      : thread.turn.outcome.atUnixMilliseconds;
-  return end === undefined
-    ? " · elapsed unknown"
-    : ` · elapsed ${Math.max(0, Math.floor((end - start) / 1000))}s`;
-}
 
 export class AgentWidget implements Component {
   #snapshot: ManagedWorkspaceSnapshot | undefined;
@@ -151,13 +137,15 @@ export class AgentWidget implements Component {
     const attentionCount = threads.filter(needsAttention).length;
     const errorCount = threads.filter(hasError).length;
     const urgentCounts = [
-      ...(attentionCount ? [`${attentionCount} attention`] : []),
-      ...(errorCount ? [`${errorCount} error${errorCount === 1 ? "" : "s"}`] : []),
+      ...(attentionCount ? [this.theme.statusWarning(`${attentionCount} attention`)] : []),
+      ...(errorCount
+        ? [this.theme.statusError(`${errorCount} error${errorCount === 1 ? "" : "s"}`)]
+        : []),
     ];
     const maximum = Math.max(2, this.maximumLines());
     if (maximum === 2 && (waiting.length || settling.length || attentionCount || errorCount)) {
       return [
-        this.theme.primary(
+        this.theme.toolTitle(
           `● Agents ${threads.length}${urgentCounts.length ? ` · ${urgentCounts.join(" · ")}` : ""}`,
         ),
         boundedCountSummary(
@@ -172,19 +160,16 @@ export class AgentWidget implements Component {
         ),
       ].map((line) => truncateToWidth(line, width));
     }
-    const renderThread = (thread: (typeof threads)[number], compressed = false): string[] => {
+    type Node = {
+      readonly head: (columns: number) => string;
+      readonly children: readonly string[];
+    };
+    const threadNode = (thread: (typeof threads)[number], compressed = false): Node => {
       const activity = this.#activity.find(
         (item) => item.agentId === thread.threadId && item.attemptId === thread.turn.attemptId,
       );
       const config = thread.turn.configuration;
       const isQueued = isQueuedThread(thread);
-      const priorityStatus =
-        compressed &&
-        (needsAttention(thread) ||
-          hasError(thread) ||
-          thread.turn.phase === "waiting" ||
-          thread.turn.phase === "settling");
-      const elapsed = agentElapsedLabel(thread);
       const argumentPhase =
         activity?.tool === undefined ? undefined : toolArgumentPhaseLabel(activity.tool.status);
       const content =
@@ -198,36 +183,68 @@ export class AgentWidget implements Component {
         content !== thread.turn.label
           ? `${thread.turn.label} · ${content}`
           : content;
-      return [
-        `├─ ${isQueued ? `${safeTerminalText(thread.turn.label.split(" · ")[0] ?? thread.turn.label)} ${safeTerminalText(thread.handle)} · ` : priorityStatus ? `${safeTerminalText(thread.turn.label)} · ` : thread.turn.phase === "executing" ? `${["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame]} ` : ""}${this.theme.reference(safeTerminalText(thread.displayName))} · ${thread.turn.phase === "idle" && !priorityStatus ? `${safeTerminalText(thread.turn.label)} · ` : ""}${safeTerminalText(thread.description)}${elapsed}`,
-        ...(!isQueued && thread.turn.phase !== "idle"
-          ? [`   ⎿ ${safeTerminalText(visibleContent)}`]
-          : []),
-        ...(thread.turn.outcome?.error === undefined
-          ? []
-          : [
-              `   ⎿ ${safeTerminalText(`${thread.turn.outcome.error.code}: ${thread.turn.outcome.error.message}`)}`,
-            ]),
-        ...(settings?.showModel && config !== undefined
-          ? [
-              `   ${safeTerminalText(config.targetId)} · thinking ${safeTerminalText(config.thinking)}`,
-            ]
-          : []),
-      ];
+      const contentStyle =
+        activity?.tool !== undefined
+          ? this.theme.toolTitle
+          : content === thread.turn.label
+            ? agentStatusStyle(this.theme, thread)
+            : this.theme.text;
+      return {
+        head: (columns) => {
+          const spinner =
+            thread.turn.phase === "executing"
+              ? `${this.theme.reference(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame] ?? "⠋")} `
+              : "";
+          const status =
+            compressed || isQueued || thread.turn.phase === "idle" || columns < 55
+              ? ` · ${agentStatus(this.theme, thread)}`
+              : "";
+          const role =
+            columns >= 55 ? ` · ${this.theme.muted(safeTerminalText(thread.displayName))}` : "";
+          return agentTimedLine(
+            this.theme,
+            `${spinner}${this.theme.reference(safeTerminalText(thread.handle))}${status}${role} · ${this.theme.text(safeTerminalText(thread.description))}`,
+            thread,
+            columns,
+          );
+        },
+        children: [
+          ...(!isQueued && thread.turn.phase !== "idle"
+            ? [contentStyle(safeTerminalText(visibleContent))]
+            : []),
+          ...(thread.turn.outcome?.error === undefined
+            ? []
+            : [
+                this.theme.statusError(
+                  safeTerminalText(
+                    `${thread.turn.outcome.error.code}: ${thread.turn.outcome.error.message}`,
+                  ),
+                ),
+              ]),
+          ...(settings?.showModel && config !== undefined
+            ? [
+                this.theme.muted(
+                  `${safeTerminalText(config.targetId)} · thinking ${safeTerminalText(config.thinking)}`,
+                ),
+              ]
+            : []),
+        ],
+      };
     };
-    const normal = [...finished, ...active, ...queued].flatMap((thread) => renderThread(thread));
+    const normal = [...finished, ...active, ...queued].map((thread) => threadNode(thread));
+    const normalHeight = normal.reduce((sum, node) => sum + 1 + node.children.length, 0);
     const statusCounts = [
-      `${running.length} running`,
-      ...(waiting.length ? [`${waiting.length} waiting`] : []),
-      ...(settling.length ? [`${settling.length} settling`] : []),
-      `${queued.length} queued`,
+      this.theme.reference(`${running.length} running`),
+      ...(waiting.length ? [this.theme.statusWarning(`${waiting.length} waiting`)] : []),
+      ...(settling.length ? [this.theme.reference(`${settling.length} settling`)] : []),
+      this.theme.statusWarning(`${queued.length} queued`),
     ];
     const lines = [
-      this.theme.primary(
-        `● Agents${normal.length + 1 > maximum ? ` · ${(urgentCounts.length ? urgentCounts : statusCounts).join(" · ")}` : ""}`,
-      ),
+      `${this.theme.toolTitle("● Agents")}${normalHeight + 1 > maximum ? ` · ${(urgentCounts.length ? urgentCounts : statusCounts).join(" · ")}` : ""}`,
     ];
-    if (normal.length + 1 <= maximum) lines.push(...normal);
+    const visible: Node[] = [];
+    let footer: string | undefined;
+    if (normalHeight + 1 <= maximum) visible.push(...normal);
     else {
       const showQueueSummary = queued.length > 0 && maximum > 2;
       let budget = maximum - 2 - Number(showQueueSummary);
@@ -249,13 +266,17 @@ export class AgentWidget implements Component {
           else hiddenRunning += 1;
           continue;
         }
-        const full = renderThread(thread, true);
-        const rendered = full.slice(0, budget);
-        lines.push(...rendered);
-        budget -= rendered.length;
-        hiddenDetails += full.length - rendered.length;
+        const node = threadNode(thread, true);
+        const children = node.children.slice(0, budget - 1);
+        visible.push({ ...node, children });
+        budget -= 1 + children.length;
+        hiddenDetails += node.children.length - children.length;
       }
-      if (showQueueSummary) lines.push(`├─ ${queued.length} queued · /agents`);
+      if (showQueueSummary)
+        visible.push({
+          head: () => this.theme.statusWarning(`${queued.length} queued · /agents`),
+          children: [],
+        });
       const compact = width < 60;
       const hidden = [
         ...(hiddenRunning ? [`${hiddenRunning} ${compact ? "run" : "running"}`] : []),
@@ -265,10 +286,24 @@ export class AgentWidget implements Component {
         ...(hiddenFinished ? [`${hiddenFinished} ${compact ? "done" : "finished"}`] : []),
         ...(hiddenDetails ? [`${hiddenDetails} ${compact ? "line" : "detail lines"}`] : []),
       ];
-      lines.push(compact ? `… hidden ${hidden.join("/")}` : `… ${hidden.join(" / ")} hidden`);
+      footer = this.theme.muted(
+        compact ? `… hidden ${hidden.join("/")}` : `… ${hidden.join(" / ")} hidden · /agents`,
+      );
     }
-    const lastBranch = lines.findLastIndex((line) => line.includes("├─"));
-    if (lastBranch >= 0) lines[lastBranch] = (lines[lastBranch] ?? "").replace("├─", "└─");
+    // The final visible structure owns connectors. Never search or rewrite rendered content.
+    for (const [index, node] of visible.entries()) {
+      const last = index === visible.length - 1;
+      const prefix = last ? "└─ " : "├─ ";
+      lines.push(this.theme.overlay(prefix) + node.head(Math.max(0, width - visibleWidth(prefix))));
+      for (const [childIndex, child] of node.children.entries()) {
+        const childPrefix = `${last ? "   " : "│  "}${childIndex === node.children.length - 1 ? "└─ " : "├─ "}`;
+        lines.push(
+          this.theme.overlay(childPrefix) +
+            truncateToWidth(child, Math.max(0, width - visibleWidth(childPrefix))),
+        );
+      }
+    }
+    if (footer !== undefined) lines.push(footer);
     return lines.map((line) => truncateToWidth(line, width));
   }
 }

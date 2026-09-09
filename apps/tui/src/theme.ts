@@ -17,6 +17,7 @@ export type AdamTuiTheme = {
   readonly danger: (text: string) => string;
   readonly deny: (text: string) => string;
   readonly editor: EditorTheme;
+  readonly selectionBackground: (text: string) => string;
   readonly inverseSelection: (text: string) => string;
   readonly keyword: (text: string) => string;
   readonly markdown: MarkdownTheme;
@@ -119,6 +120,11 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
     danger: red,
     allow: green,
     deny: red,
+    // Pi truncation can insert a full reset inside the row; the selection surface must continue.
+    selectionBackground: noColor
+      ? identity
+      : (value) =>
+          `\u001b[48;2;49;50;68m${value.replaceAll("\u001b[0m", "\u001b[0m\u001b[48;2;49;50;68m").replaceAll("\u001b[49m", "\u001b[49m\u001b[48;2;49;50;68m").replaceAll("\u001b[m", "\u001b[m\u001b[48;2;49;50;68m")}\u001b[49m`,
     inverseSelection: (value) => background(205, 214, 244)(crust(value)),
     userText: text,
     userBackground: background(49, 50, 68),
