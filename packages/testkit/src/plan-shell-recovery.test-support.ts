@@ -143,7 +143,7 @@ export async function exercisePlanShellRecoveryFixture(options: {
       command: options.command,
       cwd: "." as const,
       planCycleId: plan.cycleId,
-      planPolicyVersion: "plan-policy.hybrid-v1" as const,
+      planPolicyVersion: "plan-policy.hybrid-todo-v1" as const,
       shellPolicyVersion: "plan-shell-policy.v1" as const,
       shellEnvironmentVersion: "plan-shell-env.v1" as const,
       shellEnvironmentDigest: plan.shellEnvironment.digest,

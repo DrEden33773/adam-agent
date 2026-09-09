@@ -642,6 +642,7 @@ export async function createPresentationSession(
           ? null
           : {
               session: summary,
+              todoPermissionPolicy: created.todoPermissionPolicy,
               ...(initialRecovery === null ? {} : { recovery: initialRecovery }),
               transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
               linkedOperations: projectedOperations.map(({ display }) => display),
@@ -1829,6 +1830,7 @@ export async function createPresentationSession(
           managedAgents: activatedManagedAgents,
           active: {
             session: activatedSummary,
+            todoPermissionPolicy: snapshot.todoPermissionPolicy,
             ...(activatedRecovery === null ? {} : { recovery: activatedRecovery }),
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
             linkedOperations: activatedOperations.map((operation) => operation.display),
@@ -6331,6 +6333,29 @@ export async function createPresentationSession(
             status: "rejected",
             code: "authority_rejected",
             message: "The current Plan cycle could not be exited.",
+          };
+        }
+      }
+      if (command.type === "upgrade_todo_permission_policy") {
+        if (command.sessionId !== state.authoritative.active?.session.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        try {
+          const snapshot = await options.lifecycle.upgradeTodoPermissionPolicy(command);
+          await activateSnapshot(snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message:
+              error instanceof SessionLifecycleError && error.code === "session_invalid"
+                ? "Todo permission can only be upgraded in an idle session with no pending work."
+                : "The Todo permission update could not be confirmed. Reopen this session before retrying.",
           };
         }
       }

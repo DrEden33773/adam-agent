@@ -37,6 +37,7 @@ import {
   skillContextSnapshot,
 } from "./skills.js";
 import { hasTodoToolProfileV1, todoStoreSnapshotFromRecordsV1, todoSummaryV1 } from "./todo.js";
+import { todoPermissionPolicyFromRecords } from "./todo-permission-policy.js";
 
 export function skillResourceBytesFromRecords(
   records: readonly SessionRecord[],
@@ -426,6 +427,7 @@ export function isCompleteBranchBoundary(records: readonly SessionRecord[]): boo
             entry.record.type === "skill_catalog_committed" ||
             entry.record.type === "skill_catalog_failed" ||
             entry.record.type === "skill_revoked" ||
+            entry.record.type === "session_todo_permission_policy_changed" ||
             entry.record.type === "mcp_workspace_confirmed" ||
             entry.record.type === "mcp_server_definition_approved" ||
             entry.record.type === "mcp_activation_started" ||
@@ -494,6 +496,7 @@ export function snapshotFromGenesis(
     : undefined;
   return {
     schemaVersion: 3,
+    todoPermissionPolicy: todoPermissionPolicyFromRecords([genesis]),
     sessionId: genesis.record.sessionId,
     projectId: genesis.record.projectId,
     targetIdentity: genesis.record.targetIdentity,
@@ -973,6 +976,7 @@ export function snapshotFromRecords(
     const skillContext = skillContextRecordFromRecords(genesis, records);
     return {
       ...snapshotFromGenesis(genesis, records.length),
+      todoPermissionPolicy: todoPermissionPolicyFromRecords(records),
       ...(promptContext === undefined ? {} : { promptContext }),
       ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
       ...(context === undefined ? {} : { context }),
@@ -1032,6 +1036,7 @@ export function snapshotFromRecords(
   const skillContext = skillContextRecordFromRecords(genesis, records);
   return {
     ...snapshotFromGenesis(genesis, records.length),
+    todoPermissionPolicy: todoPermissionPolicyFromRecords(records),
     ...(promptContext === undefined ? {} : { promptContext }),
     ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
     ...(context === undefined ? {} : { context }),

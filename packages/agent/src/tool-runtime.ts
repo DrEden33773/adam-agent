@@ -100,6 +100,19 @@ export type ToolResult =
   | { readonly status: "completed"; readonly output: JsonValue }
   | { readonly status: "failed"; readonly error: ToolError };
 
+const builtinTodoAdapters = new WeakSet<object>();
+export function isBuiltinTodoAdapter(adapter: ToolAdapter): boolean {
+  return builtinTodoAdapters.has(adapter);
+}
+export function captureToolAdapter(
+  adapter: ToolAdapter,
+  definition: ModelToolDefinition,
+): ToolAdapter {
+  const captured = { ...adapter, definition, prepare: adapter.prepare.bind(adapter) };
+  if (isBuiltinTodoAdapter(adapter)) builtinTodoAdapters.add(captured);
+  return captured;
+}
+
 export type ToolAdapter = {
   readonly retainedVersions?: readonly ToolAdapter[];
   readonly definition: ModelToolDefinition;
@@ -251,6 +264,11 @@ export type PermissionDecision = "allow" | "ask" | "deny";
 
 export type PermissionSubject =
   | {
+      readonly type: "session_todo";
+      readonly sessionId: string;
+      readonly operation: "create_todo" | "update_todo" | "update_todos";
+    }
+  | {
       readonly type: "managed_agent_action";
       readonly envelope?: ManagedDelegationEnvelope;
       readonly parentSessionId: string;
@@ -303,7 +321,11 @@ export type PermissionSubject =
       readonly command: string;
       readonly cwd: ".";
       readonly planCycleId: string;
-      readonly planPolicyVersion: "plan-policy.hybrid-v1" | "plan-policy.hybrid-delegation-v1";
+      readonly planPolicyVersion:
+        | "plan-policy.hybrid-v1"
+        | "plan-policy.hybrid-delegation-v1"
+        | "plan-policy.hybrid-todo-v1"
+        | "plan-policy.hybrid-delegation-todo-v1";
       readonly shellPolicyVersion: "plan-shell-policy.v1";
       readonly shellEnvironmentVersion: "plan-shell-env.v1";
       readonly shellEnvironmentDigest: `sha256:${string}`;
@@ -1394,6 +1416,10 @@ function createCodingToolRegistryInternal(options: {
     ...makeUpdateTodosAdapter(2),
     retainedVersions: [makeUpdateTodosAdapter(1)],
   };
+  for (const adapter of [createTodoAdapter, updateTodoAdapter, updateTodosAdapter]) {
+    builtinTodoAdapters.add(adapter);
+    for (const retained of adapter.retainedVersions) builtinTodoAdapters.add(retained);
+  }
   const adapters = [
     requireAdapter(readTools, "read_file"),
     requireAdapter(readTools, "search_repository"),

@@ -120,9 +120,11 @@ import {
   type ApprovedPlanProjectionV1,
   createPlanToolProfileV1,
   digestApprovedPlanProjectionV1,
+  isDelegationPlanPolicy,
   isHybridPlanPolicy,
   isPlanDelegationTool,
   isPlanWebTool,
+  isTodoPlanPolicy,
   type PlanApprovalIntentV1,
   type PlanEligibleToolProfileV1,
   type PlanPolicyVersion,
@@ -271,10 +273,12 @@ import {
   todoStoreSnapshotDigestV1,
   todoStoreSnapshotFromRecordsV1,
 } from "./todo.js";
+import { todoPermissionPolicyFromRecords } from "./todo-permission-policy.js";
 import {
   bindInputResourceToolRegistry,
   createCodingToolRegistry,
   createPermissionPolicy,
+  isBuiltinTodoAdapter,
   type PermissionPolicy,
   resolveToolDefinition,
   type ToolEffect,
@@ -855,6 +859,9 @@ export interface SessionLifecycle {
 
   enableAutomaticTitles(): void;
   ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
+  upgradeTodoPermissionPolicy(input: {
+    readonly sessionId: string;
+  }): Promise<CurrentSessionSnapshot>;
   enterPlan(input: { readonly sessionId: string }): Promise<CurrentSessionSnapshot>;
   cancelPlan(input: {
     readonly sessionId: string;
@@ -2906,15 +2913,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
   };
 
+  const selectedPlanPolicy = (todoPermissionPolicy: string | undefined): PlanPolicyVersion =>
+    options[sessionManagedControl]?.planPolicyVersion ??
+    (options[sessionManagedControl] === undefined
+      ? todoPermissionPolicy === "todo-permission.session-v1"
+        ? "plan-policy.hybrid-todo-v1"
+        : "plan-policy.hybrid-v1"
+      : todoPermissionPolicy === "todo-permission.session-v1"
+        ? "plan-policy.hybrid-delegation-todo-v1"
+        : "plan-policy.hybrid-delegation-v1");
+
   const preparePlanCycleEntry = async (
     sequence: number,
     eligibleToolProfile: PlanEligibleToolProfileV1,
+    policyVersion: PlanPolicyVersion,
   ): Promise<SessionPlanCycleEnteredRecord> => {
-    const policyVersion =
-      options[sessionManagedControl]?.planPolicyVersion ??
-      (options[sessionManagedControl] === undefined
-        ? "plan-policy.hybrid-v1"
-        : "plan-policy.hybrid-delegation-v1");
     return {
       schemaVersion: 3,
       sequence,
@@ -3066,6 +3079,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         sequence: 1,
         record: {
           type: "session_genesis",
+          todoPermissionPolicyVersion: "todo-permission.session-v1",
           ...(input.resolved === undefined
             ? {}
             : { recordVersion: 2 as const, contextProfile: input.resolved.contextProfile }),
@@ -3203,17 +3217,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (promptContext === undefined) {
         throw new SessionLifecycleError("session_invalid");
       }
+      const policyVersion = selectedPlanPolicy(prepared.genesis.record.todoPermissionPolicyVersion);
       plan = await preparePlanCycleEntry(
         2,
         planToolProfileFromAuthority(
           promptContext.toolProfile,
           prepared.tools,
           undefined,
-          options[sessionManagedControl]?.planPolicyVersion ??
-            (options[sessionManagedControl] === undefined
-              ? "plan-policy.hybrid-v1"
-              : "plan-policy.hybrid-delegation-v1"),
+          policyVersion,
         ),
+        policyVersion,
       );
     }
     return plan;
@@ -3534,6 +3547,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           sequence: 1,
           record: {
             type: "session_genesis",
+            todoPermissionPolicyVersion: todoPermissionPolicyFromRecords(parentPrefix),
             ...(branchContextProfile === undefined
               ? {}
               : { recordVersion: 2 as const, contextProfile: branchContextProfile }),
@@ -4497,6 +4511,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ...(planApproval === undefined ? {} : { planKickoff: planApproval }),
             ...(runtimePlan === undefined ? {} : { plan: runtimePlan }),
             ...(planRevision === undefined ? {} : { planRevision }),
+            todoPermissionPolicy: todoPermissionPolicyFromRecords(replayRecords),
             ...(todo === undefined ? {} : { todo }),
             referencedModelResponseArtifactBytes,
             skillResourceLineageBytes,
@@ -6154,6 +6169,31 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return { status: "updated", snapshot };
       });
     },
+    async upgradeTodoPermissionPolicy(input) {
+      if (activeSession !== undefined) throw new SessionLifecycleError("session_invalid");
+      return withOwner(async () => {
+        const inspected = await inspectSession(input);
+        if (
+          inspected.schemaVersion !== 3 ||
+          (inspected.status !== "idle" && inspected.status !== "settled")
+        )
+          throw new SessionLifecycleError("session_invalid");
+        if (inspected.todoPermissionPolicy === "todo-permission.session-v1") return inspected;
+        const store = await openSessionStore(options, input.sessionId);
+        await store.append({
+          schemaVersion: 3,
+          sequence: inspected.lastSequence + 1,
+          record: {
+            type: "session_todo_permission_policy_changed",
+            recordVersion: 1,
+            policyVersion: "todo-permission.session-v1",
+          },
+        });
+        const snapshot = await inspectSession(input);
+        if (snapshot.schemaVersion !== 3) throw new SessionLifecycleError("session_invalid");
+        return snapshot;
+      });
+    },
     async enterPlan(input) {
       if (activeSession !== undefined) {
         throw new SessionLifecycleError("session_invalid");
@@ -6184,16 +6224,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           genesis.record.managedAgentTools,
           genesis.record.webEvidence,
         );
+        const policyVersion = selectedPlanPolicy(inspected.todoPermissionPolicy);
         const entry = await preparePlanCycleEntry(
           (records.at(-1)?.sequence ?? 0) + 1,
-          planToolProfile(
-            inspected,
-            sessionTools,
-            options[sessionManagedControl]?.planPolicyVersion ??
-              (options[sessionManagedControl] === undefined
-                ? "plan-policy.hybrid-v1"
-                : "plan-policy.hybrid-delegation-v1"),
-          ),
+          planToolProfile(inspected, sessionTools, policyVersion),
+          policyVersion,
         );
         const store = await openSessionStore(options, input.sessionId);
         await store.append(entry);
@@ -9036,10 +9071,11 @@ function planToolProfileFromAuthority(
     }
     if (
       adapter.effect === "read" ||
-      (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+      (isTodoPlanPolicy(policyVersion) && isBuiltinTodoAdapter(adapter)) ||
+      (isDelegationPlanPolicy(policyVersion) &&
         adapter.effect === "network" &&
         isPlanWebTool(definition.name)) ||
-      (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+      (isDelegationPlanPolicy(policyVersion) &&
         adapter.effect === "delegate" &&
         isPlanDelegationTool(definition.name)) ||
       (isHybridPlanPolicy(policyVersion) &&

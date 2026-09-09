@@ -10,6 +10,8 @@ export const planPolicyVersions = [
   "plan-policy.read-v1",
   "plan-policy.hybrid-v1",
   "plan-policy.hybrid-delegation-v1",
+  "plan-policy.hybrid-todo-v1",
+  "plan-policy.hybrid-delegation-todo-v1",
 ] as const;
 
 export const submitPlanToolDefinitionV1: ModelToolDefinition = {
@@ -29,8 +31,29 @@ export const submitPlanToolDefinitionV1: ModelToolDefinition = {
 
 export function isHybridPlanPolicy(
   policy: string | undefined,
-): policy is "plan-policy.hybrid-v1" | "plan-policy.hybrid-delegation-v1" {
-  return policy === "plan-policy.hybrid-v1" || policy === "plan-policy.hybrid-delegation-v1";
+): policy is Exclude<PlanPolicyVersion, "plan-policy.read-v1"> {
+  return (
+    policy === "plan-policy.hybrid-v1" ||
+    policy === "plan-policy.hybrid-delegation-v1" ||
+    isTodoPlanPolicy(policy)
+  );
+}
+
+export function isTodoPlanPolicy(
+  policy: string | undefined,
+): policy is "plan-policy.hybrid-todo-v1" | "plan-policy.hybrid-delegation-todo-v1" {
+  return (
+    policy === "plan-policy.hybrid-todo-v1" || policy === "plan-policy.hybrid-delegation-todo-v1"
+  );
+}
+
+export function isDelegationPlanPolicy(
+  policy: string | undefined,
+): policy is "plan-policy.hybrid-delegation-v1" | "plan-policy.hybrid-delegation-todo-v1" {
+  return (
+    policy === "plan-policy.hybrid-delegation-v1" ||
+    policy === "plan-policy.hybrid-delegation-todo-v1"
+  );
 }
 export function isPlanWebTool(name: string): boolean {
   return name === "web_fetch" || name === "web_search";
@@ -174,11 +197,15 @@ export function isPlanToolProfileV1Valid(
         definition.name.length <= 256 &&
         /^sha256:[0-9a-f]{64}$/u.test(definition.definitionDigest) &&
         (definition.effect === "read" ||
-          (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+          (isTodoPlanPolicy(policyVersion) &&
+            definition.source === "builtin" &&
+            definition.effect === "write" &&
+            ["create_todo", "update_todo", "update_todos"].includes(definition.name)) ||
+          (isDelegationPlanPolicy(policyVersion) &&
             definition.source === "builtin" &&
             definition.effect === "network" &&
             isPlanWebTool(definition.name)) ||
-          (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+          (isDelegationPlanPolicy(policyVersion) &&
             definition.source === "builtin" &&
             definition.effect === "delegate" &&
             isPlanDelegationTool(definition.name)) ||

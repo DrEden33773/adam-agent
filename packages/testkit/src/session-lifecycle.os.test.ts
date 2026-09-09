@@ -301,7 +301,7 @@ test("SessionLifecycle hybrid Plan automatically executes one exact simple inspe
       result: { status: "completed", answer: "The Plan inspection completed automatically." },
       plan: {
         state: "exploring",
-        policyVersion: "plan-policy.hybrid-v1",
+        policyVersion: "plan-policy.hybrid-todo-v1",
         shellPolicyVersion: "plan-shell-policy.v1",
       },
       permissionRequests: 0,
@@ -337,7 +337,7 @@ test("SessionLifecycle hybrid Plan durably freezes its shell environment identit
     const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
 
     expect(entered.plan).toMatchObject({
-      policyVersion: "plan-policy.hybrid-v1",
+      policyVersion: "plan-policy.hybrid-todo-v1",
       shellPolicyVersion: "plan-shell-policy.v1",
       shellEnvironment: {
         version: "plan-shell-env.v1",
@@ -819,7 +819,7 @@ test("SessionLifecycle hybrid Plan asks once for one exact ambiguous diagnostic"
           command,
           cwd: ".",
           planCycleId: plan.cycleId,
-          planPolicyVersion: "plan-policy.hybrid-v1",
+          planPolicyVersion: "plan-policy.hybrid-todo-v1",
           shellPolicyVersion: "plan-shell-policy.v1",
           toolProfileDigest: plan.eligibleToolProfile.digest,
           assessment: {
@@ -2500,7 +2500,7 @@ test.each([
         command,
         cwd: "." as const,
         planCycleId: plan.cycleId,
-        planPolicyVersion: "plan-policy.hybrid-v1" as const,
+        planPolicyVersion: "plan-policy.hybrid-todo-v1" as const,
         shellPolicyVersion: "plan-shell-policy.v1" as const,
         shellEnvironmentVersion: "plan-shell-env.v1" as const,
         shellEnvironmentDigest: plan.shellEnvironment.digest,

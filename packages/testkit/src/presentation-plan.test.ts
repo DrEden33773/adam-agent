@@ -105,7 +105,7 @@ test("PresentationSession durably enters a hybrid Plan cycle and rehydrates its 
       state: "exploring",
       cycleId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
       revision: 1,
-      policyVersion: "plan-policy.hybrid-v1",
+      policyVersion: "plan-policy.hybrid-todo-v1",
       shellPolicyVersion: "plan-shell-policy.v1",
     });
 
@@ -878,12 +878,20 @@ test("PresentationSession freezes the exact eligible hybrid Tool Profile for a P
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "create_todo",
         "get_todo",
         "list_todos",
+        "update_todo",
+        "update_todos",
       ].map((name) => ({
         name,
         definitionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
-        effect: name === "run_shell" ? "execute" : "read",
+        effect:
+          name === "run_shell"
+            ? "execute"
+            : ["create_todo", "update_todo", "update_todos"].includes(name)
+              ? "write"
+              : "read",
         source: "builtin",
       })),
     );
@@ -951,8 +959,11 @@ test("PresentationSession enters Plan through the exact composed session Tool Re
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "create_todo",
         "get_todo",
         "list_todos",
+        "update_todo",
+        "update_todos",
         "web_open",
         "web_find",
         "list_agents",
@@ -1029,7 +1040,7 @@ test("PresentationSession exits one Plan cycle and enters a distinct later cycle
     expect(second).toMatchObject({
       state: "exploring",
       revision: 1,
-      policyVersion: "plan-policy.hybrid-v1",
+      policyVersion: "plan-policy.hybrid-todo-v1",
       shellPolicyVersion: "plan-shell-policy.v1",
       eligibleToolProfile: first.eligibleToolProfile,
     });

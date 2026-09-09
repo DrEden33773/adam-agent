@@ -457,9 +457,16 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     aliases: [],
     availability: "always",
     id: "session",
+    arguments: [
+      {
+        label: "settings",
+        value: "settings",
+        description: "Configure this session’s Todo permission",
+      },
+    ],
     name: "session",
     summary: "Inspect authoritative session, chronology, context, and usage facts.",
-    usage: "/session",
+    usage: "/session [settings]",
   },
   {
     aliases: [],

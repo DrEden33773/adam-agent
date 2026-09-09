@@ -42,16 +42,14 @@ test("current hybrid Plan copy is policy-aware in notices and footer", async () 
 
     expect(output).toContain("Entered Plan.");
     expect(frame).toContain("Plan exploring");
-    expect(frame).toContain(
-      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
-    );
+    expect(frame).toContain("plan-policy.hybrid-todo-v1 · inspect auto · exec asks · files deny");
     expect(`${output}\n${frame}`).not.toContain("read-only Plan");
     expect(frame).not.toContain("Plan exploring · read-only");
 
     for (const [columns, rows, policyCopy] of [
-      [120, 40, ["plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies"]],
-      [80, 24, ["plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies"]],
-      [40, 12, ["inspect:auto · ambig:ask ·", "mutate:deny"]],
+      [120, 40, ["plan-policy.hybrid-todo-v1 · inspect auto · exec asks · files deny"]],
+      [80, 24, ["plan-policy.hybrid-todo-v1 · inspect auto · exec asks · files deny"]],
+      [40, 12, ["inspect:auto · exec:ask ·", "files:deny", "Todo:session"]],
     ] as const) {
       await fixture.resize(columns, rows);
       const resizedFrame = fixture.screen() ?? [];
@@ -117,7 +115,7 @@ test("NO_COLOR preserves current hybrid Plan policy copy without claiming read-o
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
     await fixture.waitForCompleteFrameAfter(
-      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
+      "plan-policy.hybrid-todo-v1 · inspect auto · exec asks · files deny",
       beforePlan,
     );
     const frame = fixture.screen()?.join("\n") ?? "";
@@ -245,7 +243,7 @@ test("a prompt-admitted production session enters policy-aware Plan after its fi
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
     await fixture.waitForCompleteFrameAfter(
-      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
+      "plan-policy.hybrid-todo-v1 · inspect auto · exec asks · files deny",
       beforePlan,
     );
     const frame = latestSynchronizedFrame(fixture.output().slice(beforePlan)).join("\n");

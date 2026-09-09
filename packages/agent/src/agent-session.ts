@@ -91,9 +91,11 @@ import {
 import { createPlanGitAttestationV1, type PlanGitAttestationV1 } from "./plan-git-policy.js";
 import {
   digestApprovedPlanProjectionV1,
+  isDelegationPlanPolicy,
   isHybridPlanPolicy,
   isPlanDelegationTool,
   isPlanWebTool,
+  isTodoPlanPolicy,
   type PlanCycleSnapshot,
   submitPlanToolDefinitionV1,
 } from "./plan-mode.js";
@@ -177,7 +179,7 @@ import type {
   ToolRegistry,
   ToolResult,
 } from "./tool-runtime.js";
-import { resolveToolDefinition } from "./tool-runtime.js";
+import { captureToolAdapter, isBuiltinTodoAdapter, resolveToolDefinition } from "./tool-runtime.js";
 
 class InputResourceProjectionError extends Error {
   constructor(readonly details: Extract<RunResult, { readonly status: "failed" }>["error"]) {
@@ -2530,6 +2532,21 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, result);
       return undefined;
     }
+    const sessionTodoAllowed =
+      this.#durableContext?.todoPermissionPolicy === "todo-permission.session-v1" &&
+      isBuiltinTodoAdapter(adapter) &&
+      adapter.effect === "write" &&
+      (call.name === "create_todo" || call.name === "update_todo" || call.name === "update_todos");
+    if (
+      sessionTodoAllowed &&
+      (call.name === "create_todo" || call.name === "update_todo" || call.name === "update_todos")
+    ) {
+      preparedPermissionSubject = {
+        type: "session_todo",
+        sessionId: this.#durableContext?.sessionId ?? this.#runtimeSessionId,
+        operation: call.name,
+      };
+    }
     const planCommandAssessment =
       isHybridPlanPolicy(this.#plan?.policyVersion) &&
       call.name === "run_shell" &&
@@ -2685,7 +2702,10 @@ export class AgentSession {
       }
     }
     // Reject known-invalid Todo CAS before asking; execution rechecks after the decision.
-    if ((call.name === "update_todo" || call.name === "update_todos") && this.#plan === undefined) {
+    if (
+      (call.name === "update_todo" || call.name === "update_todos") &&
+      isBuiltinTodoAdapter(adapter)
+    ) {
       let parsed: unknown;
       try {
         parsed = JSON.parse(call.argumentsJson);
@@ -2722,7 +2742,11 @@ export class AgentSession {
       (preparedPermissionSubject.type === "managed_agent_action" &&
         preparedPermissionSubject.envelope !== undefined);
     const policyDecision =
-      freshEnvelope && ordinaryPolicyDecision === "allow" ? "ask" : ordinaryPolicyDecision;
+      freshEnvelope && ordinaryPolicyDecision === "allow"
+        ? "ask"
+        : sessionTodoAllowed && ordinaryPolicyDecision === "ask"
+          ? "allow"
+          : ordinaryPolicyDecision;
     if (signal.aborted) {
       return this.#settleCancelled();
     }
@@ -2806,7 +2830,7 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, preDispatchFailure);
       return undefined;
     }
-    if (call.name === "create_todo") {
+    if (call.name === "create_todo" && isBuiltinTodoAdapter(adapter)) {
       return this.#createTodo(call, messages, toolResultsById, options.emitStarted);
     }
     if (call.name === "get_todo") {
@@ -2815,10 +2839,10 @@ export class AgentSession {
     if (call.name === "list_todos") {
       return this.#listTodos(call, messages, toolResultsById, options.emitStarted);
     }
-    if (call.name === "update_todos") {
+    if (call.name === "update_todos" && isBuiltinTodoAdapter(adapter)) {
       return this.#updateTodos(call, messages, toolResultsById, options.emitStarted);
     }
-    if (call.name === "update_todo") {
+    if (call.name === "update_todo" && isBuiltinTodoAdapter(adapter)) {
       return this.#updateTodo(call, messages, toolResultsById, options.emitStarted);
     }
     if (options.emitStarted) {
@@ -3070,8 +3094,13 @@ export class AgentSession {
       parsed = undefined;
     }
     const input = createTodoInputV2Schema.safeParse(parsed);
-    if (!input.success || this.#activeRunId === undefined || this.#plan !== undefined) {
-      const planDenied = input.success && this.#plan !== undefined;
+    if (
+      !input.success ||
+      this.#activeRunId === undefined ||
+      (this.#plan !== undefined && !isTodoPlanPolicy(this.#plan.policyVersion))
+    ) {
+      const planDenied =
+        input.success && this.#plan !== undefined && !isTodoPlanPolicy(this.#plan.policyVersion);
       const result: ToolResult = {
         status: "failed",
         error: {
@@ -3235,8 +3264,13 @@ export class AgentSession {
       parsed = undefined;
     }
     const input = updateTodoInputV2Schema.safeParse(parsed);
-    if (!input.success || this.#activeRunId === undefined || this.#plan !== undefined) {
-      const planDenied = input.success && this.#plan !== undefined;
+    if (
+      !input.success ||
+      this.#activeRunId === undefined ||
+      (this.#plan !== undefined && !isTodoPlanPolicy(this.#plan.policyVersion))
+    ) {
+      const planDenied =
+        input.success && this.#plan !== undefined && !isTodoPlanPolicy(this.#plan.policyVersion);
       const result: ToolResult = {
         status: "failed",
         error: {
@@ -3329,7 +3363,7 @@ export class AgentSession {
     }
     const input = updateTodosInputV2Schema.safeParse(parsed);
     const mutation =
-      this.#plan !== undefined
+      this.#plan !== undefined && !isTodoPlanPolicy(this.#plan.policyVersion)
         ? {
             status: "failed" as const,
             error: { code: "permission_denied" as const, message: "Plan denies Todo mutations." },
@@ -5133,14 +5167,7 @@ function captureToolRegistry(
       if (adapter === undefined || !isDeepStrictEqual(adapter.definition, definition)) {
         throw new TypeError(`Tool definition cannot be resolved exactly: ${definition.name}`);
       }
-      return [
-        definition.name,
-        {
-          ...adapter,
-          definition,
-          prepare: adapter.prepare.bind(adapter),
-        },
-      ] as const;
+      return [definition.name, captureToolAdapter(adapter, definition)] as const;
     }),
   );
   return {
@@ -5210,11 +5237,15 @@ function planProfileAllowsDefinition(
     return false;
   }
   return (
-    (plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+    (isTodoPlanPolicy(plan.policyVersion) &&
+      definition.source === "builtin" &&
+      definition.effect === "write" &&
+      ["create_todo", "update_todo", "update_todos"].includes(definition.name)) ||
+    (isDelegationPlanPolicy(plan.policyVersion) &&
       definition.source === "builtin" &&
       definition.effect === "network" &&
       isPlanWebTool(definition.name)) ||
-    (plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+    (isDelegationPlanPolicy(plan.policyVersion) &&
       definition.source === "builtin" &&
       definition.effect === "delegate" &&
       isPlanDelegationTool(definition.name)) ||
@@ -5244,11 +5275,20 @@ function planToolDisposition(
   ) {
     return "deny";
   }
+  if (
+    isTodoPlanPolicy(plan.policyVersion) &&
+    definition.source === "builtin" &&
+    definition.effect === "write" &&
+    isBuiltinTodoAdapter(adapter) &&
+    subject.type === "session_todo" &&
+    subject.operation === definition.name
+  )
+    return undefined;
   if (definition.effect === "read") {
     return "allow";
   }
   if (
-    plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+    isDelegationPlanPolicy(plan.policyVersion) &&
     definition.source === "builtin" &&
     definition.effect === "network" &&
     isPlanWebTool(definition.name) &&
@@ -5256,7 +5296,7 @@ function planToolDisposition(
   )
     return undefined;
   if (
-    plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+    isDelegationPlanPolicy(plan.policyVersion) &&
     definition.source === "builtin" &&
     definition.effect === "delegate" &&
     isPlanDelegationTool(definition.name) &&

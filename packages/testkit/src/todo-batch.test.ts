@@ -2,6 +2,10 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCodingToolRegistry, type ModelEvent, type RuntimeEvent } from "@adam-agent/agent";
+import {
+  createInMemorySessionStoreDirectory,
+  type SessionRecord,
+} from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
 import {
@@ -18,7 +22,7 @@ function calls(id: string, name: string, input: unknown): ModelEvent[] {
 }
 
 test.each(["allow", "deny", "cancel"] as const)(
-  "one exact permission controls an entire Todo batch: %s",
+  "legacy session: one exact permission controls an entire Todo batch: %s",
   async (decision) => {
     const root = await mkdtemp(join(tmpdir(), "adam-todo-permission-"));
     const workspaceRoot = join(root, "workspace");
@@ -91,7 +95,24 @@ test.each(["allow", "deny", "cancel"] as const)(
         { type: "finish", reason: "stop" },
       ];
     });
-    const harness = createInMemorySessionLifecycleHarness();
+    // Keep this historical permission fixture on its original genesis contract.
+    const directory = createInMemorySessionStoreDirectory<SessionRecord>();
+    const legacyRecord = (entry: SessionRecord): SessionRecord => {
+      if (entry.schemaVersion !== 3 || entry.record.type !== "session_genesis") return entry;
+      const { todoPermissionPolicyVersion: _policy, ...record } = entry.record;
+      return { ...entry, record };
+    };
+    const harness = createInMemorySessionLifecycleHarness({
+      ...directory,
+      async create(sessionId) {
+        const store = await directory.create(sessionId);
+        return {
+          ...store,
+          append: (entry) => store.append(legacyRecord(entry)),
+          appendBatch: (entries) => store.appendBatch(entries.map(legacyRecord)),
+        };
+      },
+    });
     const lifecycle = harness.createLifecycle({
       workspaceRoot,
       modelTargets: modelTargetsWithDriver(driver),
