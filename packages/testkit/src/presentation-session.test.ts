@@ -10506,22 +10506,30 @@ test("PresentationSession keeps manual precedence when an in-flight title settle
       sessionId: created.sessionId,
       name: "Manual stays visible",
     });
-    const invalidated = Promise.withResolvers<"invalidated">();
-    const unsubscribe = presentation.subscribe(() => invalidated.resolve("invalidated"));
-
-    releaseTitle.resolve();
-    const closed = lifecycle.close().then(() => "closed" as const);
-    await expect(Promise.race([invalidated.promise, closed])).resolves.toBe("invalidated");
-    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
-      manualName: "Manual stays visible",
-      generatedTitle: "Late generated title",
-      displayLabel: "Manual stays visible",
-      generation: { status: "completed" },
+    const titleProjected = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation.getState().authoritative.active?.session.naming.generation.status ===
+        "completed"
+      ) {
+        titleProjected.resolve();
+      }
     });
 
-    unsubscribe();
-    await presentation.close();
-    await closed;
+    try {
+      releaseTitle.resolve();
+      // Lifecycle close drains durable title work, not asynchronous Presentation refreshes.
+      await withManagedFailureGuard(titleProjected.promise, "late title naming projection");
+      expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+        manualName: "Manual stays visible",
+        generatedTitle: "Late generated title",
+        displayLabel: "Manual stays visible",
+        generation: { status: "completed" },
+      });
+    } finally {
+      unsubscribe();
+      await presentation.close();
+    }
   } finally {
     releaseTitle.resolve();
     await lifecycle.close();

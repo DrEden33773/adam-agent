@@ -1,5 +1,3 @@
-import { createDeepSeek } from "@ai-sdk/deepseek";
-import { createGateway } from "@ai-sdk/gateway";
 import type { ModelDriver, ModelModalityProfile } from "./agent-session-contracts.js";
 import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
 import type { ContextProfile } from "./context-profile.js";
@@ -429,6 +427,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
             "AI_GATEWAY_API_KEY is required for the Experimental Gateway target. Set it and retry the same target.",
           );
         }
+        const { createGateway } = await import("@ai-sdk/gateway");
         const provider = createGateway({
           ...(options.environment.AI_GATEWAY_API_KEY === undefined
             ? {}
@@ -458,12 +457,6 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           `DEEPSEEK_API_KEY is required for ${identity.targetId}. Set it and retry the same target.`,
         );
       }
-      const provider = createDeepSeek({
-        ...(options.environment.DEEPSEEK_API_KEY === undefined
-          ? {}
-          : { apiKey: options.environment.DEEPSEEK_API_KEY }),
-        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-      });
       const contextProfile = directDeepSeekContextProfileFor(identity);
       if (sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)) {
         return {
@@ -483,6 +476,13 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           }),
         };
       }
+      const { createDeepSeek } = await import("@ai-sdk/deepseek");
+      const provider = createDeepSeek({
+        ...(options.environment.DEEPSEEK_API_KEY === undefined
+          ? {}
+          : { apiKey: options.environment.DEEPSEEK_API_KEY }),
+        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+      });
       return {
         identity,
         contextProfile,

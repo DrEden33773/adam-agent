@@ -4,9 +4,10 @@ import {
   SessionLifecycleError,
   SessionStoreError,
 } from "@adam-agent/agent";
+import { TuiConfigurationError } from "./command.js";
 import { findMcpShutdownUnconfirmedError } from "./lifecycle-close.js";
 
-export class TuiConfigurationError extends Error {}
+export { TuiConfigurationError } from "./command.js";
 
 export function tuiExplicitResumeFailureMessage(
   sessionId: string,
