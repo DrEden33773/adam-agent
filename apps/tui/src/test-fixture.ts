@@ -163,6 +163,7 @@ const contextProfile: ContextProfile = {
 };
 
 export type TuiFixtureOptions = {
+  readonly titleResponse?: () => Promise<string>;
   readonly clipboard?: ClipboardAdapter;
   readonly controlRoot?: string;
   readonly deadlineScheduler?: DeadlineScheduler;
@@ -1055,9 +1056,51 @@ function observeTuiDispatch(
   let artifactReadCount = 0;
   let reasoningSettlementObserved = false;
   let targetNavigationSettlementObserved = false;
+  let reasoningSettlementWrite: Promise<void> | undefined;
+  const observeReasoningSettlement = (): void => {
+    const state = presentation.getState();
+    const active = state.authoritative.active;
+    if (
+      reasoningSettlementObserved ||
+      controlRoot === undefined ||
+      ![
+        "reasoning-streaming",
+        "reasoning-artifact",
+        "reasoning-artifact-race",
+        "reasoning-artifact-reorder",
+        "reasoning-artifact-session-race",
+        "reasoning-large-multiple",
+        "reasoning-large-live",
+      ].includes(options.scenario ?? "") ||
+      state.authoritative.continuity.status !== "current" ||
+      active?.session.status !== "settled" ||
+      active.parentRun?.phase !== "ready" ||
+      active.parentRun.editor !== "ready" ||
+      active.session.naming.generation.status === "in_progress" ||
+      !active.transcript.items.some((item) => item.type === "reasoning_block") ||
+      state.transient !== null ||
+      state.composer.sealed ||
+      state.composer.renderedText !== ""
+    )
+      return;
+    // Main readiness includes title admission; a title may finish unsuccessfully.
+    // Freeze storage only after both naming and submitted-draft cleanup have settled.
+    reasoningSettlementObserved = true;
+    reasoningSettlementWrite = writeFile(
+      join(controlRoot, "reasoning-session-settled"),
+      `${JSON.stringify({
+        sessionId: active.session.id,
+        throughSequence: state.authoritative.continuity.sessionThroughSequence,
+        naming: active.session.naming.generation.status,
+      })}\n`,
+      "utf8",
+    );
+    void reasoningSettlementWrite.catch(() => {});
+  };
   return {
     async close() {
       await presentation.close();
+      await reasoningSettlementWrite;
       if (options.presentationCloseMarker !== undefined) {
         await writeFile(options.presentationCloseMarker, "closed\n", "utf8");
       }
@@ -1138,7 +1181,9 @@ function observeTuiDispatch(
         return settled;
       }
       if (!observeDispatch) {
-        return receipt;
+        const settled = await receipt;
+        if (command.type === "submit_prompt") observeReasoningSettlement();
+        return settled;
       }
       if (command.type === "decide_permission") {
         await writeFile(
@@ -1188,29 +1233,16 @@ function observeTuiDispatch(
           "utf8",
         );
       }
-      return receipt;
+      const settled = await receipt;
+      if (command.type === "submit_prompt") observeReasoningSettlement();
+      return settled;
     },
     getState: () => presentation.getState(),
-    subscribe: (onChange) =>
-      presentation.subscribe(() => {
+    subscribe: (onChange) => {
+      const unsubscribe = presentation.subscribe(() => {
         onChange();
         const state = presentation.getState();
-        if (
-          !reasoningSettlementObserved &&
-          (options.scenario === "reasoning-streaming" ||
-            options.scenario === "reasoning-artifact" ||
-            options.scenario === "reasoning-artifact-race" ||
-            options.scenario === "reasoning-artifact-reorder" ||
-            options.scenario === "reasoning-artifact-session-race" ||
-            options.scenario === "reasoning-large-multiple" ||
-            options.scenario === "reasoning-large-live") &&
-          controlRoot !== undefined &&
-          state.authoritative.active?.session.status === "settled" &&
-          state.transient === null
-        ) {
-          reasoningSettlementObserved = true;
-          void writeFile(join(controlRoot, "reasoning-session-settled"), "settled\n", "utf8");
-        }
+        observeReasoningSettlement();
         if (
           !targetNavigationSettlementObserved &&
           options.scenario === "target-navigation" &&
@@ -1226,7 +1258,10 @@ function observeTuiDispatch(
             "utf8",
           );
         }
-      }),
+      });
+      observeReasoningSettlement();
+      return unsubscribe;
+    },
   };
 }
 
@@ -1276,6 +1311,7 @@ function optionValue(arguments_: readonly string[], option: string): string | un
 }
 
 function createFixtureModelTargets(options: {
+  readonly titleResponse?: () => Promise<string>;
   readonly controlRoot?: string;
   readonly launch?: TuiFixtureOptions["launch"];
   readonly scenario?: FixtureScenario;
@@ -1314,7 +1350,9 @@ function createFixtureModelTargets(options: {
           type: "text_delta",
           text:
             request.maximumOutputTokens === 64
-              ? "Streaming session"
+              ? options.titleResponse === undefined
+                ? "Streaming session"
+                : await options.titleResponse()
               : JSON.stringify({
                   schemaVersion: 1,
                   objective: "Preserve the active TUI fixture task.",
