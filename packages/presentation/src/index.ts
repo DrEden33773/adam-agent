@@ -199,6 +199,13 @@ export type SessionSummaryPage = {
   readonly items: readonly SessionSummary[];
   readonly nextCursor: string | null;
   readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
+  readonly loading?: boolean;
+  readonly health?: {
+    readonly status: "not_started" | "running" | "complete" | "failed";
+    readonly checked: number;
+    readonly total: number | null;
+  };
+  readonly error?: { readonly code: string; readonly message: string };
 };
 
 export type SessionHistoryDiagnosticDisplay = {
@@ -748,7 +755,10 @@ export type McpDisplay = {
 export type ProjectPathCatalogDisplay = {
   readonly items: readonly string[];
   readonly omittedCount: number;
-  readonly diagnostic: { readonly code: "project_path_catalog_truncated" } | null;
+  readonly diagnostic: {
+    readonly code: "project_path_catalog_truncated" | "project_path_catalog_unavailable";
+  } | null;
+  readonly loading?: boolean;
 };
 
 export type SkillCatalogDisplay = {

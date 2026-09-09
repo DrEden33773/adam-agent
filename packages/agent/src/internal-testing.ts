@@ -133,6 +133,10 @@ export {
   createWorkspaceTrustWithStorageForTesting,
 } from "./secure-user-configuration.js";
 export {
+  type SessionCatalogWorkerFactory,
+  sessionCatalogWorkerFactory,
+} from "./session-catalog-job.js";
+export {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";

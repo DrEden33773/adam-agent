@@ -166,8 +166,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const startupTargetId =
     options.startupTargetId ??
     options.presentation.getState().authoritative.targets.defaultTargetId;
+  const initialCatalog = options.presentation.getState().authoritative.sessions;
+  let startupCatalogPending = initialCatalog.loading === true;
   let newSessionSelected =
-    options.presentation.getState().authoritative.sessions.items.length === 0;
+    !startupCatalogPending &&
+    initialCatalog.error === undefined &&
+    initialCatalog.nextCursor === null &&
+    initialCatalog.items.length === 0;
   let noticeActionId = 0;
   let statusNotice: TuiNotice | null = null;
   const beginNoticeAction = (): number => {
@@ -1649,6 +1654,31 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       agentConversation.viewer.setActivity(state.managedAgentActivity);
     }
     legacyAgentHistory?.navigator.setManagedAgents(state.authoritative.managedAgents);
+    const catalog = state.authoritative.sessions;
+    sessionPicker?.picker.setCatalog({
+      ...catalog,
+      sessions: catalog.items,
+      hasMore: catalog.nextCursor !== null,
+    });
+    if (startupCatalogPending && catalog.loading !== true) {
+      startupCatalogPending = false;
+      if (
+        active === null &&
+        state.draft === null &&
+        catalog.items.length === 0 &&
+        catalog.nextCursor === null &&
+        catalog.error === undefined &&
+        !newSessionSelected &&
+        !sessionPickerDismissed &&
+        !sessionPickerRequested &&
+        sessionPicker?.picker.hasInteracted !== true &&
+        targetPicker === undefined
+      ) {
+        newSessionSelected = true;
+        sessionPicker?.hide();
+        sessionPicker = undefined;
+      }
+    }
     targetPicker?.picker.setTargets(
       state.authoritative.targets.items,
       state.authoritative.targets.defaultTargetId,
@@ -1731,11 +1761,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
     }
     const needsSessionChoice =
-      active === null && state.authoritative.sessions.items.length > 0 && !newSessionSelected;
+      active === null &&
+      state.draft === null &&
+      !newSessionSelected &&
+      (catalog.items.length > 0 ||
+        catalog.nextCursor !== null ||
+        catalog.loading === true ||
+        catalog.error !== undefined ||
+        sessionPicker !== undefined);
     if (
       !startupTrustBlocked &&
       active === null &&
       !needsSessionChoice &&
+      newSessionSelected &&
       startupTargetId !== null &&
       startupTargetId !== undefined &&
       !defaultTargetAttempted
@@ -1784,6 +1822,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.requestRender();
       };
       const picker = new SessionPicker({
+        ...state.authoritative.sessions,
         sessions: state.authoritative.sessions.items,
         hasMore: state.authoritative.sessions.nextCursor !== null,
         ...(state.authoritative.sessions.diagnostics === undefined
@@ -1832,8 +1871,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             .dispatch({ type: "load_more_sessions", after })
             .then((receipt) => {
               if (receipt.status === "admitted") {
-                sessionPicker?.hide();
-                sessionPicker = undefined;
                 renderState();
               } else if (sessionPicker?.picker === picker) {
                 picker.setNotice(receipt.message);
@@ -1870,6 +1907,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         (active === null &&
           state.draft === null &&
           !needsSessionChoice &&
+          newSessionSelected &&
           (startupTargetId === null || startupTargetId === undefined || defaultTargetRejected))) &&
       state.authoritative.targets.items.length > 0
     ) {

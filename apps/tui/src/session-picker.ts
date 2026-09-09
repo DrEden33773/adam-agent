@@ -1,4 +1,8 @@
-import type { SessionHistoryDiagnosticsDisplay, SessionSummary } from "@adam-agent/presentation";
+import type {
+  SessionHistoryDiagnosticsDisplay,
+  SessionSummary,
+  SessionSummaryPage,
+} from "@adam-agent/presentation";
 import {
   type Component,
   fuzzyFilter,
@@ -19,33 +23,42 @@ type SessionPickerItem =
   | { readonly kind: "invalid_sessions" }
   | { readonly kind: "load_more" };
 
+export type SessionPickerCatalog = {
+  readonly sessions: readonly SessionSummary[];
+  readonly hasMore: boolean;
+  readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
+} & Pick<SessionSummaryPage, "loading" | "health" | "error">;
+
 export class SessionPicker implements Component {
-  readonly #hasMore: boolean;
-  readonly #diagnostics: SessionHistoryDiagnosticsDisplay;
+  #hasMore: boolean;
+  #diagnostics: SessionHistoryDiagnosticsDisplay;
   readonly #onClose: () => void;
   readonly #onLoadMore: () => void;
   readonly #onNewSession: () => void;
   readonly #onRename: (session: SessionSummary) => void;
   readonly #onSelect: (session: SessionSummary) => void;
-  readonly #sessions: readonly SessionSummary[];
+  #sessions: readonly SessionSummary[];
   readonly #theme: AdamTuiTheme;
+  #loading: SessionSummaryPage["loading"];
+  #health: SessionSummaryPage["health"];
+  #error: SessionSummaryPage["error"];
+  #interacted = false;
   #notice: string | null = null;
   #query = "";
   #selectedIndex = 0;
   #diagnosticIndex = 0;
   #view: "sessions" | "diagnostics" = "sessions";
 
-  constructor(options: {
-    readonly sessions: readonly SessionSummary[];
-    readonly theme: AdamTuiTheme;
-    readonly onNewSession: () => void;
-    readonly onLoadMore: () => void;
-    readonly onRename: (session: SessionSummary) => void;
-    readonly onSelect: (session: SessionSummary) => void;
-    readonly onClose: () => void;
-    readonly hasMore: boolean;
-    readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
-  }) {
+  constructor(
+    options: SessionPickerCatalog & {
+      readonly theme: AdamTuiTheme;
+      readonly onNewSession: () => void;
+      readonly onLoadMore: () => void;
+      readonly onRename: (session: SessionSummary) => void;
+      readonly onSelect: (session: SessionSummary) => void;
+      readonly onClose: () => void;
+    },
+  ) {
     this.#onNewSession = options.onNewSession;
     this.#onClose = options.onClose;
     this.#onLoadMore = options.onLoadMore;
@@ -59,6 +72,35 @@ export class SessionPicker implements Component {
       truncated: false,
     };
     this.#theme = options.theme;
+    this.#loading = options.loading;
+    this.#health = options.health;
+    this.#error = options.error;
+  }
+
+  get hasInteracted(): boolean {
+    return this.#interacted;
+  }
+
+  setCatalog(catalog: SessionPickerCatalog): void {
+    const selectedKey = itemKey(this.#items()[this.#selectedIndex]);
+    const diagnosticId = this.#diagnostics.items[this.#diagnosticIndex]?.sessionId;
+    this.#sessions = catalog.sessions;
+    this.#hasMore = catalog.hasMore;
+    this.#diagnostics = catalog.diagnostics ?? { items: [], totalCount: 0, truncated: false };
+    this.#loading = catalog.loading;
+    this.#health = catalog.health;
+    this.#error = catalog.error;
+    const items = this.#items();
+    const selectedIndex = items.findIndex((item) => itemKey(item) === selectedKey);
+    this.#selectedIndex =
+      selectedIndex < 0 ? Math.min(this.#selectedIndex, items.length - 1) : selectedIndex;
+    const diagnosticIndex = this.#diagnostics.items.findIndex(
+      (item) => item.sessionId === diagnosticId,
+    );
+    this.#diagnosticIndex =
+      diagnosticIndex < 0
+        ? Math.min(this.#diagnosticIndex, Math.max(0, this.#diagnostics.items.length - 1))
+        : diagnosticIndex;
   }
 
   setNotice(notice: string): void {
@@ -66,6 +108,7 @@ export class SessionPicker implements Component {
   }
 
   handleInput(data: string): void {
+    this.#interacted = true;
     const keybindings = getKeybindings();
     if (this.#view === "diagnostics") {
       if (keybindings.matches(data, "tui.select.up")) {
@@ -118,7 +161,7 @@ export class SessionPicker implements Component {
       const selected = items[this.#selectedIndex];
       if (selected?.kind === "new_session") {
         this.#onNewSession();
-      } else if (selected?.kind === "load_more") {
+      } else if (selected?.kind === "load_more" && !this.#loading) {
         this.#onLoadMore();
       } else if (selected?.kind === "invalid_sessions") {
         this.#diagnosticIndex = 0;
@@ -151,6 +194,7 @@ export class SessionPicker implements Component {
       this.#theme.toolTitle("Select a project session"),
       this.#renderNewSession(width),
       `Search: ${safeTerminalText(this.#query)}`,
+      ...this.#renderCatalogStatus(width),
       ...(this.#diagnostics.totalCount === 0
         ? []
         : [
@@ -159,7 +203,15 @@ export class SessionPicker implements Component {
           ]),
       "",
       ...(visibleItems.length === 0
-        ? [this.#theme.editor.selectList.noMatch("  No matching sessions")]
+        ? [
+            this.#theme.editor.selectList.noMatch(
+              this.#loading
+                ? "  Loading sessions…"
+                : this.#error === undefined
+                  ? "  No matching sessions"
+                  : "  Session list unavailable",
+            ),
+          ]
         : visibleItems.map((item, index) =>
             this.#renderResultItem(item, startIndex + index === selectedResultIndex, width),
           )),
@@ -221,8 +273,32 @@ export class SessionPicker implements Component {
               selected,
               width,
             )
-          : renderColumns("Load More", "Use the opaque catalog cursor", selected, width);
+          : renderColumns(
+              this.#loading ? "Loading more…" : "Load More",
+              "Use the opaque catalog cursor",
+              selected,
+              width,
+            );
     return selected ? this.#theme.editor.selectList.selectedText(content) : content;
+  }
+
+  #renderCatalogStatus(width: number): string[] {
+    const health = this.#health;
+    const progress =
+      health === undefined
+        ? undefined
+        : health.status === "not_started"
+          ? "History check not started."
+          : health.status === "complete"
+            ? `History check complete: ${health.checked} sessions.`
+            : health.status === "failed"
+              ? `History check failed after ${health.checked} sessions.`
+              : `Checking history: ${health.checked}${health.total === null ? "" : ` / ${health.total}`} sessions.`;
+    return [
+      ...(this.#loading && this.#sessions.length > 0 ? ["Loading sessions…"] : []),
+      ...(progress === undefined ? [] : [progress]),
+      ...(this.#error === undefined ? [] : [safeTerminalText(this.#error.message)]),
+    ].flatMap((line) => wrapTextWithAnsi(this.#theme.muted(line), Math.max(1, width)));
   }
 
   #diagnosticSummary(): string {
@@ -240,6 +316,7 @@ export class SessionPicker implements Component {
     const visibleItems = items.slice(startIndex, startIndex + 5);
     return [
       this.#theme.toolTitle("Invalid sessions"),
+      ...this.#renderCatalogStatus(width),
       `${this.#diagnostics.totalCount} retained${this.#diagnostics.truncated ? " · first 100 shown" : ""}`,
       "",
       ...visibleItems.flatMap((item, index) => {
@@ -263,6 +340,10 @@ export class SessionPicker implements Component {
       this.#theme.muted("↑/↓ move · Esc back · Ctrl+Q exit"),
     ];
   }
+}
+
+function itemKey(item: SessionPickerItem | undefined): string | undefined {
+  return item?.kind === "session" ? `session:${item.session.id}` : item?.kind;
 }
 
 function renderColumns(

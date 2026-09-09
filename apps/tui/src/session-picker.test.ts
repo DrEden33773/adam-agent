@@ -278,3 +278,132 @@ test("the MCP wizard accepts Kitty printable classification and commit keys", ()
     [expect.objectContaining({ qualifiedName: "fixture.inspect", effect: "read" })],
   );
 });
+
+function namedSession(id: string, label: string) {
+  return {
+    id,
+    label,
+    targetId: "deepseek-v4-flash.direct",
+    status: "idle" as const,
+    naming: {
+      manualName: label,
+      generatedTitle: null,
+      fallbackTitle: label,
+      displayLabel: label,
+      generation: { status: "not_started" as const },
+    },
+  };
+}
+
+function pickerFixture(sessions = [namedSession("alpha", "Alpha"), namedSession("beta", "Beta")]) {
+  const actions = {
+    onNewSession: vi.fn(),
+    onLoadMore: vi.fn(),
+    onRename: vi.fn(),
+    onSelect: vi.fn(),
+    onClose: vi.fn(),
+  };
+  const picker = new SessionPicker({
+    sessions,
+    hasMore: false,
+    theme: createAdamTuiTheme(true),
+    ...actions,
+  });
+  return { picker, actions };
+}
+
+test("catalog updates preserve search and selected session identity without opening a replacement", () => {
+  const { picker, actions } = pickerFixture();
+  picker.handleInput("a");
+  picker.handleInput("\u001b[B");
+  picker.setCatalog({
+    sessions: [
+      namedSession("new", "A new entry"),
+      namedSession("beta", "Beta"),
+      namedSession("alpha", "Alpha"),
+    ],
+    hasMore: true,
+  });
+  expect(picker.render(80).join("\n")).toContain("Search: a");
+  expect(picker.render(80).join("\n")).toContain("> Beta");
+  expect(actions.onSelect).not.toHaveBeenCalled();
+  picker.handleInput("\r");
+  expect(actions.onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "beta" }));
+
+  picker.setCatalog({ sessions: [namedSession("alpha", "Alpha")], hasMore: false });
+  expect(actions.onSelect).toHaveBeenCalledTimes(1);
+  expect(picker.render(80).join("\n")).toContain("> Alpha");
+  picker.handleInput("\r");
+  expect(actions.onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ id: "alpha" }));
+});
+
+test("catalog updates retain the diagnostic selection and keep incomplete checks explicit", () => {
+  const { picker, actions } = pickerFixture([]);
+  const diagnostic = (sessionId: string) => ({
+    sessionId,
+    code: "invalid_log" as const,
+    stage: "read" as const,
+    retained: true as const,
+    message: "Invalid log retained.",
+  });
+  picker.setCatalog({
+    sessions: [],
+    hasMore: false,
+    diagnostics: {
+      items: [diagnostic("bad-a"), diagnostic("bad-b")],
+      totalCount: 2,
+      truncated: false,
+    },
+    health: { status: "running", checked: 2, total: 4 },
+  });
+  picker.handleInput("\u001b[B");
+  picker.handleInput("\r");
+  picker.handleInput("\u001b[B");
+  picker.setCatalog({
+    sessions: [],
+    hasMore: false,
+    diagnostics: {
+      items: [diagnostic("bad-b"), diagnostic("bad-new"), diagnostic("bad-a")],
+      totalCount: 3,
+      truncated: false,
+    },
+    health: { status: "running", checked: 3, total: 4 },
+  });
+  const rendered = picker.render(80).join("\n");
+  expect(rendered).toContain("Invalid sessions");
+  expect(rendered).toContain("> bad-b");
+  expect(rendered).toContain("Checking history: 3 / 4 sessions.");
+  expect(rendered).not.toContain("complete");
+  expect(actions.onSelect).not.toHaveBeenCalled();
+});
+
+test("a loading catalog keeps New Session, search and close available without claiming empty history", () => {
+  const { picker, actions } = pickerFixture([]);
+  picker.setCatalog({
+    sessions: [],
+    hasMore: false,
+    loading: true,
+    health: { status: "not_started", checked: 0, total: null },
+  });
+  const rendered = picker.render(36).join("\n");
+  expect(rendered).toContain("New Session");
+  expect(rendered).toContain("Loading sessions…");
+  expect(rendered).toContain("History check not started.");
+  expect(rendered).not.toContain("No matching sessions");
+  picker.handleInput("query");
+  expect(picker.render(80).join("\n")).toContain("Search: query");
+  expect(picker.hasInteracted).toBe(true);
+  picker.handleInput("\r");
+  expect(actions.onNewSession).toHaveBeenCalledTimes(1);
+  picker.handleInput("\u001b");
+  expect(actions.onClose).toHaveBeenCalledTimes(1);
+  picker.setCatalog({
+    sessions: [],
+    hasMore: false,
+    loading: false,
+    health: { status: "failed", checked: 2, total: 4 },
+    error: { code: "read_failed", message: "Saved sessions could not be read." },
+  });
+  expect(picker.render(80).join("\n")).toContain("Saved sessions could not be read.");
+  expect(picker.render(80).join("\n")).toContain("Session list unavailable");
+});
