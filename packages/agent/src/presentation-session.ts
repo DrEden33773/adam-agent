@@ -3155,6 +3155,7 @@ export async function createPresentationSession(
 
     const catalogLoads = new Set<Promise<void>>();
     const loadSessionCatalog = async (view: CatalogView) => {
+      if (visibilityMutation) deferredCatalogView = view;
       rememberCatalog();
       void stopSessionCatalog();
       const generation = catalogGeneration;
@@ -3205,10 +3206,7 @@ export async function createPresentationSession(
         publishStateChange();
         return;
       }
-      if (visibilityMutation) {
-        deferredCatalogView = view;
-        return;
-      }
+      if (visibilityMutation) return;
       if (options.backgroundStartup) {
         let filling = false;
         let latest: ProjectSessionCatalogSnapshot | undefined;

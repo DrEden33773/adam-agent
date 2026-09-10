@@ -271,6 +271,9 @@ test("confirmed Trash and Restore finish under their claims without taking the u
     let before = terminal.output().length;
     terminal.input("\t");
     await terminal.waitForFrameAfter("[Archived]", before);
+    before = terminal.output().length;
+    terminal.input("\t");
+    await terminal.waitForFrameAfter("[Trash]", before);
     expect(
       await current.dispatch({
         type: "set_session_visibility",
@@ -282,7 +285,7 @@ test("confirmed Trash and Restore finish under their claims without taking the u
     releaseTrash();
     const moved = await guarded(moving, "confirmed Trash completion after browsing");
     expect(moved).toMatchObject({ status: "admitted", trashItem: { phase: "trashed" } });
-    expect(current.getState().authoritative.sessions.view).toBe("archived");
+    expect(current.getState().authoritative.sessions.view).toBe("trash");
     const item = (await lifecycle.listSessionTrash()).items[0];
     if (item === undefined) throw new Error("Expected the retained Trash transaction.");
     await current.dispatch({ type: "set_session_view", view: "trash" });
@@ -301,12 +304,15 @@ test("confirmed Trash and Restore finish under their claims without taking the u
     before = terminal.output().length;
     terminal.input("\t");
     await terminal.waitForFrameAfter("[Archived]", before);
+    before = terminal.output().length;
+    terminal.input("\t");
+    await terminal.waitForFrameAfter("[Trash]", before);
     releaseRestore();
     expect(await guarded(restoring, "Restore completion after browsing")).toMatchObject({
       status: "admitted",
       trashItem: { phase: "restored" },
     });
-    expect(current.getState().authoritative.sessions.view).toBe("archived");
+    expect(current.getState().authoritative.sessions.view).toBe("trash");
     expect((await lifecycle.inspect({ sessionId: session.sessionId })).status).toBe("settled");
     expect((await lifecycle.listSessionTrash()).items).toEqual([]);
   } finally {
