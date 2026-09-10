@@ -1685,7 +1685,7 @@ test("a committed suppression holds the existing family admission until the conc
     h.terminal.input("s");
     await committed.promise;
     await h.press("\u001b", "Agents workspace");
-    await h.press("\u001b", "Fleet fixture");
+    await h.press("\u001b", "Fleet · ↓ navigate", "Agents workspace");
     const parentBefore = await (await h.sessions.open(h.parent.sessionId))?.read();
     await h.press("Main after suppressed record.\r", "Working");
     expect(requests).toHaveLength(0);

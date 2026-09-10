@@ -30,6 +30,7 @@ test("production child viewer wheel preserves manual tail control and the indepe
       await press("\u001b[B", "> Main");
       await press("\u001b[B", "> @explore-1");
       await press("\r", "Child-live-49");
+      await fixture.waitForScreen("Following tail");
     };
     const closeViewer = async () => {
       await press("\u001b[27;1;27~", "Fleet", "Conversation ·");

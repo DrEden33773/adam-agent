@@ -186,6 +186,7 @@ export type TaskProviderReceipt = {
   readonly purpose: "ordinary" | "compaction";
   readonly source: { readonly sequence: number; readonly digest: string };
   readonly blocked: boolean;
+  readonly interruption?: { readonly sequence: number; readonly digest: string };
 };
 
 function isDispatchedModelEvent(type: string): boolean {
@@ -229,6 +230,24 @@ export function validateTaskProviderReceipts(
       seen.has(source.sequence)
     )
       return false;
+    if (receipt.interruption !== undefined) {
+      const interrupted = sources.get(receipt.interruption.sequence);
+      if (
+        !receipt.blocked ||
+        source.record.type !== "provider_attempt_started" ||
+        interrupted?.schemaVersion !== 3 ||
+        interrupted.record.type !== "provider_attempt_interrupted" ||
+        interrupted.sequence <= source.sequence ||
+        interrupted.record.runId !== source.record.runId ||
+        interrupted.record.turn !== source.record.turn ||
+        interrupted.record.attempt !== source.record.attempt ||
+        interrupted.record.reason !== "run_terminal" ||
+        interrupted.record.result.status !== "cancelled" ||
+        `sha256:${createHash("sha256").update(JSON.stringify(interrupted)).digest("hex")}` !==
+          receipt.interruption.digest
+      )
+        return false;
+    }
     seen.add(source.sequence);
     if (
       receipt.blocked &&

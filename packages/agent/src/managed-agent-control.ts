@@ -976,6 +976,7 @@ export function createManagedAgentControl(options: {
       event.type === "completion" ||
       event.type === "cleanup_expired" ||
       event.type === "cancel_requested" ||
+      event.type === "provider_not_dispatched" ||
       event.type === "budget_blocked" ||
       event.type === "input_undelivered" ||
       event.type === "input_delivered" ||
@@ -1547,7 +1548,56 @@ export function createManagedAgentControl(options: {
               await commit();
             }),
           [managedAgentRuntimeBoundary]: async (record: SessionRecord) => {
-            if (record.schemaVersion !== 3 || record.record.type !== "runtime_event") return;
+            if (record.schemaVersion !== 3) return;
+            const interrupted = record.record;
+            if (
+              interrupted.type === "provider_attempt_interrupted" &&
+              interrupted.reason === "run_terminal" &&
+              interrupted.result.status === "cancelled" &&
+              controller.signal.aborted &&
+              admission?.event.type === "admitted" &&
+              admission.event.envelope !== undefined
+            ) {
+              // This live owner gates every external call on a prior reservation.
+              // A cancelled committed boundary must retain an explicit no-dispatch receipt.
+              await serialized(async () => {
+                const childRecords = await store.read();
+                const source = childRecords.findLast(
+                  (entry) =>
+                    entry.schemaVersion === 3 &&
+                    entry.record.type === "provider_attempt_started" &&
+                    entry.record.runId === interrupted.runId &&
+                    entry.record.turn === interrupted.turn &&
+                    entry.record.attempt === interrupted.attempt,
+                );
+                if (source === undefined) throw new SessionStoreError();
+                const records = await controlStore.read();
+                if (
+                  records.some(
+                    (entry) =>
+                      entry.turnId === identity.turnId &&
+                      (entry.event.type === "provider_reserved" ||
+                        entry.event.type === "budget_blocked" ||
+                        entry.event.type === "provider_not_dispatched") &&
+                      entry.event.source?.sequence === source.sequence,
+                  )
+                )
+                  return;
+                const event = {
+                  type: "provider_not_dispatched" as const,
+                  reason: "cancelled" as const,
+                  source: { sequence: source.sequence, digest: managedControlDigest(source) },
+                  interruption: { sequence: record.sequence, digest: managedControlDigest(record) },
+                };
+                validateFleetTaskProviderReceipts(admission, childRecords, [
+                  ...records,
+                  { ...identity, schemaVersion: 3, sequence: records.length + 1, event },
+                ]);
+                await append(identity, event);
+              });
+              return;
+            }
+            if (record.record.type !== "runtime_event") return;
             const event = record.record.event;
             if (event.type === "tool_permission_decided")
               await waitForCeiling(identity, controller.signal);
