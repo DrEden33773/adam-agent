@@ -106,9 +106,11 @@ import {
   SessionLifecycleError,
   type SessionMetadataEvent,
   type SessionRuntimeNotification,
+  sessionDraftMutation,
+  sessionHistoryRecords,
   sessionManagedAgentTranscriptReader,
 } from "./session-lifecycle.js";
-import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
+import type { SessionRecord } from "./session-store.js";
 import { sessionMatchesVisibilityView } from "./session-visibility.js";
 import {
   createTurnComposer,
@@ -205,7 +207,7 @@ type PresentationSessionBaseOptions = {
 
 type PresentationSessionRecordOptions = Pick<
   PresentationSessionBaseOptions,
-  "stateRoot" | "workspaceRoot" | typeof presentationSessionRecordReader
+  "lifecycle" | "stateRoot" | "workspaceRoot" | typeof presentationSessionRecordReader
 >;
 
 export type CreatePresentationSessionOptions = PresentationSessionBaseOptions &
@@ -1070,6 +1072,8 @@ export async function createPresentationSession(
         : await createRecoverableTurnDraftRepository({
             projectId: state.authoritative.project.id,
             stateRoot: effectiveSessionStateRoot(options.stateRoot),
+            withMutation: (sessionId, operation) =>
+              options.lifecycle[sessionDraftMutation](sessionId, operation),
           });
     const managedDrafts = new Map<
       string,
@@ -2976,8 +2980,16 @@ export async function createPresentationSession(
     };
 
     let visibilityMutation = false;
-    const loadedCatalogDepth = new Map<"active" | "archived", number>();
-    const refreshSessionCatalog = async (view: "active" | "archived") => {
+    let historyAction: Promise<void> | undefined;
+    let pendingTrashView:
+      | {
+          readonly preview: import("@adam-agent/presentation").SessionTrashPreview;
+          readonly composerRevision: number;
+          readonly managedDrafts: readonly unknown[];
+        }
+      | undefined;
+    const loadedCatalogDepth = new Map<"active" | "archived" | "trash", number>();
+    const refreshSessionCatalog = async (view: "active" | "archived" | "trash") => {
       loadedCatalogDepth.set(
         state.authoritative.sessions.view ?? "active",
         Math.max(
@@ -2988,6 +3000,27 @@ export async function createPresentationSession(
       const wanted = Math.max(catalogPageSize, loadedCatalogDepth.get(view) ?? 0);
       await startupCatalog?.close();
       startupCatalog = undefined;
+      if (view === "trash") {
+        const trash = await options.lifecycle.listSessionTrash();
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            sessions: {
+              view,
+              trash,
+              items: [],
+              nextCursor: null,
+              ...(state.authoritative.sessions.visibility === undefined
+                ? {}
+                : { visibility: state.authoritative.sessions.visibility }),
+            },
+          },
+        };
+        publishStateChange();
+        return;
+      }
       let page = await options.lifecycle.listProjectSessionSummaries({
         view,
         limit: Math.min(100, wanted),
@@ -3027,8 +3060,24 @@ export async function createPresentationSession(
       };
       publishStateChange();
     };
+    const detachHistorySession = async (sessionId: string) => {
+      if (state.authoritative.active?.session.id !== sessionId) return;
+      for (const observer of operationObservers.values()) observer.abort();
+      controlObserver?.abort();
+      controlObserverParent = undefined;
+      activeSessionThroughSequence = 0;
+      const { managedControl: _managedControl, ...authority } = state.authoritative;
+      state = {
+        ...state,
+        authoritative: { ...authority, active: null },
+        draft: null,
+        transient: null,
+      };
+      await turnComposer.clear({ preserveRetained: true });
+      state = { ...state, composer: projectTurnComposer() };
+    };
     const dispatch = async (command: PresentationCommand): Promise<CommandReceipt> => {
-      if (closed) {
+      if (closed || startupClosing) {
         return {
           status: "rejected",
           code: "presentation_closed",
@@ -3039,11 +3088,123 @@ export async function createPresentationSession(
         return {
           status: "rejected",
           code: "conflict",
-          message: "Wait for the archive operation to finish.",
+          message: "Wait for the session history operation to finish.",
         };
-      if (command.type === "set_session_view" || command.type === "set_session_visibility") {
+      if (
+        command.type === "set_session_view" ||
+        command.type === "set_session_visibility" ||
+        command.type === "preview_session_trash" ||
+        command.type === "confirm_session_trash" ||
+        command.type === "restore_session_trash" ||
+        command.type === "continue_session_trash"
+      ) {
         visibilityMutation = true;
+        const settled = Promise.withResolvers<void>();
+        historyAction = settled.promise;
         try {
+          if (command.type === "preview_session_trash") {
+            pendingTrashView = undefined;
+            if (activeRun !== undefined || !currentTurnDraftSettled())
+              return {
+                status: "rejected",
+                code: "conflict",
+                message:
+                  "Wait for Main work and draft attachments to finish, or use the existing Stop action.",
+              };
+            const composerRevision = turnComposer.snapshot().revision;
+            const drafts = structuredClone([...managedDrafts]);
+            await persistSettledCurrentTurnDraft();
+            await recoverableDrafts?.flush();
+            await Promise.all(managedDraftWrites);
+            const preview = await options.lifecycle.previewSessionTrash(command);
+            if (
+              turnComposer.snapshot().revision !== composerRevision ||
+              !isDeepStrictEqual(drafts, [...managedDrafts])
+            )
+              return {
+                status: "rejected",
+                code: "stale_interaction",
+                message:
+                  "A draft changed while preparing the preview. Review it and preview Trash again.",
+              };
+            pendingTrashView = { preview, composerRevision, managedDrafts: drafts };
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: null,
+              trashPreview: preview,
+            };
+          }
+          if (
+            command.type === "confirm_session_trash" ||
+            command.type === "restore_session_trash" ||
+            command.type === "continue_session_trash"
+          ) {
+            await recoverableDrafts?.flush();
+            await Promise.all(managedDraftWrites);
+            const pending = pendingTrashView;
+            if (
+              command.type === "confirm_session_trash" &&
+              (pending?.preview.previewId !== command.previewId ||
+                turnComposer.snapshot().revision !== pending.composerRevision ||
+                !isDeepStrictEqual(pending.managedDrafts, [...managedDrafts]))
+            )
+              return {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The preview or a draft changed. Preview Trash again before confirming.",
+              };
+            pendingTrashView = undefined;
+            const result =
+              command.type === "confirm_session_trash"
+                ? await options.lifecycle.confirmSessionTrash(command)
+                : command.type === "restore_session_trash"
+                  ? await options.lifecycle.restoreSessionTrash(command)
+                  : await options.lifecycle.continueSessionTrash(command);
+            if (
+              command.type === "confirm_session_trash" &&
+              pending !== undefined &&
+              (result.status === "completed" || result.status === "incomplete")
+            )
+              await detachHistorySession(pending.preview.sessionId);
+            if (result.status !== "completed") {
+              await refreshSessionCatalog(
+                result.status === "incomplete"
+                  ? "trash"
+                  : (state.authoritative.sessions.view ?? "active"),
+              );
+              return {
+                status: "rejected",
+                code: result.status === "stale" ? "stale_interaction" : "authority_rejected",
+                message:
+                  result.status === "stale"
+                    ? "The session or transaction changed. Review a fresh preview before retrying."
+                    : result.message,
+              };
+            }
+            const manifest = result.manifest;
+            await refreshSessionCatalog(
+              manifest.phase === "restored"
+                ? manifest.unit.archived
+                  ? "archived"
+                  : "active"
+                : "trash",
+            );
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: null,
+              trashItem: {
+                transactionId: manifest.transactionId,
+                sessionId: manifest.unit.mainSessionId,
+                label: manifest.unit.label,
+                revision: manifest.revision,
+                phase: manifest.phase,
+                children: manifest.unit.children,
+                archived: manifest.unit.archived,
+              },
+            };
+          }
           if (command.type === "set_session_view") {
             await refreshSessionCatalog(command.view);
           } else {
@@ -3076,24 +3237,7 @@ export async function createPresentationSession(
                     : result.message,
               };
             }
-            if (
-              command.visibility === "archived" &&
-              state.authoritative.active?.session.id === command.sessionId
-            ) {
-              for (const observer of operationObservers.values()) observer.abort();
-              controlObserver?.abort();
-              controlObserverParent = undefined;
-              activeSessionThroughSequence = 0;
-              await turnComposer.clear({ preserveRetained: true });
-              const { managedControl: _managedControl, ...authority } = state.authoritative;
-              state = {
-                ...state,
-                authoritative: { ...authority, active: null },
-                draft: null,
-                transient: null,
-                composer: projectTurnComposer(),
-              };
-            }
+            if (command.visibility === "archived") await detachHistorySession(command.sessionId);
             await refreshSessionCatalog(state.authoritative.sessions.view ?? "active");
             return {
               status: "admitted",
@@ -3111,10 +3255,13 @@ export async function createPresentationSession(
           return {
             status: "rejected",
             code: "persistence_failed",
-            message: "Archive operation could not be confirmed. Reload the session list.",
+            message:
+              "Session history operation could not be confirmed. Inspect Trash or reload the session list.",
           };
         } finally {
           visibilityMutation = false;
+          settled.resolve();
+          if (historyAction === settled.promise) historyAction = undefined;
         }
       }
 
@@ -6237,7 +6384,7 @@ export async function createPresentationSession(
           }
           const page = await options.lifecycle.listProjectSessionSummaries({
             cursor: command.after,
-            view: state.authoritative.sessions.view ?? "active",
+            view: state.authoritative.sessions.view === "archived" ? "archived" : "active",
             limit: catalogPageSize,
           });
           const additions = page.items.flatMap((snapshot) =>
@@ -7049,6 +7196,7 @@ export async function createPresentationSession(
           return;
         }
         startupClosing = true;
+        await historyAction;
         startupAbort.abort();
         await startupCatalog?.close();
         await startupPaths;
@@ -7699,11 +7847,7 @@ async function readPresentationSessionRecords(
 ): Promise<readonly SessionRecord[]> {
   return (
     options[presentationSessionRecordReader]?.(sessionId) ??
-    readJsonlSessionRecords({
-      sessionId,
-      workspaceRoot: options.workspaceRoot,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    })
+    options.lifecycle[sessionHistoryRecords](sessionId)
   );
 }
 

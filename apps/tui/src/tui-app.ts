@@ -1994,6 +1994,45 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         } else picker.setNotice(receipt.message);
         renderState();
       };
+      let trashActionPending = false;
+      const changeTrash = async (
+        command: Extract<
+          PresentationCommand,
+          {
+            readonly type:
+              | "confirm_session_trash"
+              | "restore_session_trash"
+              | "continue_session_trash";
+          }
+        >,
+      ) => {
+        if (trashActionPending) return;
+        trashActionPending = true;
+        try {
+          await draftMutationQueue.onIdle();
+          const receipt = await options.presentation.dispatch(command);
+          picker.setTrashPreview(null);
+          if (receipt.status === "admitted" && receipt.trashItem !== undefined) {
+            const item = receipt.trashItem;
+            if (item.phase === "restored") {
+              picker.rememberSession(item.sessionId, item.archived ? "archived" : "active");
+              picker.setNotice("Session unit restored. Enter opens its retained history.");
+            } else {
+              picker.rememberTrash(item.transactionId);
+              picker.setNotice("Session unit moved to Trash. Enter Restore.");
+            }
+          } else if (receipt.status === "rejected") picker.setNotice(receipt.message);
+          renderState();
+        } catch {
+          picker.setTrashPreview(null);
+          picker.setNotice(
+            "The session transaction could not be confirmed. Inspect Trash before retrying.",
+          );
+          tui.requestRender();
+        } finally {
+          trashActionPending = false;
+        }
+      };
       const picker = new SessionPicker({
         ...state.authoritative.sessions,
         sessions: state.authoritative.sessions.items,
@@ -2003,6 +2042,38 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : { diagnostics: state.authoritative.sessions.diagnostics }),
         theme,
         onClose: () => close(),
+        onPreviewTrash(session) {
+          if (trashActionPending) return;
+          void draftMutationQueue
+            .onIdle()
+            .then(() =>
+              options.presentation.dispatch({
+                type: "preview_session_trash",
+                sessionId: session.id,
+              }),
+            )
+            .then((receipt) => {
+              if (sessionPicker?.picker !== picker) return;
+              if (receipt.status === "admitted" && receipt.trashPreview !== undefined)
+                picker.setTrashPreview(receipt.trashPreview);
+              else if (receipt.status === "rejected") picker.setNotice(receipt.message);
+              tui.requestRender();
+            })
+            .catch(() => {
+              picker.setNotice("Trash preview is unavailable.");
+              tui.requestRender();
+            });
+        },
+        onConfirmTrash(previewId) {
+          void changeTrash({ type: "confirm_session_trash", previewId });
+        },
+        onRestoreTrash(item, resume) {
+          void changeTrash({
+            type: resume ? "continue_session_trash" : "restore_session_trash",
+            transactionId: item.transactionId,
+            expectedRevision: item.revision,
+          });
+        },
         onView(view) {
           void options.presentation.dispatch({ type: "set_session_view", view }).then((receipt) => {
             if (receipt.status !== "admitted") picker.setNotice(receipt.message);
@@ -2030,6 +2101,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             .dispatch({ type: "select_session", sessionId: session.id })
             .then((receipt) => {
               if (receipt.status === "admitted") {
+                // The selection receipt settles both history and draft hydration.
+                projectedComposerScope = null;
+                projectedComposerKey = null;
                 expandedReasoningIds.clear();
                 reasoningArtifactReads.clear();
                 reasoningArtifactTexts.clear();

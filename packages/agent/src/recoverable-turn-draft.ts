@@ -115,6 +115,7 @@ export type RecoverableTurnDraft =
   | RecoverableTurnDraftV4;
 
 export type RecoverableTurnDraftRepository = {
+  flush(): Promise<void>;
   load(scope: TurnDraftScopeV1): Promise<RecoverableTurnDraft | null>;
   save(draft: RecoverableTurnDraftV3 | RecoverableTurnDraftV4): Promise<void>;
   delete(scope: TurnDraftScopeV1): Promise<void>;
@@ -471,6 +472,7 @@ function validateDraftGraph(draft: RecoverableTurnDraft, context: z.RefinementCt
 export async function createRecoverableTurnDraftRepository(options: {
   readonly projectId: string;
   readonly stateRoot: string;
+  readonly withMutation?: <T>(sessionId: string | null, operation: () => Promise<T>) => Promise<T>;
 }): Promise<RecoverableTurnDraftRepository> {
   const projectMatch = projectIdPattern.exec(options.projectId);
   if (projectMatch?.[1] === undefined) {
@@ -480,8 +482,13 @@ export async function createRecoverableTurnDraftRepository(options: {
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
   let mutationQueue = Promise.resolve();
-  const enqueueMutation = <Result>(operation: () => Promise<Result>): Promise<Result> => {
-    const result = mutationQueue.then(operation);
+  const enqueueMutation = <Result>(
+    sessionId: string | null,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const result = mutationQueue.then(() =>
+      options.withMutation === undefined ? operation() : options.withMutation(sessionId, operation),
+    );
     mutationQueue = result.then(
       () => undefined,
       () => undefined,
@@ -490,6 +497,7 @@ export async function createRecoverableTurnDraftRepository(options: {
   };
 
   return {
+    flush: () => mutationQueue,
     async loadManaged(scope) {
       await mutationQueue;
       const value = await readOwnerPrivateManifest(join(root, managedManifestName(scope)));
@@ -500,7 +508,7 @@ export async function createRecoverableTurnDraftRepository(options: {
       return parseManagedComposerDraft(draft);
     },
     saveManaged(draft) {
-      return enqueueMutation(async () => {
+      return enqueueMutation(draft.parentSessionId, async () => {
         const validated = parseManagedComposerDraft(draft);
         const serialized = `${JSON.stringify({ schemaVersion: 1, type: "managed_thread_draft", draft: validated })}\n`;
         if (Buffer.byteLength(serialized, "utf8") > maximumManifestBytes)
@@ -510,7 +518,7 @@ export async function createRecoverableTurnDraftRepository(options: {
       });
     },
     clearManaged(draft) {
-      return enqueueMutation(async () => {
+      return enqueueMutation(draft.parentSessionId, async () => {
         const validated = parseManagedComposerDraft(draft);
         const path = join(root, managedManifestName(validated));
         const value = await readOwnerPrivateManifest(path);
@@ -523,7 +531,7 @@ export async function createRecoverableTurnDraftRepository(options: {
       });
     },
     delete(scope) {
-      return enqueueMutation(async () => {
+      return enqueueMutation(scope.type === "session" ? scope.sessionId : null, async () => {
         try {
           await unlink(join(root, manifestName(scope)));
         } catch (error) {
@@ -556,15 +564,20 @@ export async function createRecoverableTurnDraftRepository(options: {
       return parsed.data;
     },
     save(draft) {
-      return enqueueMutation(async () => {
-        const validated = (draft.schemaVersion === 4 ? draftV4Schema : draftV3Schema).parse(draft);
-        const serialized = `${JSON.stringify({ ...validated, elements: validated.elements.map((element) => (element.type === "mention" ? serializeMention(element) : element)) })}\n`;
-        if (Buffer.byteLength(serialized, "utf8") > maximumManifestBytes) {
-          throw new TypeError("The recoverable draft manifest is too large.");
-        }
-        await replaceOwnerPrivateFile(join(root, manifestName(validated.scope)), serialized);
-        await syncDirectory(root);
-      });
+      return enqueueMutation(
+        draft.scope.type === "session" ? draft.scope.sessionId : null,
+        async () => {
+          const validated = (draft.schemaVersion === 4 ? draftV4Schema : draftV3Schema).parse(
+            draft,
+          );
+          const serialized = `${JSON.stringify({ ...validated, elements: validated.elements.map((element) => (element.type === "mention" ? serializeMention(element) : element)) })}\n`;
+          if (Buffer.byteLength(serialized, "utf8") > maximumManifestBytes) {
+            throw new TypeError("The recoverable draft manifest is too large.");
+          }
+          await replaceOwnerPrivateFile(join(root, manifestName(validated.scope)), serialized);
+          await syncDirectory(root);
+        },
+      );
     },
   };
 }

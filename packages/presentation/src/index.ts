@@ -195,8 +195,34 @@ export type SessionNaming = {
       };
 };
 
+export type SessionTrashPreview = {
+  readonly previewId: string | null;
+  readonly sessionId: string;
+  readonly label: string;
+  readonly children: readonly { readonly sessionId: string; readonly threadId: string }[];
+  readonly blockers: readonly {
+    readonly kind: "activity" | "dependency" | "ownership";
+    readonly message: string;
+    readonly sessionIds: readonly string[];
+  }[];
+};
+export type SessionTrashItem = {
+  readonly transactionId: string;
+  readonly sessionId: string;
+  readonly label: string;
+  readonly revision: number;
+  readonly phase: "prepared" | "trashing" | "trashed" | "restoring" | "restored";
+  readonly children: readonly { readonly sessionId: string; readonly threadId: string }[];
+  readonly archived: boolean;
+};
+export type SessionTrashCatalogDisplay = {
+  readonly items: readonly SessionTrashItem[];
+  readonly diagnostics: readonly { readonly transactionId: string; readonly message: string }[];
+};
+
 export type SessionSummaryPage = {
-  readonly view?: "active" | "archived";
+  readonly view?: "active" | "archived" | "trash";
+  readonly trash?: SessionTrashCatalogDisplay;
   readonly visibility?:
     | { readonly status: "ready"; readonly revision: number; readonly archived: readonly string[] }
     | { readonly status: "unknown"; readonly message: string };
@@ -1444,6 +1470,8 @@ export type CommandReceipt =
       readonly status: "admitted";
       readonly commandId: string;
       readonly resource: ArtifactChunk | null;
+      readonly trashPreview?: SessionTrashPreview;
+      readonly trashItem?: SessionTrashItem;
       readonly sessionVisibility?: {
         readonly sessionId: string;
         readonly visibility: "active" | "archived";
@@ -1805,9 +1833,21 @@ export type PresentationCommand =
       readonly type: "load_older_transcript";
       readonly before: string;
     }
+  | { readonly type: "preview_session_trash"; readonly sessionId: string }
+  | { readonly type: "confirm_session_trash"; readonly previewId: string }
+  | {
+      readonly type: "restore_session_trash";
+      readonly transactionId: string;
+      readonly expectedRevision: number;
+    }
+  | {
+      readonly type: "continue_session_trash";
+      readonly transactionId: string;
+      readonly expectedRevision: number;
+    }
   | {
       readonly type: "set_session_view";
-      readonly view: "active" | "archived";
+      readonly view: "active" | "archived" | "trash";
     }
   | {
       readonly type: "set_session_visibility";

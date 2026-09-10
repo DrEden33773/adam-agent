@@ -523,6 +523,7 @@ test("ConversationViewer follows live output, preserves manual scroll, and survi
     await started.promise;
     await h.terminal.waitForScreen("@explore-1 · Running · Explore");
     await h.openFirstAgent();
+    await h.terminal.waitForScreen("Following tail");
     expect(h.conversationText()).toContain("First live line.");
     await h.press("d", "Conversation details");
     expect(h.terminal.lines().join("\n")).toContain("deepseek-v4-flash.direct · thinking default");
@@ -611,6 +612,7 @@ test("viewer cycles assistant Markdown, full Markdown and raw without rewriting 
     await h.terminal.waitForScreen("Completed");
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Conversation");
+    await h.terminal.waitForScreen("Following tail");
     expect(h.conversationText()).toContain("Bold proof");
     expect(h.conversationText()).not.toContain("**Bold proof**");
     expect(h.conversationText()).toContain("m assistant Markdown");
@@ -702,6 +704,7 @@ test("viewer loads bounded older transcript pages and returns to the current tai
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Newest evidence page.");
     expect(h.conversationText()).not.toContain("Page evidence 1.");
+    await h.terminal.waitForScreen("PgUp at top: older transcript page");
     await h.press("\u001b[H", "Manual scroll");
     await h.press("\u001b[5~", "Page evidence 1.");
     await h.press("\u001b[F", "Newest evidence page.");

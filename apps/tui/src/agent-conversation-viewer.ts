@@ -137,6 +137,7 @@ export class AgentConversationViewer implements Component {
   #pageReadPending = false;
   #pageGeneration = 0;
   #readKey = "";
+  #initialPageReady = false;
   #readGeneration = 0;
   #closed = false;
   #details = false;
@@ -305,6 +306,7 @@ export class AgentConversationViewer implements Component {
   }
   setThread(thread: ManagedControlThread): void {
     if (this.#thread.turn.turnId !== thread.turn.turnId) {
+      this.#initialPageReady = false;
       this.#items = [];
       this.#olderCursor = null;
       this.#liveText = undefined;
@@ -351,6 +353,7 @@ export class AgentConversationViewer implements Component {
       thread.turn.outcome.transcript.sequence === 0
     ) {
       this.#items = [];
+      this.#initialPageReady = true;
       this.#notice = "No agent session was started.";
       return;
     }
@@ -365,6 +368,7 @@ export class AgentConversationViewer implements Component {
           page.childSessionId !== thread.turn.childSessionId
         )
           throw new Error("The exact agent transcript changed.");
+        this.#initialPageReady = true;
         this.#items = page.items;
         this.#olderCursor = page.olderCursor;
         this.#currentCursor = page.cursor ?? null;
@@ -807,6 +811,22 @@ export class AgentConversationViewer implements Component {
       if (!isKeyRepeat(data)) this.back();
       return;
     }
+    // Page navigation and resource selection require the first durable snapshot.
+    if (
+      !this.#initialPageReady &&
+      this.#manualPage === undefined &&
+      !this.#composing &&
+      (wheel !== null ||
+        matchesKey(data, "home") ||
+        matchesKey(data, "end") ||
+        viewerKeys.up(data) ||
+        viewerKeys.down(data) ||
+        viewerKeys.pageUp(data) ||
+        viewerKeys.pageDown(data) ||
+        matchesKey(data, "v") ||
+        matchesKey(data, "i"))
+    )
+      return;
     if (wheel !== null) {
       this.scrollConversation(wheel, false);
       this.options.onChange();
@@ -1429,12 +1449,17 @@ export class AgentConversationViewer implements Component {
       this.#composeTarget.expectedTurnId !== thread.turn.turnId
         ? ["Draft targets an earlier turn · Ctrl+D discard · t retarget"]
         : []),
-      `${this.#followTail ? "Following tail" : "Manual scroll · End tail"} · m ${this.#renderMode === "raw" ? "raw" : `${this.#renderMode} Markdown`}`,
+      this.#initialPageReady || this.#manualPage !== undefined
+        ? `${this.#followTail ? "Following tail" : "Manual scroll · End tail"} · m ${this.#renderMode === "raw" ? "raw" : `${this.#renderMode} Markdown`}`
+        : "Loading transcript…",
       ...(olderCursor === null ? [] : ["PgUp at top: older transcript page"]),
       ...(this.#newerCursors.length === 0 ? [] : ["PgDown at bottom: newer page · End latest"]),
       ...(this.#notice ? [this.options.theme.statusWarning(safeTerminalText(this.#notice))] : []),
       ...(liveOmittedBytes > 0 ? [`Live preview · ${liveOmittedBytes} bytes omitted`] : []),
-      ...(this.resourceEntries().length > 0 ? ["v resources · i input receipts"] : []),
+      ...((this.#initialPageReady || this.#manualPage !== undefined) &&
+      this.resourceEntries().length > 0
+        ? ["v resources · i input receipts"]
+        : []),
       ...(() => {
         const input =
           thread.inputs?.find((entry) => entry.id === this.#lastInputId) ??
