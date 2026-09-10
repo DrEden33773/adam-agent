@@ -1559,3 +1559,162 @@ test("completed Control shutdown does not depend on a newly unreadable parent ad
     await lifecycle.close().catch(() => undefined);
   }
 });
+
+test.each(["attempt_commit", "plan_ceiling"] as const)(
+  "cancellation at %s retains strict provider accounting without dispatch",
+  async (boundary) => {
+    const paused = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const cancelIntent = Promise.withResolvers<void>();
+    let restricted = false;
+    let calls = 0;
+    const harness = await controlHarness({
+      stream() {
+        calls += 1;
+        throw new Error("Cancellation must precede external provider dispatch.");
+      },
+    });
+    const control = createManagedAgentControl({
+      ...harness.options,
+      readPlan: async () =>
+        restricted
+          ? {
+              cycleId: "00000000-0000-4000-8000-000000000099",
+              revision: 1,
+              policyVersion: "plan-policy.read-v1" as const,
+              state: "exploring" as const,
+              eligibleToolProfile: {
+                version: 1 as const,
+                digest: `sha256:${"a".repeat(64)}` as const,
+                source: { version: 1 as const, digest: `sha256:${"b".repeat(64)}` as const },
+                definitions: [
+                  {
+                    name: "read_file",
+                    definitionDigest: `sha256:${"c".repeat(64)}` as const,
+                    effect: "read" as const,
+                    source: "builtin" as const,
+                  },
+                ],
+              },
+            }
+          : undefined,
+      [sessionRecordCommittedBarrier]: async (record) => {
+        if (record.schemaVersion !== 3 || record.record.type !== "provider_attempt_started") return;
+        if (boundary === "plan_ceiling") restricted = true;
+        else {
+          paused.resolve();
+          await release.promise;
+        }
+      },
+      [managedAgentRecordBarrier]: async (record) => {
+        if (record.event.type === "cancel_requested") cancelIntent.resolve();
+        if (record.event.type === "capacity_wait" && record.event.reason === "plan")
+          paused.resolve();
+      },
+    });
+    let cold: ReturnType<typeof createManagedAgentControl> | undefined;
+    try {
+      await control.dispatch({
+        type: "start_thread",
+        parentSessionId,
+        role: "builtin:explore",
+        task: "Cancel before dispatch.",
+        description: "Undispatched attempt",
+      });
+      await withManagedFailureGuard(paused.promise, `paused ${boundary}`);
+      const admission = (await harness.options.store.read()).find(
+        (record) => record.event.type === "admitted",
+      );
+      if (admission === undefined) throw new Error("Missing admitted attempt.");
+      const cancellation = control.dispatch({
+        type: "cancel_turn",
+        parentSessionId,
+        threadId: admission.threadId,
+        expectedTurnId: admission.turnId,
+      });
+      await withManagedFailureGuard(cancelIntent.promise, "durable cancellation intent");
+      release.resolve();
+      expect(
+        await withManagedFailureGuard(cancellation, "cancelled undispatched attempt"),
+      ).toMatchObject({ status: "cancelled" });
+      const snapshot = await control.inspect({ parentSessionId });
+      expect(snapshot.threads[0]?.turn).toMatchObject({
+        phase: "idle",
+        recovery: "none",
+        outcome: { status: "cancelled", usage: { providerCalls: 0 } },
+      });
+      expect(snapshot.threads[0]?.turn.diagnostic).toBeUndefined();
+      expect(calls).toBe(0);
+      const history = await harness.options.store.read();
+      const disposition = history.find((record) => record.event.type === "provider_not_dispatched");
+      expect(disposition?.event).toMatchObject({
+        type: "provider_not_dispatched",
+        reason: "cancelled",
+      });
+      expect(history.filter((record) => record.event.type === "provider_reserved")).toEqual([]);
+      if (disposition?.event.type !== "provider_not_dispatched")
+        throw new Error("Missing disposition.");
+      const blocked = {
+        type: "budget_blocked" as const,
+        purpose: "ordinary" as const,
+        source: disposition.event.source,
+        code: "fleet_budget_exhausted" as const,
+        message: "Conflicting budget disposition.",
+      };
+      for (const [first, second] of [
+        [disposition.event, blocked],
+        [blocked, disposition.event],
+      ] as const) {
+        const conflicting = createInMemoryManagedAgentControlStore();
+        for (const entry of history.filter((entry) => entry.sequence < disposition.sequence))
+          await conflicting.append(entry);
+        await conflicting.append({ ...disposition, event: first });
+        await expect(
+          conflicting.append({ ...disposition, sequence: disposition.sequence + 1, event: second }),
+        ).rejects.toMatchObject({ code: "managed_agent_log_invalid" });
+      }
+      await control.dispatch({ type: "close", parentSessionId });
+      cold = createManagedAgentControl(harness.options);
+      expect((await cold.inspect({ parentSessionId })).threads[0]?.turn.recovery).toBe("none");
+      expect(
+        await cold.dispatch({
+          type: "wait_agents",
+          parentSessionId,
+          mode: "all",
+          targets: [{ threadId: admission.threadId, expectedTurnId: admission.turnId }],
+        }),
+      ).toMatchObject({ status: "completed" });
+      const damaged = createInMemoryManagedAgentControlStore();
+      for (const record of history) {
+        const event = record.event;
+        await damaged.append(
+          event.type !== "provider_not_dispatched"
+            ? record
+            : {
+                ...record,
+                event: {
+                  ...event,
+                  [boundary === "attempt_commit" ? "source" : "interruption"]: {
+                    ...(boundary === "attempt_commit" ? event.source : event.interruption),
+                    digest: `sha256:${"0".repeat(64)}`,
+                  },
+                },
+              },
+        );
+      }
+      const unproven = createManagedAgentControl({ ...harness.options, store: damaged });
+      try {
+        expect((await unproven.inspect({ parentSessionId })).threads[0]?.turn.recovery).toBe(
+          "required",
+        );
+      } finally {
+        await unproven.dispatch({ type: "close", parentSessionId });
+      }
+    } finally {
+      release.resolve();
+      await cold?.dispatch({ type: "close", parentSessionId });
+      await control.dispatch({ type: "close", parentSessionId });
+      await harness.close();
+    }
+  },
+);

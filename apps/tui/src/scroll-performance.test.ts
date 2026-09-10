@@ -177,6 +177,7 @@ test.each(["main", "todo", "static_widget", "eight_streaming"] as const)(
         if (view === "child") {
           await h.openFirstAgent();
           await h.terminal.waitForScreen(`Wave ${samples - 1} fragment 9`);
+          await h.terminal.waitForScreen("Following tail");
         }
         for (let index = 0; index < samples; index++) {
           const wave = index + (view === "child" ? samples : 0);

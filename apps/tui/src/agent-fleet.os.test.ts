@@ -120,6 +120,7 @@ test("explicit child resources page private reasoning, exact tool records and im
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Conversation");
     expect(h.conversationText()).not.toContain("PRIVATE_REASONING");
+    await h.terminal.waitForScreen("Following tail");
     await h.press("v", "Conversation resources");
     await h.press("\r", "Reasoning page");
     expect(h.terminal.lines().join("\n")).toContain("PRIVATE_REASONING");
@@ -192,6 +193,7 @@ test("full Markdown renders an actual read-file prose result while assistant mod
     await h.terminal.waitForScreen("Completed");
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Conversation");
+    await h.terminal.waitForScreen("Following tail");
     await h.press("\u001b[H", "Manual scroll");
     expect(h.conversationText()).toContain("**literal tool text**");
     await h.press("m", "m full Markdown");
@@ -563,6 +565,7 @@ test("confirmed bounded exports persist selected fields privately with a separat
     try {
       await cold.press("/agents\r", "Agents workspace");
       await cold.press("\r", "Seen · Main pending");
+      await cold.terminal.waitForScreen("Following tail");
       await cold.press("v", "Conversation resources");
       await cold.press("\u001b[F\r", "Artifact page");
       expect(cold.terminal.lines().join("\n")).toContain("adam.agent-export.v1");

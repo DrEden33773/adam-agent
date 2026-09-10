@@ -4,6 +4,8 @@ export class SessionLifecycleError extends Error {
   readonly code:
     | "session_branch_boundary_invalid"
     | "session_invalid"
+    | "session_in_trash"
+    | "session_trash_unavailable"
     | "session_managed_control_read_only"
     | "session_managed_transition_required"
     | "session_model_target_incompatible"
@@ -80,6 +82,10 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The requested branch position is not a complete session boundary.";
     case "session_managed_control_read_only":
       return "Historical agent controls are read-only. Start a new current Session to delegate work.";
+    case "session_in_trash":
+      return "This session is in Trash or an unfinished transaction. Restore the complete unit before opening it.";
+    case "session_trash_unavailable":
+      return "Trash metadata could not be verified. Inspect Trash before changing session history.";
     case "session_invalid":
       return "The session history is invalid.";
     case "session_model_target_incompatible":

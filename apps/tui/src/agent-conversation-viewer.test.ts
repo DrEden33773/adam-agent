@@ -27,9 +27,14 @@ async function textViewer(
   noColor = true,
   maximum = 30,
   items?: ManagedAgentTranscriptPageResource["items"],
+  beforeRead?: (viewer: AgentConversationViewer) => void,
+  nextRead?: { gate: Promise<void>; changed: () => void },
 ) {
   const thread = agentViewThread();
   const read = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let released = false;
+  let reads = 0;
   const unexpected = async () => {
     throw new Error("Rendering literal evidence cannot dispatch an action.");
   };
@@ -39,7 +44,10 @@ async function textViewer(
     theme: createAdamTuiTheme(noColor),
     maximumLines: () => maximum,
     renderMode: "full",
-    onChange: () => read.resolve(),
+    onChange: () => {
+      if (released) read.resolve();
+      if (reads > 1) nextRead?.changed();
+    },
     onClose() {},
     onExport: unexpected,
     onSeen: unexpected,
@@ -48,13 +56,16 @@ async function textViewer(
     onSaveDraft: unexpected,
     onClearDraft: unexpected,
     onReadResource: unexpected,
-    async onRead() {
+    async onRead(selected) {
+      reads += 1;
+      await release.promise;
+      if (reads > 1) await nextRead?.gate;
       return {
         type: "managed_agent_transcript_page",
-        agentId: thread.threadId,
-        turnId: thread.turn.turnId,
-        attemptId: thread.turn.attemptId,
-        childSessionId: thread.turn.childSessionId,
+        agentId: selected.threadId,
+        turnId: selected.turn.turnId,
+        attemptId: selected.turn.attemptId,
+        childSessionId: selected.turn.childSessionId,
         throughSequence: 1,
         olderCursor: null,
         items: items ?? [
@@ -62,7 +73,7 @@ async function textViewer(
             type: "assistant_message",
             id: "answer",
             sequence: 1,
-            sourceSessionId: thread.turn.childSessionId,
+            sourceSessionId: selected.turn.childSessionId,
             branchBoundary: null,
             text,
             artifact: null,
@@ -71,6 +82,9 @@ async function textViewer(
       };
     },
   });
+  beforeRead?.(viewer);
+  released = true;
+  release.resolve();
   await read.promise;
   return viewer;
 }
@@ -199,3 +213,68 @@ test.each([
     }
   },
 );
+
+test("initial transcript loading cannot freeze an empty page or open partial resources", async () => {
+  const viewer = await textViewer("Retained first page.", true, 30, undefined, (pending) => {
+    expect(pending.render(80).join("\n")).toContain("Loading transcript");
+    pending.handleInput("\u001b[H");
+    pending.handleInput("v");
+    expect(pending.render(80).join("\n")).not.toContain("Conversation resources");
+  });
+  try {
+    viewer.handleInput("\u001b[H");
+    const text = viewer.render(80).join("\n");
+    expect(text).toContain("Manual scroll");
+    expect(text).toContain("Retained first page.");
+  } finally {
+    viewer.dispose();
+  }
+});
+
+test("a changed turn waits for its own first page before manual navigation", async () => {
+  const gate = Promise.withResolvers<void>();
+  const changed = Promise.withResolvers<void>();
+  const viewer = await textViewer("Next-turn retained page.", true, 30, undefined, undefined, {
+    gate: gate.promise,
+    changed: () => changed.resolve(),
+  });
+  try {
+    const thread = agentViewThread();
+    viewer.setThread({
+      ...thread,
+      turn: { ...thread.turn, turnId: "00000000-0000-4000-8000-000000000099" },
+    });
+    expect(viewer.render(80).join("\n")).toContain("Loading transcript");
+    viewer.handleInput("\u001b[H");
+    viewer.handleInput("v");
+    expect(viewer.render(80).join("\n")).not.toContain("Conversation resources");
+    gate.resolve();
+    await changed.promise;
+    viewer.handleInput("\u001b[H");
+    expect(viewer.render(80).join("\n")).toContain("Next-turn retained page.");
+  } finally {
+    gate.resolve();
+    viewer.dispose();
+  }
+});
+
+test("leaving a retained manual page waits for the unread current tail", async () => {
+  const original = await textViewer("Saved manual evidence.");
+  original.handleInput("\u001b[H");
+  const saved = original.readingState();
+  original.dispose();
+  const reopened = await textViewer("Fresh tail evidence.", true, 30, undefined, (pending) => {
+    pending.restoreReadingState(saved);
+    expect(pending.render(80).join("\n")).toContain("Saved manual evidence.");
+    expect(pending.render(80).join("\n")).toContain("Manual scroll");
+    pending.handleInput("\u001b[F");
+    pending.handleInput("\u001b[H");
+    expect(pending.render(80).join("\n")).toContain("Loading transcript");
+  });
+  try {
+    reopened.handleInput("\u001b[H");
+    expect(reopened.render(80).join("\n")).toContain("Fresh tail evidence.");
+  } finally {
+    reopened.dispose();
+  }
+});

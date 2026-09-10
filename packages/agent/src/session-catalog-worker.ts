@@ -29,6 +29,8 @@ import {
   type SessionStoreDirectoryEntry,
   SessionStoreError,
 } from "./session-store.js";
+import { createSessionTrashRepository } from "./session-trash.js";
+import { createSessionTrashAccess } from "./session-trash-guards.js";
 import {
   createSessionVisibilityRepository,
   type SessionVisibilitySnapshot,
@@ -38,6 +40,8 @@ import {
 const port = parentPort;
 if (port === null) throw new Error("The session catalog requires a worker message port.");
 const input = workerData as SessionCatalogWorkerData;
+const trashAccess = createSessionTrashAccess(createSessionTrashRepository(input));
+let reserved: ReadonlySet<string> = new Set();
 const directory = createJsonlSessionStoreDirectory(input);
 const readRecords = async (sessionId: string): Promise<readonly SessionRecord[]> =>
   (await directory.readRecords?.(sessionId)) ?? [];
@@ -86,14 +90,25 @@ const diagnostics = new Map<string, SessionHistoryDiagnostic>();
 const healthChecked = new Set<string>();
 let pageWork = Promise.resolve();
 
+async function refreshReservations(): Promise<void> {
+  reserved = await trashAccess.reservedIds();
+  for (const id of reserved) {
+    summaries.delete(id);
+    diagnostics.delete(id);
+  }
+}
+
 function cursor(): string | null {
-  const unread = entries.slice(position).some((entry) => !healthChecked.has(entry.sessionId));
+  const unread = entries
+    .slice(position)
+    .some((entry) => !reserved.has(entry.sessionId) && !healthChecked.has(entry.sessionId));
   return summaries.size > wantedItems || unread
     ? `project-summaries:v1:${input.generation}:${wantedItems}`
     : null;
 }
 
-function publish(error?: ProjectSessionCatalogSnapshot["error"]): void {
+async function publish(error?: ProjectSessionCatalogSnapshot["error"]): Promise<void> {
+  if (error === undefined) await refreshReservations();
   const knownDiagnostics = [...diagnostics.values()].sort((left, right) =>
     left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
   );
@@ -104,6 +119,7 @@ function publish(error?: ProjectSessionCatalogSnapshot["error"]): void {
       visibility,
       view: input.view ?? "active",
       items: entries
+        .filter((entry) => !reserved.has(entry.sessionId))
         .flatMap((entry) => {
           const item = summaries.get(entry.sessionId);
           return item === undefined ? [] : [item];
@@ -122,12 +138,12 @@ function publish(error?: ProjectSessionCatalogSnapshot["error"]): void {
   });
 }
 
-function fail(): void {
+async function fail(): Promise<void> {
   if (failed) return;
   failed = true;
   phase = "failed";
   health = "failed";
-  publish({
+  await publish({
     code: "catalog_scan_failed",
     message: "The history scan could not be completed. Existing local sessions were retained.",
   });
@@ -189,9 +205,11 @@ function summary(sessionId: string, records: readonly SessionRecord[]): ProjectS
 }
 
 async function fillPage(): Promise<void> {
+  await refreshReservations();
   while (!failed && position < entries.length && summaries.size < wantedItems) {
     const entry = entries[position++];
-    if (entry === undefined || healthChecked.has(entry.sessionId)) continue;
+    if (entry === undefined || reserved.has(entry.sessionId) || healthChecked.has(entry.sessionId))
+      continue;
     try {
       const records = await readRecords(entry.sessionId);
       if (!healthChecked.has(entry.sessionId) && hasAcceptedInput(records)) {
@@ -206,7 +224,7 @@ async function fillPage(): Promise<void> {
 
 async function scanHealth(): Promise<void> {
   health = "running";
-  publish();
+  await publish();
   for (const entry of entries) {
     if (failed) return;
     try {
@@ -224,14 +242,14 @@ async function scanHealth(): Promise<void> {
     }
     healthChecked.add(entry.sessionId);
     checked += 1;
-    publish();
+    await publish();
   }
   pageWork = pageWork.then(async () => {
     if (failed) return;
     // Excluding an invalid visible row must not leave the first page artificially short.
     await fillPage();
     health = "complete";
-    publish();
+    await publish();
   });
   await pageWork;
 }
@@ -241,17 +259,22 @@ async function start(): Promise<void> {
   projectId = `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
   visibility = await createSessionVisibilityRepository(input).load();
   const metadata = visibility;
+  await refreshReservations();
   entries = [...(await directory.listSessionEntries())]
-    .filter((entry) => sessionMatchesVisibilityView(entry.sessionId, metadata, input.view))
+    .filter(
+      (entry) =>
+        !reserved.has(entry.sessionId) &&
+        sessionMatchesVisibilityView(entry.sessionId, metadata, input.view),
+    )
     .sort(
       (left, right) =>
         right.modifiedAtMilliseconds - left.modifiedAtMilliseconds ||
         (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0),
     );
-  publish();
+  await publish();
   await fillPage();
   phase = "ready";
-  publish();
+  await publish();
   await scanHealth();
 }
 
@@ -276,10 +299,10 @@ port.on("message", (message: SessionCatalogWorkerRequest) => {
     wantedItems += input.limit;
     try {
       await fillPage();
-      publish();
+      await publish();
       post({ type: "page_settled", id: message.id, ok: true });
     } catch {
-      fail();
+      await fail();
       post({ type: "page_settled", id: message.id, ok: false });
     }
   });

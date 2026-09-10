@@ -2,11 +2,15 @@ import type {
   SessionHistoryDiagnosticsDisplay,
   SessionSummary,
   SessionSummaryPage,
+  SessionTrashItem,
+  SessionTrashPreview,
 } from "@adam-agent/presentation";
 import {
   type Component,
   fuzzyFilter,
   getKeybindings,
+  isKeyRelease,
+  isKeyRepeat,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -21,6 +25,7 @@ import type { AdamTuiTheme } from "./theme.js";
 type SessionPickerItem =
   | { readonly kind: "new_session" }
   | { readonly kind: "session"; readonly session: SessionSummary }
+  | { readonly kind: "trash"; readonly transaction: SessionTrashItem }
   | { readonly kind: "invalid_sessions" }
   | { readonly kind: "load_more" };
 
@@ -28,13 +33,22 @@ export type SessionPickerCatalog = {
   readonly sessions: readonly SessionSummary[];
   readonly hasMore: boolean;
   readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
-} & Pick<SessionSummaryPage, "loading" | "health" | "error" | "view" | "visibility">;
+} & Pick<SessionSummaryPage, "loading" | "health" | "error" | "view" | "visibility" | "trash">;
 
 export class SessionPicker implements Component {
-  #catalogView: "active" | "archived";
-  readonly #viewSelections = new Map<"active" | "archived", string>();
+  #catalogView: "active" | "archived" | "trash";
+  #trash: SessionSummaryPage["trash"];
+  #trashPreview: SessionTrashPreview | null = null;
+  #trashConfirm = false;
+  #trashPreviewRendered = false;
+  #trashBusy = false;
+  #trashPreviewOffset = 0;
+  readonly #onPreviewTrash: ((session: SessionSummary) => void) | undefined;
+  readonly #onConfirmTrash: ((previewId: string) => void) | undefined;
+  readonly #onRestoreTrash: ((transaction: SessionTrashItem, resume: boolean) => void) | undefined;
+  readonly #viewSelections = new Map<"active" | "archived" | "trash", string>();
   #visibility: SessionSummaryPage["visibility"];
-  readonly #onView: ((view: "active" | "archived") => void) | undefined;
+  readonly #onView: ((view: "active" | "archived" | "trash") => void) | undefined;
   readonly #onArchive:
     | ((session: SessionSummary, visibility: "active" | "archived", revision: number) => void)
     | undefined;
@@ -61,7 +75,10 @@ export class SessionPicker implements Component {
   constructor(
     options: SessionPickerCatalog & {
       readonly theme: AdamTuiTheme;
-      readonly onView?: (view: "active" | "archived") => void;
+      readonly onView?: (view: "active" | "archived" | "trash") => void;
+      readonly onPreviewTrash?: (session: SessionSummary) => void;
+      readonly onConfirmTrash?: (previewId: string) => void;
+      readonly onRestoreTrash?: (transaction: SessionTrashItem, resume: boolean) => void;
       readonly onArchive?: (
         session: SessionSummary,
         visibility: "active" | "archived",
@@ -78,6 +95,10 @@ export class SessionPicker implements Component {
     this.#catalogView = options.view ?? "active";
     this.#visibility = options.visibility;
     this.#onView = options.onView;
+    this.#trash = options.trash;
+    this.#onPreviewTrash = options.onPreviewTrash;
+    this.#onConfirmTrash = options.onConfirmTrash;
+    this.#onRestoreTrash = options.onRestoreTrash;
     this.#onArchive = options.onArchive;
     this.#onUndo = options.onUndo;
     this.#onNewSession = options.onNewSession;
@@ -112,6 +133,7 @@ export class SessionPicker implements Component {
     const diagnosticId = this.#diagnostics.items[this.#diagnosticIndex]?.sessionId;
     this.#catalogView = catalog.view ?? "active";
     this.#visibility = catalog.visibility;
+    this.#trash = catalog.trash;
     this.#sessions = catalog.sessions;
     this.#hasMore = catalog.hasMore;
     this.#diagnostics = catalog.diagnostics ?? { items: [], totalCount: 0, truncated: false };
@@ -140,6 +162,23 @@ export class SessionPicker implements Component {
     }
   }
 
+  rememberTrash(transactionId: string): void {
+    const key = `trash:${transactionId}`;
+    this.#viewSelections.set("trash", key);
+    if (this.#catalogView === "trash") {
+      const index = this.#items().findIndex((item) => itemKey(item) === key);
+      if (index >= 0) this.#selectedIndex = index;
+    }
+  }
+
+  setTrashPreview(preview: SessionTrashPreview | null): void {
+    this.#trashPreview = preview;
+    this.#trashConfirm = false;
+    this.#trashBusy = false;
+    this.#trashPreviewRendered = false;
+    this.#trashPreviewOffset = 0;
+  }
+
   setNotice(notice: string): void {
     this.#notice = safeTerminalText(notice);
   }
@@ -147,6 +186,41 @@ export class SessionPicker implements Component {
   handleInput(data: string): void {
     this.#interacted = true;
     const keybindings = getKeybindings();
+    if (this.#trashPreview !== null) {
+      if (this.#trashBusy || isKeyRelease(data)) return;
+      if (matchesKey(data, "escape")) {
+        this.setTrashPreview(null);
+        return;
+      }
+      if (matchesKey(data, "up") || matchesKey(data, "pageUp")) {
+        this.#trashPreviewOffset = Math.max(0, this.#trashPreviewOffset - 3);
+        return;
+      }
+      if (matchesKey(data, "down") || matchesKey(data, "pageDown")) {
+        this.#trashPreviewOffset += 3;
+        return;
+      }
+      if (matchesKey(data, "left")) {
+        this.#trashConfirm = false;
+        return;
+      }
+      if (
+        matchesKey(data, "right") &&
+        this.#trashPreview.previewId !== null &&
+        this.#trashPreview.blockers.length === 0
+      ) {
+        this.#trashConfirm = true;
+        return;
+      }
+      if (matchesKey(data, "enter") && this.#trashPreviewRendered && !isKeyRepeat(data)) {
+        if (!this.#trashConfirm) this.setTrashPreview(null);
+        else if (this.#trashPreview.previewId !== null) {
+          this.#trashBusy = true;
+          this.#onConfirmTrash?.(this.#trashPreview.previewId);
+        }
+      }
+      return;
+    }
     if (this.#view === "diagnostics") {
       if (keybindings.matches(data, "tui.select.up")) {
         this.#diagnosticIndex =
@@ -167,8 +241,35 @@ export class SessionPicker implements Component {
       }
       return;
     }
+    if (
+      (isKeyRepeat(data) || isKeyRelease(data)) &&
+      (["enter", "ctrl+enter", "ctrl+a", "ctrl+d", "ctrl+r", "ctrl+u"] as const).some((key) =>
+        matchesKey(data, key),
+      )
+    )
+      return;
     if (matchesKey(data, "tab")) {
-      this.#onView?.(this.#catalogView === "active" ? "archived" : "active");
+      this.#onView?.(
+        this.#catalogView === "active"
+          ? "archived"
+          : this.#catalogView === "archived"
+            ? "trash"
+            : "active",
+      );
+      return;
+    }
+    if (matchesKey(data, "ctrl+d")) {
+      const selected = this.#items()[this.#selectedIndex];
+      if (selected?.kind === "session") this.#onPreviewTrash?.(selected.session);
+      return;
+    }
+    if (
+      this.#catalogView === "trash" &&
+      (matchesKey(data, "ctrl+r") || matchesKey(data, "ctrl+enter"))
+    ) {
+      const selected = this.#items()[this.#selectedIndex];
+      if (selected?.kind === "trash")
+        this.#onRestoreTrash?.(selected.transaction, matchesKey(data, "ctrl+enter"));
       return;
     }
     if (matchesKey(data, "ctrl+a")) {
@@ -221,6 +322,8 @@ export class SessionPicker implements Component {
       } else if (selected?.kind === "invalid_sessions") {
         this.#diagnosticIndex = 0;
         this.#view = "diagnostics";
+      } else if (selected?.kind === "trash") {
+        this.#onRestoreTrash?.(selected.transaction, false);
       } else if (selected?.kind === "session") {
         this.#onSelect(selected.session);
       }
@@ -234,6 +337,7 @@ export class SessionPicker implements Component {
   invalidate(): void {}
 
   render(width: number): string[] {
+    if (this.#trashPreview !== null) return this.#renderTrashPreview(width);
     if (this.#view === "diagnostics") {
       return this.#renderDiagnostics(width);
     }
@@ -251,8 +355,10 @@ export class SessionPicker implements Component {
         this.#visibility?.status === "unknown"
           ? "Recovery view · archive state unknown"
           : this.#catalogView === "active"
-            ? "[Active] · Archived"
-            : "Active · [Archived]",
+            ? "[Active] · Archived · Trash"
+            : this.#catalogView === "archived"
+              ? "Active · [Archived] · Trash"
+              : "Active · Archived · [Trash]",
       ),
       ...(this.#visibility?.status === "unknown"
         ? wrapTextWithAnsi(this.#theme.muted(this.#visibility.message), Math.max(1, width))
@@ -260,6 +366,11 @@ export class SessionPicker implements Component {
       this.#renderNewSession(width),
       `Search: ${safeTerminalText(this.#query)}`,
       ...this.#renderCatalogStatus(width),
+      ...(this.#catalogView === "trash"
+        ? (this.#trash?.diagnostics ?? []).flatMap((item) =>
+            wrapTextWithAnsi(this.#theme.muted(safeTerminalText(item.message)), Math.max(1, width)),
+          )
+        : []),
       ...(this.#diagnostics.totalCount === 0
         ? []
         : [
@@ -293,13 +404,17 @@ export class SessionPicker implements Component {
       "",
       ...wrapTextWithAnsi(
         this.#theme.muted(
-          `Tab Active/Archived · Ctrl+A ${this.#catalogView === "active" ? "archive" : "unarchive"} · Ctrl+U undo`,
+          this.#catalogView === "trash"
+            ? "Tab views · Enter Restore · Ctrl+Enter Continue"
+            : `Tab views · Ctrl+A ${this.#catalogView === "active" ? "archive" : "unarchive"} · Ctrl+U undo · Ctrl+D Trash`,
         ),
         Math.max(1, width),
       ),
       ...wrapTextWithAnsi(
         this.#theme.muted(
-          `Enter open · ${adamCommandRegistry.keybinding("rename_session").keys} rename · type search · ↑/↓ move · Esc close · Ctrl+Q exit`,
+          this.#catalogView === "trash"
+            ? "Type search · ↑/↓ move · Esc close"
+            : `Enter open · ${adamCommandRegistry.keybinding("rename_session").keys} rename · type search · ↑/↓ move · Esc close`,
         ),
         Math.max(1, width),
       ),
@@ -315,7 +430,13 @@ export class SessionPicker implements Component {
     );
     return [
       { kind: "new_session" },
-      ...sessions.map((session) => ({ kind: "session" as const, session })),
+      ...(this.#catalogView === "trash"
+        ? fuzzyFilter(
+            [...(this.#trash?.items ?? [])],
+            this.#query,
+            (item) => `${item.label} ${item.sessionId} ${item.transactionId} ${item.phase}`,
+          ).map((transaction) => ({ kind: "trash" as const, transaction }))
+        : sessions.map((session) => ({ kind: "session" as const, session }))),
       ...(this.#diagnostics.totalCount === 0 ? [] : [{ kind: "invalid_sessions" as const }]),
       ...(this.#hasMore ? [{ kind: "load_more" as const }] : []),
     ];
@@ -323,7 +444,7 @@ export class SessionPicker implements Component {
 
   #selectFirstSearchResult(): void {
     const items = this.#items();
-    this.#selectedIndex = items[1]?.kind === "session" ? 1 : 0;
+    this.#selectedIndex = items[1]?.kind === "session" || items[1]?.kind === "trash" ? 1 : 0;
   }
 
   #renderNewSession(width: number): string {
@@ -342,20 +463,67 @@ export class SessionPicker implements Component {
             selected,
             width,
           )
-        : item.kind === "invalid_sessions"
+        : item.kind === "trash"
           ? renderColumns(
-              "Invalid sessions",
-              `${this.#diagnostics.totalCount} retained · Enter review`,
+              safeTerminalText(item.transaction.label),
+              `${item.transaction.phase} · ${item.transaction.children.length} Child`,
               selected,
               width,
             )
-          : renderColumns(
-              this.#loading ? "Loading more…" : "Load More",
-              "Use the opaque catalog cursor",
-              selected,
-              width,
-            );
+          : item.kind === "invalid_sessions"
+            ? renderColumns(
+                "Invalid sessions",
+                `${this.#diagnostics.totalCount} retained · Enter review`,
+                selected,
+                width,
+              )
+            : renderColumns(
+                this.#loading ? "Loading more…" : "Load More",
+                "Use the opaque catalog cursor",
+                selected,
+                width,
+              );
     return selected ? this.#theme.editor.selectList.selectedText(content) : content;
+  }
+
+  #renderTrashPreview(width: number): string[] {
+    const preview = this.#trashPreview;
+    if (preview === null) return [];
+    this.#trashPreviewRendered = true;
+    const body = [
+      `Main: ${preview.label}`,
+      preview.sessionId,
+      `Owned Child histories: ${preview.children.length}`,
+      ...preview.children.flatMap((child) => [
+        `Child ${child.sessionId}`,
+        `Thread ${child.threadId}`,
+      ]),
+      ...preview.blockers.map((blocker) => blocker.message),
+    ].flatMap((line) => wrapTextWithAnsi(safeTerminalText(line), Math.max(1, width)));
+    this.#trashPreviewOffset = Math.min(this.#trashPreviewOffset, Math.max(0, body.length - 8));
+    return [
+      this.#theme.toolTitle("Move session to Trash?"),
+      ...body.slice(this.#trashPreviewOffset, this.#trashPreviewOffset + 8),
+      ...(body.length > 8
+        ? [
+            this.#theme.muted(
+              `Lines ${this.#trashPreviewOffset + 1}-${Math.min(body.length, this.#trashPreviewOffset + 8)} of ${body.length}`,
+            ),
+          ]
+        : []),
+      "",
+      this.#trashBusy
+        ? "Moving session unit…"
+        : preview.previewId === null
+          ? "> Cancel · Move unavailable"
+          : this.#trashConfirm
+            ? "  Cancel    > Move to Trash"
+            : "> Cancel      Move to Trash",
+      ...wrapTextWithAnsi(
+        this.#theme.muted("←/→ choose · Enter confirm · ↑/↓ scroll · Esc cancel"),
+        Math.max(1, width),
+      ),
+    ];
   }
 
   #renderCatalogStatus(width: number): string[] {
@@ -419,7 +587,11 @@ export class SessionPicker implements Component {
 }
 
 function itemKey(item: SessionPickerItem | undefined): string | undefined {
-  return item?.kind === "session" ? `session:${item.session.id}` : item?.kind;
+  return item?.kind === "session"
+    ? `session:${item.session.id}`
+    : item?.kind === "trash"
+      ? `trash:${item.transaction.transactionId}`
+      : item?.kind;
 }
 
 function renderColumns(

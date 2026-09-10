@@ -381,11 +381,20 @@ export function validateFleetTaskProviderReceipts(
       ? []
       : record.event.type === "provider_reserved"
         ? [{ ...record.event, blocked: false }]
-        : record.event.type === "budget_blocked" &&
-            record.event.source !== undefined &&
-            record.event.purpose !== undefined
-          ? [{ source: record.event.source, purpose: record.event.purpose, blocked: true }]
-          : [],
+        : record.event.type === "provider_not_dispatched"
+          ? [
+              {
+                purpose: "ordinary" as const,
+                source: record.event.source,
+                blocked: true,
+                interruption: record.event.interruption,
+              },
+            ]
+          : record.event.type === "budget_blocked" &&
+              record.event.source !== undefined &&
+              record.event.purpose !== undefined
+            ? [{ source: record.event.source, purpose: record.event.purpose, blocked: true }]
+            : [],
   );
   if (!validateTaskProviderReceipts(childRecords, receipts, allowPendingSource))
     throw new SessionStoreError();

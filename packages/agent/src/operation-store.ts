@@ -566,11 +566,10 @@ function enqueueAppend(path: string, run: () => Promise<void>): Promise<void> {
 }
 
 /** Cold history mutations must not create an Operation journal merely to inspect it. */
-export async function readUnfinishedSessionOperations(input: {
+export async function readOnlyProjectOperationRecords(input: {
   readonly workspaceRoot: string;
   readonly stateRoot: string;
-  readonly sessionId: string;
-}): Promise<readonly string[]> {
+}): Promise<readonly OperationEventRecord[]> {
   const project = createHash("sha256")
     .update(await realpath(input.workspaceRoot))
     .digest("hex");
@@ -591,6 +590,15 @@ export async function readUnfinishedSessionOperations(input: {
   }
   const records = await readOperationLog(join(directory, "events-v1.jsonl"), true);
   assertProjectRecords(records, `sha256:${project}`);
+  return records;
+}
+
+export async function readUnfinishedSessionOperations(input: {
+  readonly workspaceRoot: string;
+  readonly stateRoot: string;
+  readonly sessionId: string;
+}): Promise<readonly string[]> {
+  const records = await readOnlyProjectOperationRecords(input);
   return records
     .filter(
       (record) =>

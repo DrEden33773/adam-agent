@@ -118,7 +118,10 @@ test.each([40, 80, 120])(
       execution = runTui({
         presentation,
         terminal,
-        closeRuntime: () => lifecycle.close().then(() => {}),
+        closeRuntime: async () => {
+          await presentation?.close();
+          await lifecycle.close();
+        },
       });
       await terminal.waitForScreen("Retained archive conversation.");
       let before = terminal.output().length;
@@ -144,6 +147,9 @@ test.each([40, 80, 120])(
       before = terminal.output().length;
       terminal.input("\u0015");
       await terminal.waitForFrameAfter("Session unarchived.", before);
+      before = terminal.output().length;
+      terminal.input("\t");
+      await terminal.waitForFrameAfter("[Trash]", before);
       before = terminal.output().length;
       terminal.input("\t");
       await terminal.waitForFrameAfter("[Active]", before);
@@ -224,7 +230,10 @@ test.each([2, 3])(
       execution = runTui({
         presentation,
         terminal,
-        closeRuntime: () => lifecycle.close().then(() => {}),
+        closeRuntime: async () => {
+          await presentation?.close();
+          await lifecycle.close();
+        },
       });
       const press = async (key: string, frame: string) => {
         const offset = terminal.output().length;
@@ -255,6 +264,7 @@ test.each([2, 3])(
       ]);
       expect(terminal.lines().join("\n")).toContain("> History Two");
       await press("\t", "[Archived]");
+      await press("\t", "[Trash]");
       await press("\t", "[Active]");
       expect(terminal.lines().join("\n")).toContain("> History Two");
     } finally {

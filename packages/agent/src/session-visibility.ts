@@ -24,8 +24,9 @@ export type SessionVisibilityResult =
 export function sessionMatchesVisibilityView(
   sessionId: string,
   visibility: SessionVisibilitySnapshot | undefined,
-  view: SessionVisibility = "active",
+  view: SessionVisibility | "trash" = "active",
 ): boolean {
+  if (view === "trash") return false;
   return (
     visibility?.status !== "ready" ||
     visibility.archived.includes(sessionId) === (view === "archived")

@@ -5,6 +5,7 @@ import type {
 } from "@adam-agent/presentation";
 import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-store.js";
 import type { SessionRecord } from "./session-store.js";
+import { toolOutputArtifactReferences } from "./tool-output-artifacts.js";
 import type { JsonValue, PermissionSubject, ToolEffect } from "./tool-runtime.js";
 
 type PresentationToolHistoryRecord = {
@@ -828,20 +829,10 @@ function boundedDisplayText(value: string): string {
 function toolArtifacts(
   output: JsonValue | undefined,
 ): readonly ToolCallDisplay["artifacts"][number][] {
-  const outputRecord = jsonRecord(output);
-  const candidates = [
-    jsonRecord(outputRecord?.artifact),
-    jsonRecord(jsonRecord(outputRecord?.stdout)?.artifact),
-    jsonRecord(jsonRecord(outputRecord?.stderr)?.artifact),
-  ];
-  return candidates.flatMap((candidate) => {
-    const id = candidate?.id;
-    const mediaType = candidate?.mediaType;
-    const byteCount = candidate?.byteCount;
-    return typeof id === "string" && typeof mediaType === "string" && typeof byteCount === "number"
-      ? [{ id, mediaType, byteCount, source: "tool_output" as const }]
-      : [];
-  });
+  return toolOutputArtifactReferences(output).map((artifact) => ({
+    ...artifact,
+    source: "tool_output" as const,
+  }));
 }
 
 type KnownJsonRecord = Readonly<Record<string, JsonValue>> & {

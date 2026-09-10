@@ -14,6 +14,7 @@ export type { ContextProfile } from "./context-profile.js";
 export { DirectDeepSeekResponsesModelDriver as DirectDeepSeekResponsesModelDriverForTesting } from "./deepseek-responses-model-driver.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
 export { projectExecutionDomainForExtensionHost } from "./extension-host.js";
+export { createExtensionRecordStore } from "./extension-record-store.js";
 export { createInputResourceUserMessageV1 } from "./input-resources.js";
 export {
   createHistoricalManagedAgentToolRegistry,
@@ -119,6 +120,7 @@ export {
   createPromptContextV1,
   digestPromptRequestV1,
 } from "./prompt-assembly.js";
+export { createRecoverableTurnDraftRepository } from "./recoverable-turn-draft.js";
 export {
   createRepositorySearchToolAdapter as createRepositorySearchToolAdapterForTesting,
   type RepositorySearchBackend,
@@ -159,6 +161,8 @@ export {
   type SessionTitleDeadlineScheduler,
   sessionAutomaticTitlesEnabled,
   sessionCloseDrainBarrier,
+  sessionDraftMutation,
+  sessionHistoryRecords,
   sessionLogicalRunStartedBarrier,
   sessionManagedControl,
   sessionManagedTransition,
@@ -195,6 +199,11 @@ export {
   type SessionV3Record,
   sessionLogFileSystem,
 } from "./session-store.js";
+export {
+  createSessionTrashRepository,
+  type SessionTrashFileSystem,
+  sessionTrashFileSystem,
+} from "./session-trash.js";
 export { createDirectDeepSeekThinkingCapability } from "./thinking-policy.js";
 export { createCodingToolRegistryForTesting } from "./tool-runtime.js";
 export {

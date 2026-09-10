@@ -147,6 +147,12 @@ export type ManagedControlEvent =
     }
   | FleetProviderEvent
   | {
+      readonly type: "provider_not_dispatched";
+      readonly reason: "cancelled";
+      readonly source: ManagedControlLink;
+      readonly interruption: ManagedControlLink;
+    }
+  | {
       readonly type: "budget_blocked";
       readonly purpose?: "ordinary" | "compaction";
       readonly source?: { readonly sequence: number; readonly digest: string };
@@ -259,6 +265,12 @@ const eventSchema = z.discriminatedUnion("type", [
     type: z.literal("input_undelivered"),
     inputId: z.uuid(),
     reason: z.enum(["settled", "cancelled", "restart"]),
+  }),
+  z.strictObject({
+    type: z.literal("provider_not_dispatched"),
+    reason: z.literal("cancelled"),
+    source: linkSchema,
+    interruption: linkSchema,
   }),
   z.strictObject({
     type: z.literal("budget_blocked"),
@@ -632,6 +644,24 @@ export function validateManagedControlRecord(
       return record;
     }
     if (
+      record.event.type === "provider_not_dispatched" ||
+      record.event.type === "provider_reserved" ||
+      record.event.type === "budget_blocked"
+    ) {
+      const source = record.event.source;
+      if (
+        source !== undefined &&
+        turnRecords.some(
+          (entry) =>
+            (entry.event.type === "provider_reserved" ||
+              entry.event.type === "provider_not_dispatched" ||
+              entry.event.type === "budget_blocked") &&
+            entry.event.source?.sequence === source.sequence,
+        )
+      )
+        return invalid();
+    }
+    if (
       record.event.type === "provider_reserved" ||
       record.event.type === "provider_usage" ||
       record.event.type === "provider_unknown"
@@ -666,6 +696,7 @@ export function validateManagedControlRecord(
       return record;
     }
     if (
+      record.event.type === "provider_not_dispatched" ||
       record.event.type === "budget_blocked" ||
       record.event.type === "capacity_wait" ||
       record.event.type === "capacity_acquired"
@@ -697,6 +728,7 @@ export function validateManagedControlRecord(
         entry.event.type !== "provider_reserved" &&
         entry.event.type !== "provider_usage" &&
         entry.event.type !== "provider_unknown" &&
+        entry.event.type !== "provider_not_dispatched" &&
         entry.event.type !== "budget_blocked" &&
         entry.event.type !== "seen" &&
         entry.event.type !== "suppressed" &&
@@ -778,6 +810,7 @@ export function foldManagedControl(
       event.type === "input_accepted" ||
       event.type === "input_delivered" ||
       event.type === "input_undelivered" ||
+      event.type === "provider_not_dispatched" ||
       event.type === "budget_blocked" ||
       event.type === "consumed" ||
       event.type === "seen" ||
