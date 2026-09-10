@@ -6,6 +6,63 @@ import { SessionPicker } from "./session-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
 
+test("late restored rows preserve explicit search and per-view selection intent", () => {
+  const [restored, other] = ["Restored", "Other"].map((label) => ({
+    id: label,
+    label,
+    targetId: "fixture",
+    status: "settled" as const,
+    naming: {
+      manualName: label,
+      generatedTitle: null,
+      fallbackTitle: label,
+      displayLabel: label,
+      generation: { status: "not_started" as const },
+    },
+  }));
+  if (restored === undefined || other === undefined) throw new Error("Missing picker fixtures.");
+  const onSelect = vi.fn();
+  const onNewSession = vi.fn();
+  const picker = new SessionPicker({
+    sessions: [],
+    hasMore: false,
+    view: "active",
+    loading: true,
+    theme: createAdamTuiTheme(true),
+    onSelect,
+    onNewSession,
+    onLoadMore: vi.fn(),
+    onRename: vi.fn(),
+    onClose: vi.fn(),
+  });
+  picker.rememberSession(restored.id, "active");
+  picker.setCatalog({ sessions: [other], hasMore: false, view: "active", loading: true });
+  picker.handleInput("\r");
+  expect(onNewSession).not.toHaveBeenCalled();
+  picker.handleInput("Other");
+  picker.handleInput("\r");
+  expect(onSelect).toHaveBeenLastCalledWith(other);
+  picker.setCatalog({
+    sessions: [restored, other],
+    hasMore: false,
+    view: "active",
+    loading: false,
+  });
+  expect(picker.render(80).join("\n")).toContain("> Other");
+  picker.setCatalog({ sessions: [restored], hasMore: false, view: "archived", loading: false });
+  for (let i = 0; i < "Other".length; i++) picker.handleInput("\u007f");
+  picker.handleInput("Restored");
+  expect(picker.render(80).join("\n")).toContain("> Restored");
+  picker.setCatalog({
+    sessions: [restored, other],
+    hasMore: false,
+    view: "active",
+    loading: false,
+  });
+  expect(picker.render(80).join("\n")).toContain("Search: Other");
+  expect(picker.render(80).join("\n")).toContain("> Other");
+});
+
 test.each([40, 80, 120])(
   "archive picker actions preserve search and exact revision at %i columns",
   (width) => {

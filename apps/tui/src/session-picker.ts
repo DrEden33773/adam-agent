@@ -33,7 +33,10 @@ export type SessionPickerCatalog = {
   readonly sessions: readonly SessionSummary[];
   readonly hasMore: boolean;
   readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
-} & Pick<SessionSummaryPage, "loading" | "health" | "error" | "view" | "visibility" | "trash">;
+} & Pick<
+  SessionSummaryPage,
+  "loading" | "health" | "error" | "view" | "visibility" | "trash" | "operation"
+>;
 
 export class SessionPicker implements Component {
   #catalogView: "active" | "archived" | "trash";
@@ -63,8 +66,14 @@ export class SessionPicker implements Component {
   #sessions: readonly SessionSummary[];
   readonly #theme: AdamTuiTheme;
   #loading: SessionSummaryPage["loading"];
+  #operation: SessionSummaryPage["operation"];
+  readonly #onCancelPreview: (() => void) | undefined;
   #health: SessionSummaryPage["health"];
   #error: SessionSummaryPage["error"];
+  readonly #viewQueries = new Map<string, string>();
+  readonly #pendingSelections = new Map<string, string>();
+  readonly #pendingSelectionIndices = new Map<string, number>();
+  #searchAwaitingResults = false;
   #interacted = false;
   #notice: string | null = null;
   #query = "";
@@ -90,6 +99,7 @@ export class SessionPicker implements Component {
       readonly onRename: (session: SessionSummary) => void;
       readonly onSelect: (session: SessionSummary) => void;
       readonly onClose: () => void;
+      readonly onCancelPreview?: () => void;
     },
   ) {
     this.#catalogView = options.view ?? "active";
@@ -115,6 +125,8 @@ export class SessionPicker implements Component {
     };
     this.#theme = options.theme;
     this.#loading = options.loading;
+    this.#operation = options.operation;
+    this.#onCancelPreview = options.onCancelPreview;
     this.#health = options.health;
     this.#error = options.error;
   }
@@ -127,9 +139,12 @@ export class SessionPicker implements Component {
     let selectedKey = itemKey(this.#items()[this.#selectedIndex]);
     const destination = catalog.view ?? "active";
     if (destination !== this.#catalogView) {
+      this.#viewQueries.set(this.#catalogView, this.#query);
+      this.#query = this.#viewQueries.get(destination) ?? this.#query;
       if (selectedKey !== undefined) this.#viewSelections.set(this.#catalogView, selectedKey);
       selectedKey = this.#viewSelections.get(destination) ?? selectedKey;
     }
+    selectedKey = this.#pendingSelections.get(destination) ?? selectedKey;
     const diagnosticId = this.#diagnostics.items[this.#diagnosticIndex]?.sessionId;
     this.#catalogView = catalog.view ?? "active";
     this.#visibility = catalog.visibility;
@@ -138,12 +153,32 @@ export class SessionPicker implements Component {
     this.#hasMore = catalog.hasMore;
     this.#diagnostics = catalog.diagnostics ?? { items: [], totalCount: 0, truncated: false };
     this.#loading = catalog.loading;
+    this.#operation = catalog.operation;
     this.#health = catalog.health;
     this.#error = catalog.error;
     const items = this.#items();
     const selectedIndex = items.findIndex((item) => itemKey(item) === selectedKey);
+    if (
+      selectedIndex < 0 &&
+      selectedKey?.startsWith("session:") &&
+      catalog.loading === true &&
+      !this.#pendingSelections.has(destination)
+    )
+      this.#pendingSelectionIndices.set(destination, this.#selectedIndex);
     this.#selectedIndex =
       selectedIndex < 0 ? Math.min(this.#selectedIndex, items.length - 1) : selectedIndex;
+    if (selectedIndex >= 0 && this.#pendingSelections.get(destination) === selectedKey)
+      this.#pendingSelections.delete(destination);
+    const pendingIndex = this.#pendingSelectionIndices.get(destination);
+    if (
+      pendingIndex !== undefined &&
+      ((pendingIndex < items.length && items[pendingIndex]?.kind !== "load_more") ||
+        catalog.loading !== true)
+    ) {
+      this.#selectedIndex = Math.min(pendingIndex, items.length - 1);
+      this.#pendingSelectionIndices.delete(destination);
+    }
+    if (this.#searchAwaitingResults) this.#selectFirstSearchResult();
     const diagnosticIndex = this.#diagnostics.items.findIndex(
       (item) => item.sessionId === diagnosticId,
     );
@@ -156,9 +191,14 @@ export class SessionPicker implements Component {
   rememberSession(sessionId: string, view: "active" | "archived"): void {
     const key = `session:${sessionId}`;
     this.#viewSelections.set(view, key);
+    this.#pendingSelections.set(view, key);
+    this.#pendingSelectionIndices.delete(view);
     if (view === this.#catalogView) {
       const index = this.#items().findIndex((item) => itemKey(item) === key);
-      if (index >= 0) this.#selectedIndex = index;
+      if (index >= 0) {
+        this.#selectedIndex = index;
+        this.#pendingSelections.delete(view);
+      }
     }
   }
 
@@ -184,14 +224,27 @@ export class SessionPicker implements Component {
   }
 
   handleInput(data: string): void {
+    const selected = itemKey(this.#items()[this.#selectedIndex]);
+    this.#handleInput(data);
+    if (
+      this.#operation === "trash_preview" &&
+      selected !== itemKey(this.#items()[this.#selectedIndex])
+    )
+      this.#onCancelPreview?.();
+  }
+
+  #handleInput(data: string): void {
     this.#interacted = true;
     const keybindings = getKeybindings();
     if (this.#trashPreview !== null) {
-      if (this.#trashBusy || isKeyRelease(data)) return;
-      if (matchesKey(data, "escape")) {
+      if (isKeyRelease(data)) return;
+      if (matchesKey(data, "escape") || matchesKey(data, "tab")) {
+        if (!this.#trashBusy) this.#onCancelPreview?.();
         this.setTrashPreview(null);
+        if (matchesKey(data, "tab")) this.#nextView();
         return;
       }
+      if (this.#trashBusy) return;
       if (matchesKey(data, "up") || matchesKey(data, "pageUp")) {
         this.#trashPreviewOffset = Math.max(0, this.#trashPreviewOffset - 3);
         return;
@@ -213,8 +266,10 @@ export class SessionPicker implements Component {
         return;
       }
       if (matchesKey(data, "enter") && this.#trashPreviewRendered && !isKeyRepeat(data)) {
-        if (!this.#trashConfirm) this.setTrashPreview(null);
-        else if (this.#trashPreview.previewId !== null) {
+        if (!this.#trashConfirm) {
+          this.#onCancelPreview?.();
+          this.setTrashPreview(null);
+        } else if (this.#trashPreview.previewId !== null) {
           this.#trashBusy = true;
           this.#onConfirmTrash?.(this.#trashPreview.previewId);
         }
@@ -249,15 +304,16 @@ export class SessionPicker implements Component {
     )
       return;
     if (matchesKey(data, "tab")) {
-      this.#onView?.(
-        this.#catalogView === "active"
-          ? "archived"
-          : this.#catalogView === "archived"
-            ? "trash"
-            : "active",
-      );
+      this.#nextView();
       return;
     }
+    if (
+      this.#operation !== undefined &&
+      (["enter", "ctrl+enter", "ctrl+a", "ctrl+d", "ctrl+r", "ctrl+u"] as const).some((key) =>
+        matchesKey(data, key),
+      )
+    )
+      return;
     if (matchesKey(data, "ctrl+d")) {
       const selected = this.#items()[this.#selectedIndex];
       if (selected?.kind === "session") this.#onPreviewTrash?.(selected.session);
@@ -294,26 +350,37 @@ export class SessionPicker implements Component {
       return;
     }
     if (keybindings.matches(data, "tui.editor.deleteCharBackward") && this.#query.length > 0) {
+      this.#pendingSelections.delete(this.#catalogView);
+      this.#pendingSelectionIndices.delete(this.#catalogView);
       this.#query = Array.from(this.#query).slice(0, -1).join("");
       this.#selectFirstSearchResult();
       return;
     }
     const text = textKeyInput(data);
     if (text !== undefined) {
+      this.#pendingSelections.delete(this.#catalogView);
+      this.#pendingSelectionIndices.delete(this.#catalogView);
       this.#query += safeTerminalText(text);
       this.#selectFirstSearchResult();
       return;
     }
     const items = this.#items();
     if (keybindings.matches(data, "tui.select.up")) {
+      this.#searchAwaitingResults = false;
+      this.#pendingSelections.delete(this.#catalogView);
+      this.#pendingSelectionIndices.delete(this.#catalogView);
       this.#selectedIndex = this.#selectedIndex === 0 ? items.length - 1 : this.#selectedIndex - 1;
       return;
     }
     if (keybindings.matches(data, "tui.select.down")) {
+      this.#searchAwaitingResults = false;
+      this.#pendingSelections.delete(this.#catalogView);
+      this.#pendingSelectionIndices.delete(this.#catalogView);
       this.#selectedIndex = this.#selectedIndex === items.length - 1 ? 0 : this.#selectedIndex + 1;
       return;
     }
     if (keybindings.matches(data, "tui.select.confirm")) {
+      if (this.#pendingSelections.has(this.#catalogView)) return;
       const selected = items[this.#selectedIndex];
       if (selected?.kind === "new_session") {
         this.#onNewSession();
@@ -445,6 +512,8 @@ export class SessionPicker implements Component {
   #selectFirstSearchResult(): void {
     const items = this.#items();
     this.#selectedIndex = items[1]?.kind === "session" || items[1]?.kind === "trash" ? 1 : 0;
+    this.#searchAwaitingResults =
+      this.#query.length > 0 && this.#selectedIndex === 0 && this.#loading === true;
   }
 
   #renderNewSession(width: number): string {
@@ -526,6 +595,16 @@ export class SessionPicker implements Component {
     ];
   }
 
+  #nextView(): void {
+    this.#onView?.(
+      this.#catalogView === "active"
+        ? "archived"
+        : this.#catalogView === "archived"
+          ? "trash"
+          : "active",
+    );
+  }
+
   #renderCatalogStatus(width: number): string[] {
     const health = this.#health;
     const progress =
@@ -538,9 +617,22 @@ export class SessionPicker implements Component {
             : health.status === "failed"
               ? `History check failed after ${health.checked} sessions.`
               : `Checking history: ${health.checked}${health.total === null ? "" : ` / ${health.total}`} sessions.`;
+    const operation =
+      this.#operation === "archive"
+        ? "Checking session before archive change…"
+        : this.#operation === "trash_preview"
+          ? "Checking history and dependencies…"
+          : this.#operation === "trash"
+            ? "Checking and moving session to Trash…"
+            : this.#operation === "restore"
+              ? "Restoring and checking history…"
+              : undefined;
     return [
-      ...(this.#loading && this.#sessions.length > 0 ? ["Loading sessions…"] : []),
-      ...(progress === undefined ? [] : [progress]),
+      ...(operation === undefined ? [] : [operation]),
+      ...(this.#operation === undefined && this.#loading && this.#sessions.length > 0
+        ? ["Loading sessions…"]
+        : []),
+      ...(progress === undefined || this.#operation !== undefined ? [] : [progress]),
       ...(this.#error === undefined ? [] : [safeTerminalText(this.#error.message)]),
     ].flatMap((line) => wrapTextWithAnsi(this.#theme.muted(line), Math.max(1, width)));
   }

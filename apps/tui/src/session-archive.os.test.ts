@@ -177,9 +177,13 @@ test.each([40, 80, 120])(
   },
 );
 
-test.each([2, 3])(
-  "page-two archive and Undo retain selection with %i total sessions",
-  async (count) => {
+test.each([
+  [2, false],
+  [3, false],
+  [3, true],
+] as const)(
+  "page-two archive and Undo retain selection with %i total sessions (background %s)",
+  async (count, backgroundStartup) => {
     const root = await mkdtemp(join(tmpdir(), "adam-archive-page-selection-"));
     const workspaceRoot = join(root, "project");
     const stateRoot = join(root, "state");
@@ -225,6 +229,7 @@ test.each([2, 3])(
         stateRoot,
         openProject: true,
         projectLabel: "Paged archives",
+        backgroundStartup,
         [presentationCatalogPageSize]: 1,
       });
       execution = runTui({
@@ -250,6 +255,7 @@ test.each([2, 3])(
       ]);
       if (count === 3) await press("\u001b[A", "> History Two");
       await press("\u0001", "Session archived.");
+      if (backgroundStartup) await terminal.waitForScreen("> History One");
       expect(presentation.getState().authoritative.sessions.items.map((item) => item.id)).toEqual([
         newest,
         ...(count === 2 ? [] : [sessions[0]]),
@@ -267,6 +273,23 @@ test.each([2, 3])(
       await press("\t", "[Trash]");
       await press("\t", "[Active]");
       expect(terminal.lines().join("\n")).toContain("> History Two");
+      if (backgroundStartup) {
+        const completed = Promise.withResolvers<void>();
+        const observe = () => {
+          if (presentation?.getState().authoritative.sessions.health?.status === "complete")
+            completed.resolve();
+        };
+        const unsubscribe = presentation.subscribe(observe);
+        try {
+          observe();
+          await guarded(completed.promise, "restored catalog page depth");
+        } finally {
+          unsubscribe();
+        }
+        expect(presentation.getState().authoritative.sessions.items.map((item) => item.id)).toEqual(
+          [newest, selected],
+        );
+      }
     } finally {
       if (execution !== undefined) {
         if (terminal.running()) terminal.input("\u0011");

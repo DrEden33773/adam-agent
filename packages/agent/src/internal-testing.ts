@@ -143,6 +143,10 @@ export {
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
 export {
+  type SessionHistoryWorkerFactory,
+  sessionHistoryWorkerFactory,
+} from "./session-history-inspection-job.js";
+export {
   type InputResourceIngestBarrier,
   inputResourceIngestBarrier,
   type McpActivationSettlementBarrier,

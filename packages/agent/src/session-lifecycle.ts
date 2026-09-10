@@ -84,6 +84,7 @@ import {
   createJsonlManagedAgentControlStore,
   createJsonlManagedAgentStore,
 } from "./managed-agent-store.js";
+import { isNativeManagedControlComposition } from "./managed-control-runtime.js";
 import {
   createMcpRuntimeHost,
   inspectMcpConfiguration,
@@ -223,12 +224,19 @@ import {
   snapshotFromRecords,
 } from "./session-history-folds.js";
 import {
+  type SessionHistoryWorkerFactory,
+  sessionHistoryWorkerFactory,
+  startSessionHistoryInspection,
+} from "./session-history-inspection-job.js";
+import type { SessionHistoryInspectionRequest } from "./session-history-inspection-protocol.js";
+import {
   createLogicalRunUserMessageV1,
   inlineModelResponseField,
   managedDeliveryMessagesFromReceipt,
   modelMessagesFromCompleteRecords,
 } from "./session-history-replay.js";
 import {
+  createSessionHistoryValidator,
   hasSuccessfullySettledAssistant,
   validateCurrentSessionHistory,
 } from "./session-history-validation.js";
@@ -538,6 +546,7 @@ export type ManagedControlComposition = {
 export type SessionLifecycleOptions = {
   readonly [sessionTrashFileSystem]?: SessionTrashFileSystem;
   readonly [sessionCatalogWorkerFactory]?: SessionCatalogWorkerFactory;
+  readonly [sessionHistoryWorkerFactory]?: SessionHistoryWorkerFactory;
   readonly onPhaseDiagnostic?: (diagnostic: RuntimePhaseDiagnostic) => void;
   readonly managedControl?: ManagedControlComposition;
   readonly [sessionManagedControl]?: ManagedControlComposition;
@@ -874,7 +883,10 @@ export type SessionCommand =
   | McpConfigurationCommand;
 
 export interface SessionLifecycle {
-  previewSessionTrash(input: { readonly sessionId: string }): Promise<SessionTrashPreview>;
+  previewSessionTrash(input: {
+    readonly sessionId: string;
+    readonly signal?: AbortSignal;
+  }): Promise<SessionTrashPreview>;
   confirmSessionTrash(input: {
     readonly previewId: string;
   }): Promise<SessionTrashResult | { readonly status: "blocked"; readonly message: string }>;
@@ -1215,6 +1227,7 @@ export function createReadOnlySessionInspector(dependencies: {
   readonly lineage?: SessionLineageTraversal;
   readonly resolvePlanProfile: SessionPlanAuthorityResolver;
   readonly inspectMcpInputs: (sessionId: string) => Promise<ReadOnlySessionMcpInputs>;
+  readonly validateHistory?: ReturnType<typeof createSessionHistoryValidator>;
 }) {
   const { options } = dependencies;
   const lineage =
@@ -1223,7 +1236,8 @@ export function createReadOnlySessionInspector(dependencies: {
       workspaceRoot: options.workspaceRoot,
       readRecords: dependencies.readRecords,
     });
-  const validatedHistories = new WeakSet<readonly SessionRecord[]>();
+  const validateHistory =
+    dependencies.validateHistory ?? createSessionHistoryValidator(options.workspaceRoot);
   const validatedPromptPrefixes = new WeakMap<
     SessionRecord,
     {
@@ -1264,10 +1278,7 @@ export function createReadOnlySessionInspector(dependencies: {
     if (first.record.projectId !== projectId) {
       throw new SessionLifecycleError("session_project_mismatch");
     }
-    if (!validatedHistories.has(records)) {
-      validateCurrentSessionHistory(first, records, options.workspaceRoot);
-      if (isDeeplyImmutable(records)) validatedHistories.add(records);
-    }
+    validateHistory(first, records);
     await lineage.validateSessionLineage(first, records);
     await validateMcpAuthorityFromLineage(lineage, first, records);
     await validatePlanToolProfilesFromLineage(
@@ -1339,6 +1350,344 @@ export function createReadOnlySessionInspector(dependencies: {
 
   return inspectSession;
 }
+
+/** Shared read-only history proof. Callers retain mutation claims and transaction ownership. */
+export function createReadOnlySessionHistoryInspector(dependencies: {
+  readonly options: { readonly workspaceRoot: string; readonly stateRoot: string };
+  readonly mainDirectory: SessionStoreDirectory;
+  readonly childDirectory: SessionStoreDirectory;
+  readonly controlStore: () => Promise<import("./managed-agent-folds.js").ManagedControlStore>;
+  readonly readRecords: (sessionId: string) => Promise<readonly SessionRecord[]>;
+  readonly inspectMcpInputs: (sessionId: string) => Promise<ReadOnlySessionMcpInputs>;
+  readonly resolvePlanProfile: SessionPlanAuthorityResolver;
+  readonly activityBlocker: (sessionId: string) => Promise<string | undefined>;
+  readonly trashRepository: Pick<
+    ReturnType<typeof createSessionTrashRepository>,
+    "list" | "inspectDraftThreads" | "inspectFiles"
+  >;
+  readonly visibilityRepository: Pick<ReturnType<typeof createSessionVisibilityRepository>, "load">;
+}) {
+  const { options, trashRepository, visibilityRepository } = dependencies;
+  const validateHistory = createSessionHistoryValidator(options.workspaceRoot);
+  const inspectSession = createReadOnlySessionInspector({
+    options,
+    readRecords: dependencies.readRecords,
+    resolvePlanProfile: dependencies.resolvePlanProfile,
+    inspectMcpInputs: dependencies.inspectMcpInputs,
+    validateHistory,
+  });
+  const effectiveStateRoot = options.stateRoot;
+  const rawStoreDirectory = dependencies.mainDirectory;
+  const rawTrashChildren = dependencies.childDirectory;
+  const rawTrashControl = dependencies.controlStore;
+  const resolveCatalogPlanProfile = dependencies.resolvePlanProfile;
+  const requireIdleHistory = async (sessionId: string): Promise<CurrentSessionSnapshot> => {
+    const snapshot = await inspectSession({ sessionId });
+    if (snapshot.schemaVersion !== 3 || snapshot.status === "interrupted")
+      throw new SessionTrashError(
+        "conflict",
+        "This history has unfinished recovery work or cannot prove an idle Main. Resume and settle it before changing history visibility.",
+      );
+    const blocker = await dependencies.activityBlocker(sessionId);
+    if (blocker !== undefined) throw new SessionTrashError("conflict", blocker);
+    return snapshot;
+  };
+  const inspectTrashCandidate = async (sessionId: string) => {
+    const snapshot = await requireIdleHistory(sessionId);
+    const visibility = await visibilityRepository.load();
+    if (visibility.status !== "ready")
+      throw new SessionTrashError("unavailable", visibility.message);
+    const inventory = await inspectSessionTrashUnit({
+      sessionId,
+      workspaceRoot: options.workspaceRoot,
+      mainDirectory: rawStoreDirectory,
+      childDirectory: rawTrashChildren,
+      controlStore: await rawTrashControl(),
+      trash: await trashRepository.list(),
+      archived: visibility.archived.includes(sessionId),
+      draftThreadIds: await trashRepository.inspectDraftThreads(sessionId),
+      validateHistory,
+    });
+    const files = await trashRepository.inspectFiles(inventory.unit, inventory.specs);
+    if (files.some((file) => file.kind === "main_draft" || file.kind === "child_draft")) {
+      const drafts = await createRecoverableTurnDraftRepository({
+        projectId: snapshot.projectId,
+        stateRoot: effectiveStateRoot,
+      });
+      for (const file of files) {
+        if (
+          file.kind === "main_draft" &&
+          (await drafts.load({ type: "session", sessionId })) === null
+        )
+          throw new SessionTrashError("conflict", "The Main draft identity could not be verified.");
+        if (
+          file.kind === "child_draft" &&
+          (await drafts.loadManaged({ parentSessionId: sessionId, threadId: file.threadId })) ===
+            null
+        )
+          throw new SessionTrashError("conflict", "A Child draft identity could not be verified.");
+      }
+    }
+    if (inventory.unit.children.length > 0 && !files.some((file) => file.kind === "control"))
+      throw new SessionTrashError(
+        "conflict",
+        "The owned Control journal is not available as a private session file.",
+      );
+    const operations = await readOnlyProjectOperationRecords({
+      workspaceRoot: options.workspaceRoot,
+      stateRoot: effectiveStateRoot,
+    });
+    const linked = new Set(
+      operations
+        .filter(
+          (record) =>
+            record.schemaVersion === 3 &&
+            record.event.type === "operation_started" &&
+            record.origin.sessionId === sessionId,
+        )
+        .map((record) => record.operationId),
+    );
+    const heads = new Map<string, number>();
+    for (const record of operations)
+      if (linked.has(record.operationId)) heads.set(record.operationId, record.sequence);
+    return {
+      inventory,
+      files,
+      visibilityRevision: visibility.revision,
+      mainSequence: snapshot.lastSequence,
+      operationHeads: [...heads].sort(([left], [right]) => left.localeCompare(right)),
+    };
+  };
+  const validateRestoredUnit = async (manifest: SessionTrashManifest): Promise<void> => {
+    const childIds = new Set(manifest.unit.children.map((child) => child.sessionId));
+    const readRecords = (sessionId: string) =>
+      sessionId === manifest.unit.mainSessionId
+        ? readSessionTrashRecords(rawStoreDirectory, sessionId)
+        : childIds.has(sessionId)
+          ? readSessionTrashRecords(rawTrashChildren, sessionId)
+          : dependencies.readRecords(sessionId);
+    const restoredLineage = createSessionLineageTraversal({
+      workspaceRoot: options.workspaceRoot,
+      readRecords,
+    });
+    const inspector = createReadOnlySessionInspector({
+      options,
+      readRecords,
+      lineage: restoredLineage,
+      resolvePlanProfile: resolveCatalogPlanProfile,
+      inspectMcpInputs: async () => ({ trusted: false }),
+      validateHistory,
+    });
+    const main = await inspector({ sessionId: manifest.unit.mainSessionId });
+    if (main.schemaVersion !== 3 || main.degradation !== undefined || main.status === "interrupted")
+      throw new SessionTrashError(
+        "conflict",
+        "The restored Main history is incomplete or degraded.",
+      );
+    const visibility = await visibilityRepository.load();
+    if (
+      visibility.status !== "ready" ||
+      visibility.archived.includes(main.sessionId) !== manifest.unit.archived
+    )
+      throw new SessionTrashError(
+        "conflict",
+        "The original archive state no longer matches the retained unit.",
+      );
+    const verified = new Set<string>();
+    const readArtifact = async (reference: { readonly id: string; readonly byteCount: number }) => {
+      const key = `${reference.id}:${reference.byteCount}`;
+      if (verified.has(key)) return;
+      if (!Number.isSafeInteger(reference.byteCount) || reference.byteCount < 0)
+        throw new SessionTrashError("conflict", "A restored artifact descriptor is invalid.");
+      const bytes = await readFileArtifact({
+        root: join(effectiveStateRoot, "artifacts"),
+        id: reference.id,
+        maximumBytes: reference.byteCount,
+      });
+      if (bytes === undefined || bytes.byteLength !== reference.byteCount)
+        throw new SessionTrashError(
+          "conflict",
+          "A referenced resource is missing or unreadable. Restore remains unfinished.",
+        );
+      verified.add(key);
+    };
+    const checkedPrefixes = new Set<string>();
+    const operationScopes = new Map<string, number>();
+    const validateRecords = async (records: readonly SessionRecord[]): Promise<void> => {
+      const genesis = records[0];
+      if (genesis === undefined || !isGenesisRecord(genesis))
+        throw new SessionTrashError("conflict", "A restored history lacks its genesis.");
+      if (genesis.record.projectId !== manifest.projectId)
+        throw new SessionTrashError("conflict", "A restored history belongs to another project.");
+      const key = `${genesis.record.sessionId}:${records.at(-1)?.sequence}`;
+      if (checkedPrefixes.has(key)) return;
+      checkedPrefixes.add(key);
+      validateHistory(genesis, records);
+      await restoredLineage.validateSessionLineage(genesis, records);
+      const response = await inspectModelResponseArtifactLineage(
+        options,
+        restoredLineage,
+        genesis,
+        records,
+        createArtifactMaterializationCache(),
+      );
+      if (response.degradation !== undefined)
+        throw new SessionTrashError(
+          "conflict",
+          "A retained response artifact is missing or corrupt.",
+        );
+      const resources = await inputResourcesFromLineage(restoredLineage, genesis, records);
+      await validateCompactionInputResources(restoredLineage, genesis, records);
+      validateInputResourceReadLineage(records, resources);
+      await validateVisibleInputResourceArtifacts(
+        {
+          read: (id, bounds) =>
+            readFileArtifact({ root: join(effectiveStateRoot, "artifacts"), id, ...bounds }),
+        },
+        resources,
+      );
+      for (const record of records) {
+        if (record.schemaVersion !== 3) continue;
+        const entry = record.record;
+        if ("artifact" in entry) await readArtifact(entry.artifact);
+        if (entry.type === "logical_run_started" && entry.recordVersion === 3)
+          for (const pasted of entry.pastedTexts) await readArtifact(pasted.artifact);
+        if (entry.type === "runtime_event") {
+          const event = entry.event;
+          if (event.type === "tool_completed")
+            for (const artifact of toolOutputArtifactReferences(event.output))
+              await readArtifact(artifact);
+          if (
+            (event.type === "tool_permission_requested" ||
+              event.type === "tool_permission_decided") &&
+            event.changePreviewRef !== undefined
+          )
+            await readArtifact(event.changePreviewRef);
+        }
+      }
+      operationScopes.set(
+        genesis.record.sessionId,
+        Math.max(operationScopes.get(genesis.record.sessionId) ?? 0, records.at(-1)?.sequence ?? 0),
+      );
+      if (genesis.record.lineage !== undefined)
+        await validateRecords(
+          (await restoredLineage.readValidatedLineagePrefix(genesis)).prefixRecords,
+        );
+    };
+    await validateRecords(await readRecords(main.sessionId));
+    const controls = await (await rawTrashControl()).forParent(main.sessionId).read();
+    for (const record of controls) {
+      if (record.event.type === "exported") await readArtifact(record.event.artifact);
+      if (record.event.type === "admitted" && record.event.frozen?.review !== undefined)
+        await readArtifact(record.event.frozen.review.evidence);
+    }
+    for (const child of manifest.unit.children) {
+      const admission = controls.find(
+        (record) =>
+          record.event.type === "admitted" &&
+          record.childSessionId === child.sessionId &&
+          record.threadId === child.threadId,
+      );
+      if (admission === undefined)
+        throw new SessionTrashError("conflict", "A restored Child admission is missing.");
+      const records = await readRecords(child.sessionId);
+      if (
+        validateTrashChildHistory({
+          admission,
+          controls,
+          records,
+          projectId: manifest.projectId,
+          workspaceRoot: options.workspaceRoot,
+          validateHistory,
+        }) === undefined
+      )
+        continue;
+      await validateRecords(records);
+    }
+    const operations = await readOnlyProjectOperationRecords({
+      workspaceRoot: options.workspaceRoot,
+      stateRoot: effectiveStateRoot,
+    });
+    const linked = new Set(
+      operations
+        .filter(
+          (record) =>
+            record.schemaVersion === 3 &&
+            record.event.type === "operation_started" &&
+            record.origin.sourceSequence <= (operationScopes.get(record.origin.sessionId) ?? -1),
+        )
+        .map((record) => record.operationId),
+    );
+    for (const record of operations) {
+      if (!linked.has(record.operationId)) continue;
+      if (record.event.type === "operation_artifact_published")
+        await readArtifact(record.event.artifact);
+      if (record.event.type === "operation_managed_review_invoked") {
+        for (const evidence of record.event.request.evidence) {
+          if (evidence.type === "artifact") await readArtifact(evidence.artifact);
+          else {
+            const retained = await createExtensionRecordStore(effectiveStateRoot).get(
+              evidence.record.provenance,
+              evidence.record.key,
+            );
+            if (
+              retained === undefined ||
+              retained.digest !== evidence.record.digest ||
+              retained.byteCount !== evidence.record.byteCount
+            )
+              throw new SessionTrashError(
+                "conflict",
+                "A referenced review record is missing or corrupt.",
+              );
+          }
+        }
+      }
+      if ("artifacts" in record.event)
+        for (const artifact of record.event.artifacts ?? []) await readArtifact(artifact);
+    }
+    if (manifest.files.some((file) => file.kind === "main_draft" || file.kind === "child_draft")) {
+      const drafts = await createRecoverableTurnDraftRepository({
+        stateRoot: effectiveStateRoot,
+        projectId: manifest.projectId,
+      });
+      const mainDraft = await drafts.load({ type: "session", sessionId: main.sessionId });
+      if (manifest.files.some((file) => file.kind === "main_draft") && mainDraft === null)
+        throw new SessionTrashError("conflict", "The Main draft is missing after restore.");
+      // Creating this reader opens no files and owns no staged writes; each read closes its handle.
+      const staged = await createFileArtifactStagingStore({
+        root: join(effectiveStateRoot, "artifacts"),
+      });
+      for (const resource of [...(mainDraft?.resources ?? []), ...(mainDraft?.pastedTexts ?? [])]) {
+        if (resource.selection === undefined) continue;
+        const reference = resource.selection.staged;
+        const bytes =
+          (await staged.read(reference, 8 * 1024 * 1024)) ??
+          (await readFileArtifact({
+            root: join(effectiveStateRoot, "artifacts"),
+            id: reference.id,
+            maximumBytes: 8 * 1024 * 1024,
+          }));
+        if (bytes === undefined || bytes.byteLength !== reference.byteCount)
+          throw new SessionTrashError("conflict", "A retained draft resource is unavailable.");
+      }
+      for (const file of manifest.files)
+        if (
+          file.kind === "child_draft" &&
+          (await drafts.loadManaged({
+            parentSessionId: main.sessionId,
+            threadId: file.threadId,
+          })) === null
+        )
+          throw new SessionTrashError("conflict", "A Child draft is missing after restore.");
+    }
+  };
+
+  return { requireIdleHistory, inspectTrashCandidate, validateRestoredUnit };
+}
+
+export type SessionTrashCandidate = Awaited<
+  ReturnType<ReturnType<typeof createReadOnlySessionHistoryInspector>["inspectTrashCandidate"]>
+>;
 
 export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
   const effectiveStateRoot = effectiveSessionStateRoot(providedOptions.stateRoot);
@@ -3528,24 +3877,6 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       historyMutationSettlements.delete(settlement);
     }
   };
-  const requireIdleHistory = async (sessionId: string): Promise<CurrentSessionSnapshot> => {
-    const snapshot = await inspectSession({ sessionId });
-    if (snapshot.schemaVersion !== 3 || snapshot.status === "interrupted")
-      throw new SessionTrashError(
-        "conflict",
-        "This history has unfinished recovery work or cannot prove an idle Main. Resume and settle it before changing history visibility.",
-      );
-    const blocker = await sessionHistoryActivityBlocker({
-      workspaceRoot: options.workspaceRoot,
-      stateRoot: effectiveStateRoot,
-      sessionId,
-      ...(options[sessionManagedControl] === undefined
-        ? {}
-        : { composition: options[sessionManagedControl] }),
-    });
-    if (blocker !== undefined) throw new SessionTrashError("conflict", blocker);
-    return snapshot;
-  };
   const rawTrashChildren =
     rawManagedComposition?.childSessionStores ??
     createJsonlSessionStoreDirectory<SessionRecord>({
@@ -3556,73 +3887,86 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     rawManagedComposition === undefined
       ? createJsonlManagedAgentControlStore(options)
       : Promise.resolve(rawManagedComposition.store);
-  const inspectTrashCandidate = async (sessionId: string) => {
-    const snapshot = await requireIdleHistory(sessionId);
-    const visibility = await visibilityRepository.load();
-    if (visibility.status !== "ready")
-      throw new SessionTrashError("unavailable", visibility.message);
-    const inventory = await inspectSessionTrashUnit({
-      sessionId,
-      workspaceRoot: options.workspaceRoot,
-      mainDirectory: rawStoreDirectory,
-      childDirectory: rawTrashChildren,
-      controlStore: await rawTrashControl(),
-      trash: await trashRepository.list(),
-      archived: visibility.archived.includes(sessionId),
-      draftThreadIds: await trashRepository.inspectDraftThreads(sessionId),
-    });
-    const files = await trashRepository.inspectFiles(inventory.unit, inventory.specs);
-    if (files.some((file) => file.kind === "main_draft" || file.kind === "child_draft")) {
-      const drafts = await createRecoverableTurnDraftRepository({
-        projectId: snapshot.projectId,
+  const historyInspector = createReadOnlySessionHistoryInspector({
+    options: { workspaceRoot: options.workspaceRoot, stateRoot: effectiveStateRoot },
+    mainDirectory: rawStoreDirectory,
+    childDirectory: rawTrashChildren,
+    controlStore: rawTrashControl,
+    readRecords: (sessionId) => readSessionRecords(options, sessionId),
+    inspectMcpInputs: inspectCatalogMcpInputs,
+    resolvePlanProfile: resolveCatalogPlanProfile,
+    activityBlocker: (sessionId) =>
+      sessionHistoryActivityBlocker({
+        workspaceRoot: options.workspaceRoot,
         stateRoot: effectiveStateRoot,
-      });
-      for (const file of files) {
-        if (
-          file.kind === "main_draft" &&
-          (await drafts.load({ type: "session", sessionId })) === null
-        )
-          throw new SessionTrashError("conflict", "The Main draft identity could not be verified.");
-        if (
-          file.kind === "child_draft" &&
-          (await drafts.loadManaged({ parentSessionId: sessionId, threadId: file.threadId })) ===
-            null
-        )
-          throw new SessionTrashError("conflict", "A Child draft identity could not be verified.");
-      }
-    }
-    if (inventory.unit.children.length > 0 && !files.some((file) => file.kind === "control"))
-      throw new SessionTrashError(
-        "conflict",
-        "The owned Control journal is not available as a private session file.",
-      );
-    const operations = await readOnlyProjectOperationRecords({
+        sessionId,
+        ...(options[sessionManagedControl] === undefined
+          ? {}
+          : { composition: options[sessionManagedControl] }),
+      }),
+    trashRepository,
+    visibilityRepository,
+  });
+  const nativeHistoryInspection =
+    providedOptions[sessionStoreDirectory] === undefined &&
+    providedOptions[sessionTrashFileSystem] === undefined &&
+    (rawManagedComposition === undefined ||
+      isNativeManagedControlComposition(rawManagedComposition, {
+        workspaceRoot: options.workspaceRoot,
+        stateRoot: effectiveStateRoot,
+      }));
+  const inspectHistory = async (request: SessionHistoryInspectionRequest, signal?: AbortSignal) => {
+    signal?.throwIfAborted();
+    await catalogJob?.close();
+    catalogJob = undefined;
+    signal?.throwIfAborted();
+    const job = startSessionHistoryInspection({
       workspaceRoot: options.workspaceRoot,
       stateRoot: effectiveStateRoot,
+      request,
+      resolvePlanProfile: resolveCatalogPlanProfile,
+      inspectMcpInputs: inspectCatalogMcpInputs,
+      ...(signal === undefined ? {} : { signal }),
+      ...(providedOptions[sessionHistoryWorkerFactory] === undefined
+        ? {}
+        : { workerFactory: providedOptions[sessionHistoryWorkerFactory] }),
     });
-    const linked = new Set(
-      operations
-        .filter(
-          (record) =>
-            record.schemaVersion === 3 &&
-            record.event.type === "operation_started" &&
-            record.origin.sessionId === sessionId,
-        )
-        .map((record) => record.operationId),
-    );
-    const heads = new Map<string, number>();
-    for (const record of operations)
-      if (linked.has(record.operationId)) heads.set(record.operationId, record.sequence);
-    return {
-      inventory,
-      files,
-      visibilityRevision: visibility.revision,
-      mainSequence: snapshot.lastSequence,
-      operationHeads: [...heads].sort(([left], [right]) => left.localeCompare(right)),
-    };
+    try {
+      return await job.result;
+    } finally {
+      await job.close();
+    }
   };
+  const requireIdleHistory = async (sessionId: string) => {
+    if (nativeHistoryInspection) await inspectHistory({ type: "idle", sessionId });
+    else await historyInspector.requireIdleHistory(sessionId);
+  };
+  const inspectTrashCandidate = async (
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<SessionTrashCandidate> => {
+    if (!nativeHistoryInspection) {
+      signal?.throwIfAborted();
+      const result = await historyInspector.inspectTrashCandidate(sessionId);
+      signal?.throwIfAborted();
+      return result;
+    }
+    const result = await inspectHistory({ type: "trash", sessionId }, signal);
+    if (result.type !== "trash")
+      throw new SessionTrashError("unavailable", "The history inspection result is unavailable.");
+    return result.candidate;
+  };
+  const validateRestoredUnit = async (manifest: SessionTrashManifest): Promise<void> => {
+    if (nativeHistoryInspection) await inspectHistory({ type: "restore", manifest });
+    else await historyInspector.validateRestoredUnit(manifest);
+  };
+  let activeTrashPreview: AbortController | undefined;
   let pendingTrashPreview:
-    | { readonly id: string; readonly candidate: Awaited<ReturnType<typeof inspectTrashCandidate>> }
+    | {
+        readonly id: string;
+        readonly candidate: SessionTrashCandidate;
+        readonly signal?: AbortSignal;
+      }
     | undefined;
   const retireTrashedSession = async (sessionId: string) => {
     await catalogJob?.close();
@@ -3639,228 +3983,6 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         );
     }
   };
-  const validateRestoredUnit = async (manifest: SessionTrashManifest): Promise<void> => {
-    const childIds = new Set(manifest.unit.children.map((child) => child.sessionId));
-    const readRecords = (sessionId: string) =>
-      sessionId === manifest.unit.mainSessionId
-        ? readSessionTrashRecords(rawStoreDirectory, sessionId)
-        : childIds.has(sessionId)
-          ? readSessionTrashRecords(rawTrashChildren, sessionId)
-          : readSessionRecords(options, sessionId);
-    const restoredLineage = createSessionLineageTraversal({
-      workspaceRoot: options.workspaceRoot,
-      readRecords,
-    });
-    const inspector = createReadOnlySessionInspector({
-      options,
-      readRecords,
-      lineage: restoredLineage,
-      resolvePlanProfile: resolveCatalogPlanProfile,
-      inspectMcpInputs: async () => ({ trusted: false }),
-    });
-    const main = await inspector({ sessionId: manifest.unit.mainSessionId });
-    if (main.schemaVersion !== 3 || main.degradation !== undefined || main.status === "interrupted")
-      throw new SessionTrashError(
-        "conflict",
-        "The restored Main history is incomplete or degraded.",
-      );
-    const visibility = await visibilityRepository.load();
-    if (
-      visibility.status !== "ready" ||
-      visibility.archived.includes(main.sessionId) !== manifest.unit.archived
-    )
-      throw new SessionTrashError(
-        "conflict",
-        "The original archive state no longer matches the retained unit.",
-      );
-    const verified = new Set<string>();
-    const readArtifact = async (reference: { readonly id: string; readonly byteCount: number }) => {
-      const key = `${reference.id}:${reference.byteCount}`;
-      if (verified.has(key)) return;
-      if (!Number.isSafeInteger(reference.byteCount) || reference.byteCount < 0)
-        throw new SessionTrashError("conflict", "A restored artifact descriptor is invalid.");
-      const bytes = await readFileArtifact({
-        root: join(effectiveStateRoot, "artifacts"),
-        id: reference.id,
-        maximumBytes: reference.byteCount,
-      });
-      if (bytes === undefined || bytes.byteLength !== reference.byteCount)
-        throw new SessionTrashError(
-          "conflict",
-          "A referenced resource is missing or unreadable. Restore remains unfinished.",
-        );
-      verified.add(key);
-    };
-    const checkedPrefixes = new Set<string>();
-    const operationScopes = new Map<string, number>();
-    const validateRecords = async (records: readonly SessionRecord[]): Promise<void> => {
-      const genesis = records[0];
-      if (genesis === undefined || !isGenesisRecord(genesis))
-        throw new SessionTrashError("conflict", "A restored history lacks its genesis.");
-      if (genesis.record.projectId !== manifest.projectId)
-        throw new SessionTrashError("conflict", "A restored history belongs to another project.");
-      const key = `${genesis.record.sessionId}:${records.at(-1)?.sequence}`;
-      if (checkedPrefixes.has(key)) return;
-      checkedPrefixes.add(key);
-      validateCurrentSessionHistory(genesis, records, options.workspaceRoot);
-      await restoredLineage.validateSessionLineage(genesis, records);
-      const response = await inspectModelResponseArtifactLineage(
-        options,
-        restoredLineage,
-        genesis,
-        records,
-        createArtifactMaterializationCache(),
-      );
-      if (response.degradation !== undefined)
-        throw new SessionTrashError(
-          "conflict",
-          "A retained response artifact is missing or corrupt.",
-        );
-      const resources = await inputResourcesFromLineage(restoredLineage, genesis, records);
-      await validateCompactionInputResources(restoredLineage, genesis, records);
-      validateInputResourceReadLineage(records, resources);
-      await validateVisibleInputResourceArtifacts(
-        {
-          read: (id, bounds) =>
-            readFileArtifact({ root: join(effectiveStateRoot, "artifacts"), id, ...bounds }),
-        },
-        resources,
-      );
-      for (const record of records) {
-        if (record.schemaVersion !== 3) continue;
-        const entry = record.record;
-        if ("artifact" in entry) await readArtifact(entry.artifact);
-        if (entry.type === "logical_run_started" && entry.recordVersion === 3)
-          for (const pasted of entry.pastedTexts) await readArtifact(pasted.artifact);
-        if (entry.type === "runtime_event") {
-          const event = entry.event;
-          if (event.type === "tool_completed")
-            for (const artifact of toolOutputArtifactReferences(event.output))
-              await readArtifact(artifact);
-          if (
-            (event.type === "tool_permission_requested" ||
-              event.type === "tool_permission_decided") &&
-            event.changePreviewRef !== undefined
-          )
-            await readArtifact(event.changePreviewRef);
-        }
-      }
-      operationScopes.set(
-        genesis.record.sessionId,
-        Math.max(operationScopes.get(genesis.record.sessionId) ?? 0, records.at(-1)?.sequence ?? 0),
-      );
-      if (genesis.record.lineage !== undefined)
-        await validateRecords(
-          (await restoredLineage.readValidatedLineagePrefix(genesis)).prefixRecords,
-        );
-    };
-    await validateRecords(await readRecords(main.sessionId));
-    const controls = await (await rawTrashControl()).forParent(main.sessionId).read();
-    for (const record of controls) {
-      if (record.event.type === "exported") await readArtifact(record.event.artifact);
-      if (record.event.type === "admitted" && record.event.frozen?.review !== undefined)
-        await readArtifact(record.event.frozen.review.evidence);
-    }
-    for (const child of manifest.unit.children) {
-      const admission = controls.find(
-        (record) =>
-          record.event.type === "admitted" &&
-          record.childSessionId === child.sessionId &&
-          record.threadId === child.threadId,
-      );
-      if (admission === undefined)
-        throw new SessionTrashError("conflict", "A restored Child admission is missing.");
-      const records = await readRecords(child.sessionId);
-      if (
-        validateTrashChildHistory({
-          admission,
-          controls,
-          records,
-          projectId: manifest.projectId,
-          workspaceRoot: options.workspaceRoot,
-        }) === undefined
-      )
-        continue;
-      await validateRecords(records);
-    }
-    const operations = await readOnlyProjectOperationRecords({
-      workspaceRoot: options.workspaceRoot,
-      stateRoot: effectiveStateRoot,
-    });
-    const linked = new Set(
-      operations
-        .filter(
-          (record) =>
-            record.schemaVersion === 3 &&
-            record.event.type === "operation_started" &&
-            record.origin.sourceSequence <= (operationScopes.get(record.origin.sessionId) ?? -1),
-        )
-        .map((record) => record.operationId),
-    );
-    for (const record of operations) {
-      if (!linked.has(record.operationId)) continue;
-      if (record.event.type === "operation_artifact_published")
-        await readArtifact(record.event.artifact);
-      if (record.event.type === "operation_managed_review_invoked") {
-        for (const evidence of record.event.request.evidence) {
-          if (evidence.type === "artifact") await readArtifact(evidence.artifact);
-          else {
-            const retained = await createExtensionRecordStore(effectiveStateRoot).get(
-              evidence.record.provenance,
-              evidence.record.key,
-            );
-            if (
-              retained === undefined ||
-              retained.digest !== evidence.record.digest ||
-              retained.byteCount !== evidence.record.byteCount
-            )
-              throw new SessionTrashError(
-                "conflict",
-                "A referenced review record is missing or corrupt.",
-              );
-          }
-        }
-      }
-      if ("artifacts" in record.event)
-        for (const artifact of record.event.artifacts ?? []) await readArtifact(artifact);
-    }
-    if (manifest.files.some((file) => file.kind === "main_draft" || file.kind === "child_draft")) {
-      const drafts = await createRecoverableTurnDraftRepository({
-        stateRoot: effectiveStateRoot,
-        projectId: manifest.projectId,
-      });
-      const mainDraft = await drafts.load({ type: "session", sessionId: main.sessionId });
-      if (manifest.files.some((file) => file.kind === "main_draft") && mainDraft === null)
-        throw new SessionTrashError("conflict", "The Main draft is missing after restore.");
-      // Creating this reader opens no files and owns no staged writes; each read closes its handle.
-      const staged = await createFileArtifactStagingStore({
-        root: join(effectiveStateRoot, "artifacts"),
-      });
-      for (const resource of [...(mainDraft?.resources ?? []), ...(mainDraft?.pastedTexts ?? [])]) {
-        if (resource.selection === undefined) continue;
-        const reference = resource.selection.staged;
-        const bytes =
-          (await staged.read(reference, 8 * 1024 * 1024)) ??
-          (await readFileArtifact({
-            root: join(effectiveStateRoot, "artifacts"),
-            id: reference.id,
-            maximumBytes: 8 * 1024 * 1024,
-          }));
-        if (bytes === undefined || bytes.byteLength !== reference.byteCount)
-          throw new SessionTrashError("conflict", "A retained draft resource is unavailable.");
-      }
-      for (const file of manifest.files)
-        if (
-          file.kind === "child_draft" &&
-          (await drafts.loadManaged({
-            parentSessionId: main.sessionId,
-            threadId: file.threadId,
-          })) === null
-        )
-          throw new SessionTrashError("conflict", "A Child draft is missing after restore.");
-    }
-  };
-
   const collectProjectSessionCatalog = async (input: {
     readonly view?: SessionVisibility;
     readonly cursor?: string;
@@ -4428,6 +4550,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return lifecycleClosePromise;
       }
       lifecycleClosing = true;
+      activeTrashPreview?.abort();
+      pendingTrashPreview = undefined;
       pendingManagedFamily?.controller.abort();
       pendingManagedFamily = undefined;
       const runningSession = activeSessionSettlement;
@@ -6337,37 +6461,55 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     },
     async previewSessionTrash(input) {
       pendingTrashPreview = undefined;
-      const result = await runHistoryMutation(
-        input.sessionId,
-        async (): Promise<SessionTrashPreview> => {
-          const candidate = await inspectTrashCandidate(input.sessionId);
-          const id = randomUUID();
-          if (candidate.inventory.blockers.length === 0) pendingTrashPreview = { id, candidate };
-          return {
-            previewId: candidate.inventory.blockers.length === 0 ? id : null,
-            sessionId: input.sessionId,
-            label: candidate.inventory.unit.label,
-            children: candidate.inventory.unit.children,
-            blockers: candidate.inventory.blockers,
-          };
-        },
-      );
-      return "status" in result
-        ? {
-            previewId: null,
-            sessionId: input.sessionId,
-            label: input.sessionId,
-            children: [],
-            blockers: [
-              { kind: "activity", message: result.message, sessionIds: [input.sessionId] },
-            ],
-          }
-        : result;
+      activeTrashPreview?.abort();
+      const controller = new AbortController();
+      activeTrashPreview = controller;
+      const signal =
+        input.signal === undefined
+          ? controller.signal
+          : AbortSignal.any([controller.signal, input.signal]);
+      try {
+        const result = await runHistoryMutation(
+          input.sessionId,
+          async (): Promise<SessionTrashPreview> => {
+            const candidate = await inspectTrashCandidate(input.sessionId, signal);
+            const id = randomUUID();
+            if (candidate.inventory.blockers.length === 0)
+              pendingTrashPreview = {
+                id,
+                candidate,
+                signal,
+              };
+            return {
+              previewId: candidate.inventory.blockers.length === 0 ? id : null,
+              sessionId: input.sessionId,
+              label: candidate.inventory.unit.label,
+              children: candidate.inventory.unit.children,
+              blockers: candidate.inventory.blockers,
+            };
+          },
+        );
+        signal.throwIfAborted();
+        return "status" in result
+          ? {
+              previewId: null,
+              sessionId: input.sessionId,
+              label: input.sessionId,
+              children: [],
+              blockers: [
+                { kind: "activity", message: result.message, sessionIds: [input.sessionId] },
+              ],
+            }
+          : result;
+      } finally {
+        if (activeTrashPreview === controller) activeTrashPreview = undefined;
+      }
     },
     async confirmSessionTrash(input) {
       const preview = pendingTrashPreview;
       pendingTrashPreview = undefined;
-      if (preview === undefined || preview.id !== input.previewId) return { status: "stale" };
+      if (preview === undefined || preview.id !== input.previewId || preview.signal?.aborted)
+        return { status: "stale" };
       return runHistoryMutation(
         preview.candidate.inventory.unit.mainSessionId,
         async (): Promise<SessionTrashResult> => {

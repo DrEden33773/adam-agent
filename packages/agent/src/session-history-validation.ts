@@ -10,6 +10,7 @@ import {
   digestContextRecordPrefix,
   reduceContextEvidence,
 } from "./durable-context.js";
+import { isDeeplyImmutable } from "./immutable-value.js";
 import {
   createInputResourceProjectionMessageV1,
   decodeInputResourceCursorV1,
@@ -111,6 +112,16 @@ type ValidatedAttemptState = {
   responseSequence?: number;
   status: "started" | "interrupted" | "completed";
 };
+
+/** Reuse only complete immutable observations within one inspector, after every fresh byte read. */
+export function createSessionHistoryValidator(workspaceRoot: string) {
+  const validated = new WeakSet<readonly SessionRecord[]>();
+  return (genesis: SessionGenesisRecord, records: readonly SessionRecord[]): void => {
+    if (records[0] === genesis && validated.has(records)) return;
+    validateCurrentSessionHistory(genesis, records, workspaceRoot);
+    if (isDeeplyImmutable(records)) validated.add(records);
+  };
+}
 
 export function validateCurrentSessionHistory(
   genesis: SessionGenesisRecord,

@@ -221,6 +221,8 @@ export type SessionTrashCatalogDisplay = {
 };
 
 export type SessionSummaryPage = {
+  /** Current history operation; browsing remains available while conflicting actions are guarded. */
+  readonly operation?: "archive" | "trash_preview" | "trash" | "restore";
   readonly view?: "active" | "archived" | "trash";
   readonly trash?: SessionTrashCatalogDisplay;
   readonly visibility?:
@@ -1834,6 +1836,7 @@ export type PresentationCommand =
       readonly before: string;
     }
   | { readonly type: "preview_session_trash"; readonly sessionId: string }
+  | { readonly type: "cancel_session_trash_preview" }
   | { readonly type: "confirm_session_trash"; readonly previewId: string }
   | {
       readonly type: "restore_session_trash";
