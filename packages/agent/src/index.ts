@@ -194,6 +194,11 @@ export {
   type SessionStore,
   SessionStoreError,
 } from "./session-store.js";
+export type {
+  SessionVisibility,
+  SessionVisibilityResult,
+  SessionVisibilitySnapshot,
+} from "./session-visibility.js";
 export {
   resolveThinkingPolicy,
   type ThinkingCapabilityV1,

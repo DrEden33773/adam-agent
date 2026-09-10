@@ -1544,6 +1544,8 @@ test("PresentationSession opens an empty project catalog without creating a sess
         },
         targets: { items: [], defaultTargetId: null, diagnostic: null },
         sessions: {
+          view: "active",
+          visibility: { status: "ready", revision: 0, archived: [] },
           items: [],
           nextCursor: null,
           diagnostics: { items: [], totalCount: 0, truncated: false },
@@ -4928,6 +4930,8 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
           diagnostic: null,
         },
         sessions: {
+          view: "active",
+          visibility: { status: "ready", revision: 0, archived: [] },
           items: [],
           nextCursor: null,
           diagnostics: { items: [], totalCount: 0, truncated: false },

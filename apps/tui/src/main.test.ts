@@ -8757,10 +8757,15 @@ test("a mandatory permission keeps input ownership when the inherited transcript
       .findIndex((line) => line.includes("Adam · New session"));
     expect(transcriptHeaderRow).toBeGreaterThanOrEqual(0);
 
-    await inputAndWaitForPhysicalFrame(terminal, "\u001b[102;6u");
+    await waitForPhysicalText(terminal, "> Allow");
+    // An ignored search chord need not repaint. The next explicit selection
+    // change proves the permission dialog still owns input and yields a frame.
+    terminal.input("\u001b[102;6u");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[C");
 
     const frame = terminal.lines().join("\n");
     expect(frame).toContain("Permission required");
+    expect(frame).toContain("> Deny");
     expect(frame).not.toContain("Find transcript");
     expect(terminal.lines().findIndex((line) => line.includes("Adam · New session"))).toBe(
       transcriptHeaderRow,

@@ -4,6 +4,7 @@ import type { ReadOnlySessionMcpInputs, SessionPlanAuthorityInput } from "./sess
 import type { SessionLifecycleError } from "./session-lifecycle-error.js";
 
 export type SessionCatalogWorkerData = {
+  readonly view?: import("./session-visibility.js").SessionVisibility;
   readonly workspaceRoot: string;
   readonly stateRoot: string;
   readonly limit: number;

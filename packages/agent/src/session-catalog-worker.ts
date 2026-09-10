@@ -29,6 +29,11 @@ import {
   type SessionStoreDirectoryEntry,
   SessionStoreError,
 } from "./session-store.js";
+import {
+  createSessionVisibilityRepository,
+  type SessionVisibilitySnapshot,
+  sessionMatchesVisibilityView,
+} from "./session-visibility.js";
 
 const port = parentPort;
 if (port === null) throw new Error("The session catalog requires a worker message port.");
@@ -66,6 +71,7 @@ const inspect = createReadOnlySessionInspector({
     (await requestAuthority({ type: "mcp", sessionId })) as ReadOnlySessionMcpInputs,
 });
 let projectId = "";
+let visibility: SessionVisibilitySnapshot = { status: "ready", revision: 0, archived: [] };
 let entries: readonly SessionStoreDirectoryEntry[] = [];
 let position = 0;
 let wantedItems = input.limit;
@@ -95,6 +101,8 @@ function publish(error?: ProjectSessionCatalogSnapshot["error"]): void {
     type: "update",
     snapshot: {
       projectId,
+      visibility,
+      view: input.view ?? "active",
       items: entries
         .flatMap((entry) => {
           const item = summaries.get(entry.sessionId);
@@ -231,11 +239,15 @@ async function scanHealth(): Promise<void> {
 async function start(): Promise<void> {
   const canonicalRoot = await realpath(input.workspaceRoot);
   projectId = `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
-  entries = [...(await directory.listSessionEntries())].sort(
-    (left, right) =>
-      right.modifiedAtMilliseconds - left.modifiedAtMilliseconds ||
-      (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0),
-  );
+  visibility = await createSessionVisibilityRepository(input).load();
+  const metadata = visibility;
+  entries = [...(await directory.listSessionEntries())]
+    .filter((entry) => sessionMatchesVisibilityView(entry.sessionId, metadata, input.view))
+    .sort(
+      (left, right) =>
+        right.modifiedAtMilliseconds - left.modifiedAtMilliseconds ||
+        (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0),
+    );
   publish();
   await fillPage();
   phase = "ready";

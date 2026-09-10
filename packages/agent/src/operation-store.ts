@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { type FileHandle, mkdir, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type {
   ExtensionArtifactSummary,
@@ -565,12 +565,62 @@ function enqueueAppend(path: string, run: () => Promise<void>): Promise<void> {
   return operation;
 }
 
-async function readOperationLog(path: string): Promise<OperationEventRecord[]> {
+/** Cold history mutations must not create an Operation journal merely to inspect it. */
+export async function readUnfinishedSessionOperations(input: {
+  readonly workspaceRoot: string;
+  readonly stateRoot: string;
+  readonly sessionId: string;
+}): Promise<readonly string[]> {
+  const project = createHash("sha256")
+    .update(await realpath(input.workspaceRoot))
+    .digest("hex");
+  const stateRoot = resolve(input.stateRoot);
+  const directory = join(stateRoot, "projects", project, "operations");
+  for (const path of [
+    stateRoot,
+    join(stateRoot, "projects"),
+    join(stateRoot, "projects", project),
+    directory,
+  ]) {
+    try {
+      if ((await realpath(path)) !== path) throw new OperationStoreError();
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return [];
+      throw error;
+    }
+  }
+  const records = await readOperationLog(join(directory, "events-v1.jsonl"), true);
+  assertProjectRecords(records, `sha256:${project}`);
+  return records
+    .filter(
+      (record) =>
+        record.schemaVersion === 3 &&
+        record.event.type === "operation_started" &&
+        record.origin.sessionId === input.sessionId,
+    )
+    .filter(
+      (start) =>
+        !records.some(
+          (record) =>
+            record.operationId === start.operationId &&
+            ["operation_completed", "operation_failed", "operation_cancelled"].includes(
+              record.event.type,
+            ),
+        ),
+    )
+    .map((record) => record.operationId);
+}
+
+async function readOperationLog(
+  path: string,
+  missingIsEmpty = false,
+): Promise<OperationEventRecord[]> {
   let file: FileHandle;
   try {
     file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
+      if (missingIsEmpty) return [];
       throw new OperationStoreError();
     }
     throw error;
