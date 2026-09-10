@@ -7,6 +7,7 @@ import {
   type Component,
   fuzzyFilter,
   getKeybindings,
+  matchesKey,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
@@ -27,9 +28,17 @@ export type SessionPickerCatalog = {
   readonly sessions: readonly SessionSummary[];
   readonly hasMore: boolean;
   readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
-} & Pick<SessionSummaryPage, "loading" | "health" | "error">;
+} & Pick<SessionSummaryPage, "loading" | "health" | "error" | "view" | "visibility">;
 
 export class SessionPicker implements Component {
+  #catalogView: "active" | "archived";
+  readonly #viewSelections = new Map<"active" | "archived", string>();
+  #visibility: SessionSummaryPage["visibility"];
+  readonly #onView: ((view: "active" | "archived") => void) | undefined;
+  readonly #onArchive:
+    | ((session: SessionSummary, visibility: "active" | "archived", revision: number) => void)
+    | undefined;
+  readonly #onUndo: (() => void) | undefined;
   #hasMore: boolean;
   #diagnostics: SessionHistoryDiagnosticsDisplay;
   readonly #onClose: () => void;
@@ -52,6 +61,13 @@ export class SessionPicker implements Component {
   constructor(
     options: SessionPickerCatalog & {
       readonly theme: AdamTuiTheme;
+      readonly onView?: (view: "active" | "archived") => void;
+      readonly onArchive?: (
+        session: SessionSummary,
+        visibility: "active" | "archived",
+        revision: number,
+      ) => void;
+      readonly onUndo?: () => void;
       readonly onNewSession: () => void;
       readonly onLoadMore: () => void;
       readonly onRename: (session: SessionSummary) => void;
@@ -59,6 +75,11 @@ export class SessionPicker implements Component {
       readonly onClose: () => void;
     },
   ) {
+    this.#catalogView = options.view ?? "active";
+    this.#visibility = options.visibility;
+    this.#onView = options.onView;
+    this.#onArchive = options.onArchive;
+    this.#onUndo = options.onUndo;
     this.#onNewSession = options.onNewSession;
     this.#onClose = options.onClose;
     this.#onLoadMore = options.onLoadMore;
@@ -82,8 +103,15 @@ export class SessionPicker implements Component {
   }
 
   setCatalog(catalog: SessionPickerCatalog): void {
-    const selectedKey = itemKey(this.#items()[this.#selectedIndex]);
+    let selectedKey = itemKey(this.#items()[this.#selectedIndex]);
+    const destination = catalog.view ?? "active";
+    if (destination !== this.#catalogView) {
+      if (selectedKey !== undefined) this.#viewSelections.set(this.#catalogView, selectedKey);
+      selectedKey = this.#viewSelections.get(destination) ?? selectedKey;
+    }
     const diagnosticId = this.#diagnostics.items[this.#diagnosticIndex]?.sessionId;
+    this.#catalogView = catalog.view ?? "active";
+    this.#visibility = catalog.visibility;
     this.#sessions = catalog.sessions;
     this.#hasMore = catalog.hasMore;
     this.#diagnostics = catalog.diagnostics ?? { items: [], totalCount: 0, truncated: false };
@@ -101,6 +129,15 @@ export class SessionPicker implements Component {
       diagnosticIndex < 0
         ? Math.min(this.#diagnosticIndex, Math.max(0, this.#diagnostics.items.length - 1))
         : diagnosticIndex;
+  }
+
+  rememberSession(sessionId: string, view: "active" | "archived"): void {
+    const key = `session:${sessionId}`;
+    this.#viewSelections.set(view, key);
+    if (view === this.#catalogView) {
+      const index = this.#items().findIndex((item) => itemKey(item) === key);
+      if (index >= 0) this.#selectedIndex = index;
+    }
   }
 
   setNotice(notice: string): void {
@@ -128,6 +165,24 @@ export class SessionPicker implements Component {
       if (keybindings.matches(data, "tui.select.cancel")) {
         this.#view = "sessions";
       }
+      return;
+    }
+    if (matchesKey(data, "tab")) {
+      this.#onView?.(this.#catalogView === "active" ? "archived" : "active");
+      return;
+    }
+    if (matchesKey(data, "ctrl+a")) {
+      const selected = this.#items()[this.#selectedIndex];
+      if (selected?.kind === "session" && this.#visibility?.status === "ready")
+        this.#onArchive?.(
+          selected.session,
+          this.#catalogView === "active" ? "archived" : "active",
+          this.#visibility.revision,
+        );
+      return;
+    }
+    if (matchesKey(data, "ctrl+u")) {
+      this.#onUndo?.();
       return;
     }
     if (adamCommandRegistry.matchesInput(data, "rename_session")) {
@@ -192,6 +247,16 @@ export class SessionPicker implements Component {
     const visibleItems = resultItems.slice(startIndex, startIndex + 8);
     return [
       this.#theme.toolTitle("Select a project session"),
+      this.#theme.muted(
+        this.#visibility?.status === "unknown"
+          ? "Recovery view · archive state unknown"
+          : this.#catalogView === "active"
+            ? "[Active] · Archived"
+            : "Active · [Archived]",
+      ),
+      ...(this.#visibility?.status === "unknown"
+        ? wrapTextWithAnsi(this.#theme.muted(this.#visibility.message), Math.max(1, width))
+        : []),
       this.#renderNewSession(width),
       `Search: ${safeTerminalText(this.#query)}`,
       ...this.#renderCatalogStatus(width),
@@ -222,10 +287,21 @@ export class SessionPicker implements Component {
             ),
           ]
         : []),
-      ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
+      ...(this.#notice === null
+        ? []
+        : ["", ...wrapTextWithAnsi(this.#theme.muted(this.#notice), Math.max(1, width))]),
       "",
-      this.#theme.muted(
-        `Enter open · ${adamCommandRegistry.keybinding("rename_session").keys} rename · type search · ↑/↓ move · Esc close · Ctrl+Q exit`,
+      ...wrapTextWithAnsi(
+        this.#theme.muted(
+          `Tab Active/Archived · Ctrl+A ${this.#catalogView === "active" ? "archive" : "unarchive"} · Ctrl+U undo`,
+        ),
+        Math.max(1, width),
+      ),
+      ...wrapTextWithAnsi(
+        this.#theme.muted(
+          `Enter open · ${adamCommandRegistry.keybinding("rename_session").keys} rename · type search · ↑/↓ move · Esc close · Ctrl+Q exit`,
+        ),
+        Math.max(1, width),
       ),
     ];
   }

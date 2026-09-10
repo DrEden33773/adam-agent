@@ -1835,7 +1835,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     synchronizeDraftInputs(state.composer);
     const activeSessionChanged = active?.session.id !== previousActiveSessionId;
     if (activeSessionChanged) {
-      if (previousActiveSessionId !== undefined) {
+      if (previousActiveSessionId !== undefined && (active !== null || !sessionPickerRequested)) {
         sessionPicker?.hide();
         sessionPicker = undefined;
         sessionPickerRequested = false;
@@ -1962,6 +1962,38 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.setFocus(editor);
         tui.requestRender();
       };
+      let archiveUndo:
+        | { sessionId: string; visibility: "active" | "archived"; expectedRevision: number }
+        | undefined;
+      const changeArchive = async (input: {
+        sessionId: string;
+        visibility: "active" | "archived";
+        expectedRevision: number;
+      }) => {
+        await draftMutationQueue.onIdle();
+        const receipt = await options.presentation.dispatch({
+          type: "set_session_visibility",
+          ...input,
+        });
+        if (receipt.status === "admitted") {
+          picker.rememberSession(input.sessionId, input.visibility);
+          const metadata = receipt.sessionVisibility;
+          archiveUndo =
+            metadata === undefined
+              ? undefined
+              : {
+                  sessionId: input.sessionId,
+                  visibility: input.visibility === "active" ? "archived" : "active",
+                  expectedRevision: metadata.revision,
+                };
+          picker.setNotice(
+            input.visibility === "archived"
+              ? "Session archived. Ctrl+U undo."
+              : "Session unarchived. Ctrl+U undo.",
+          );
+        } else picker.setNotice(receipt.message);
+        renderState();
+      };
       const picker = new SessionPicker({
         ...state.authoritative.sessions,
         sessions: state.authoritative.sessions.items,
@@ -1971,6 +2003,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : { diagnostics: state.authoritative.sessions.diagnostics }),
         theme,
         onClose: () => close(),
+        onView(view) {
+          void options.presentation.dispatch({ type: "set_session_view", view }).then((receipt) => {
+            if (receipt.status !== "admitted") picker.setNotice(receipt.message);
+            renderState();
+          });
+        },
+        onArchive(session, visibility, expectedRevision) {
+          void changeArchive({ sessionId: session.id, visibility, expectedRevision });
+        },
+        onUndo() {
+          if (archiveUndo !== undefined) void changeArchive(archiveUndo);
+        },
         onNewSession() {
           newSessionSelected = true;
           sessionPickerRequested = false;

@@ -37,6 +37,7 @@ export type ProjectSessionCatalogController = {
 };
 
 export type ProjectSessionCatalogStartOptions = {
+  readonly view?: import("./session-visibility.js").SessionVisibility;
   readonly limit?: number;
   readonly onUpdate: (snapshot: ProjectSessionCatalogSnapshot) => void;
 };
@@ -197,6 +198,7 @@ export function startNativeSessionCatalog(
         stateRoot: input.stateRoot,
         limit,
         generation: randomUUID(),
+        view: input.view ?? "active",
       },
     });
     worker.on("message", handleMessage);

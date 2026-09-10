@@ -109,6 +109,7 @@ import {
   sessionManagedAgentTranscriptReader,
 } from "./session-lifecycle.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
+import { sessionMatchesVisibilityView } from "./session-visibility.js";
 import {
   createTurnComposer,
   type TurnComposer,
@@ -508,6 +509,8 @@ export async function createPresentationSession(
     const workspaceTrustSnapshot = await options.lifecycle.inspectWorkspaceTrust();
     const catalogPage = options.backgroundStartup
       ? {
+          visibility: undefined,
+          view: "active" as const,
           projectId: workspaceTrustSnapshot.projectId ?? "",
           items: [],
           nextCursor: null,
@@ -529,7 +532,9 @@ export async function createPresentationSession(
         ? undefined
         : (catalogItems.find((candidate) => candidate.id === created.sessionId) ?? activeSummary);
     const initialCatalogItems =
-      created === undefined || activeSummary === undefined
+      created === undefined ||
+      activeSummary === undefined ||
+      !sessionMatchesVisibilityView(created.sessionId, catalogPage.visibility)
         ? catalogItems
         : catalogItems.some((candidate) => candidate.id === created.sessionId)
           ? catalogItems
@@ -642,6 +647,8 @@ export async function createPresentationSession(
             }),
       },
       sessions: {
+        ...(catalogPage.visibility === undefined ? {} : { visibility: catalogPage.visibility }),
+        view: catalogPage.view ?? "active",
         items: initialCatalogItems,
         nextCursor: catalogPage.nextCursor,
         diagnostics: projectSessionHistoryDiagnostics(catalogPage.diagnostics),
@@ -1126,21 +1133,14 @@ export async function createPresentationSession(
         ),
       );
     };
+    const currentTurnDraftSettled = (): boolean => {
+      const snapshot = turnComposer.snapshot();
+      return [...snapshot.resources, ...snapshot.pastedTexts].every(
+        (resource) => resource.state === "ready" || resource.state === "failed",
+      );
+    };
     const persistSettledCurrentTurnDraft = async (): Promise<void> => {
-      if (
-        turnComposer
-          .snapshot()
-          .resources.every(
-            (resource) => resource.state === "ready" || resource.state === "failed",
-          ) &&
-        turnComposer
-          .snapshot()
-          .pastedTexts.every(
-            (pastedText) => pastedText.state === "ready" || pastedText.state === "failed",
-          )
-      ) {
-        await persistCurrentTurnDraft();
-      }
+      if (currentTurnDraftSettled()) await persistCurrentTurnDraft();
     };
     const clearAcceptedTurnDraft = async (
       draftRevision: number,
@@ -1771,7 +1771,13 @@ export async function createPresentationSession(
         ? state.authoritative.sessions.items.map((session) =>
             session.id === snapshot.sessionId ? activatedSummary : session,
           )
-        : [...state.authoritative.sessions.items, activatedSummary];
+        : !sessionMatchesVisibilityView(
+              snapshot.sessionId,
+              state.authoritative.sessions.visibility,
+              state.authoritative.sessions.view,
+            )
+          ? state.authoritative.sessions.items
+          : [...state.authoritative.sessions.items, activatedSummary];
       const activeSequence = activatedRecords.reduce(
         (maximum, record) =>
           record.sessionId === snapshot.sessionId
@@ -2969,6 +2975,58 @@ export async function createPresentationSession(
       return operation;
     };
 
+    let visibilityMutation = false;
+    const loadedCatalogDepth = new Map<"active" | "archived", number>();
+    const refreshSessionCatalog = async (view: "active" | "archived") => {
+      loadedCatalogDepth.set(
+        state.authoritative.sessions.view ?? "active",
+        Math.max(
+          loadedCatalogDepth.get(state.authoritative.sessions.view ?? "active") ?? 0,
+          state.authoritative.sessions.items.length,
+        ),
+      );
+      const wanted = Math.max(catalogPageSize, loadedCatalogDepth.get(view) ?? 0);
+      await startupCatalog?.close();
+      startupCatalog = undefined;
+      let page = await options.lifecycle.listProjectSessionSummaries({
+        view,
+        limit: Math.min(100, wanted),
+      });
+      const summaries = [...page.items];
+      const visibility = page.visibility;
+      while (summaries.length < wanted && page.nextCursor !== null) {
+        page = await options.lifecycle.listProjectSessionSummaries({
+          view,
+          cursor: page.nextCursor,
+          limit: Math.min(100, wanted - summaries.length),
+        });
+        if (
+          page.visibility?.status !== visibility?.status ||
+          (page.visibility?.status === "ready" &&
+            visibility?.status === "ready" &&
+            page.visibility.revision !== visibility.revision)
+        )
+          throw new Error("Archive state changed during catalog refresh.");
+        summaries.push(...page.items);
+      }
+      state = {
+        ...state,
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          sessions: {
+            view,
+            ...(page.visibility === undefined ? {} : { visibility: page.visibility }),
+            items: summaries.flatMap((item) =>
+              item.schemaVersion === 3 ? [sessionSummaryFromCatalog(item)] : [],
+            ),
+            nextCursor: page.nextCursor,
+            diagnostics: projectSessionHistoryDiagnostics(page.diagnostics),
+          },
+        },
+      };
+      publishStateChange();
+    };
     const dispatch = async (command: PresentationCommand): Promise<CommandReceipt> => {
       if (closed) {
         return {
@@ -2977,6 +3035,89 @@ export async function createPresentationSession(
           message: "The presentation session is closed.",
         };
       }
+      if (visibilityMutation)
+        return {
+          status: "rejected",
+          code: "conflict",
+          message: "Wait for the archive operation to finish.",
+        };
+      if (command.type === "set_session_view" || command.type === "set_session_visibility") {
+        visibilityMutation = true;
+        try {
+          if (command.type === "set_session_view") {
+            await refreshSessionCatalog(command.view);
+          } else {
+            if (activeRun !== undefined)
+              return {
+                status: "rejected",
+                code: "conflict",
+                message:
+                  "Main work is active. Close this list and use Stop, or wait for settlement.",
+              };
+            if (
+              state.authoritative.active?.session.id === command.sessionId &&
+              !currentTurnDraftSettled()
+            )
+              return {
+                status: "rejected",
+                code: "conflict",
+                message: "Wait for draft attachments to finish before archiving this session.",
+              };
+            await persistSettledCurrentTurnDraft();
+            const result = await options.lifecycle.setSessionVisibility(command);
+            if (result.status !== "updated") {
+              await refreshSessionCatalog(state.authoritative.sessions.view ?? "active");
+              return {
+                status: "rejected",
+                code: "authority_rejected",
+                message:
+                  result.status === "stale"
+                    ? "Archive state changed. Review the refreshed list and retry."
+                    : result.message,
+              };
+            }
+            if (
+              command.visibility === "archived" &&
+              state.authoritative.active?.session.id === command.sessionId
+            ) {
+              for (const observer of operationObservers.values()) observer.abort();
+              controlObserver?.abort();
+              controlObserverParent = undefined;
+              activeSessionThroughSequence = 0;
+              await turnComposer.clear({ preserveRetained: true });
+              const { managedControl: _managedControl, ...authority } = state.authoritative;
+              state = {
+                ...state,
+                authoritative: { ...authority, active: null },
+                draft: null,
+                transient: null,
+                composer: projectTurnComposer(),
+              };
+            }
+            await refreshSessionCatalog(state.authoritative.sessions.view ?? "active");
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: null,
+              sessionVisibility: {
+                sessionId: command.sessionId,
+                visibility: command.visibility,
+                revision: result.snapshot.revision,
+              },
+            };
+          }
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "Archive operation could not be confirmed. Reload the session list.",
+          };
+        } finally {
+          visibilityMutation = false;
+        }
+      }
+
       if (command.type === "resolve_managed_transition") {
         const transition = state.authoritative.managedTransition;
         const original = pendingManagedCommand;
@@ -6096,6 +6237,7 @@ export async function createPresentationSession(
           }
           const page = await options.lifecycle.listProjectSessionSummaries({
             cursor: command.after,
+            view: state.authoritative.sessions.view ?? "active",
             limit: catalogPageSize,
           });
           const additions = page.items.flatMap((snapshot) =>
@@ -6110,6 +6252,8 @@ export async function createPresentationSession(
             authoritative: {
               ...state.authoritative,
               sessions: {
+                ...state.authoritative.sessions,
+                ...(page.visibility === undefined ? {} : { visibility: page.visibility }),
                 items: [
                   ...state.authoritative.sessions.items,
                   ...additions.filter((session) => !knownSessionIds.has(session.id)),
@@ -6747,11 +6891,20 @@ export async function createPresentationSession(
           ];
         });
         for (const [id, local] of locallyUpdatedCatalog) {
-          if (locallyCreatedCatalogIds.has(id) && !included.has(id) && !invalidIds.has(id))
+          if (
+            sessionMatchesVisibilityView(id, catalog.visibility, catalog.view) &&
+            locallyCreatedCatalogIds.has(id) &&
+            !included.has(id) &&
+            !invalidIds.has(id)
+          )
             items.push(local.summary);
         }
         const active = state.authoritative.active;
-        if (active !== null && !items.some((item) => item.id === active.session.id))
+        if (
+          active !== null &&
+          sessionMatchesVisibilityView(active.session.id, catalog.visibility, catalog.view) &&
+          !items.some((item) => item.id === active.session.id)
+        )
           items.push(active.session);
         state = {
           ...state,
@@ -6764,6 +6917,8 @@ export async function createPresentationSession(
             },
             sessions: {
               items,
+              view: catalog.view ?? "active",
+              ...(catalog.visibility === undefined ? {} : { visibility: catalog.visibility }),
               nextCursor: catalog.nextCursor,
               diagnostics: projectSessionHistoryDiagnostics(catalog.diagnostics),
               loading: catalog.phase === "loading",

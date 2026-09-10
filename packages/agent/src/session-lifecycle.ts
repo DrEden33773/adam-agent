@@ -192,6 +192,7 @@ import {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
+import { sessionHistoryActivityBlocker } from "./session-history-activity.js";
 import {
   addContextUsageTotals,
   areReplayProfilesCompatible,
@@ -246,6 +247,13 @@ import {
   SessionStoreError,
   type SessionTodoStoreInheritedRecord,
 } from "./session-store.js";
+import {
+  createSessionVisibilityRepository,
+  type SessionVisibility,
+  type SessionVisibilityResult,
+  type SessionVisibilitySnapshot,
+  sessionMatchesVisibilityView,
+} from "./session-visibility.js";
 import {
   buildSkillResourceManifestV1,
   createInitialSkillContextV1,
@@ -614,6 +622,8 @@ export type SessionNamingResult = {
 };
 
 export type ProjectSessionCatalogPage = {
+  readonly visibility?: SessionVisibilitySnapshot;
+  readonly view?: SessionVisibility;
   readonly projectId: string;
   readonly items: readonly SessionSnapshot[];
   readonly nextCursor: string | null;
@@ -989,12 +999,19 @@ export interface SessionLifecycle {
     readonly limit?: number;
     readonly cursor?: string;
   }): Promise<TodoListResultV1 | { readonly status: "stale" }>;
+  setSessionVisibility(input: {
+    readonly sessionId: string;
+    readonly visibility: SessionVisibility;
+    readonly expectedRevision: number;
+  }): Promise<SessionVisibilityResult>;
   listProjectSessions(input?: {
+    readonly view?: SessionVisibility;
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<ProjectSessionCatalogPage>;
   /** Display metadata from the full validated catalog; opening a session still requires inspect/resume. */
   listProjectSessionSummaries(input?: {
+    readonly view?: SessionVisibility;
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<ProjectSessionSummaryPage>;
@@ -1280,6 +1297,10 @@ export function createReadOnlySessionInspector(dependencies: {
 
 export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
   const effectiveStateRoot = effectiveSessionStateRoot(providedOptions.stateRoot);
+  const visibilityRepository = createSessionVisibilityRepository({
+    workspaceRoot: providedOptions.workspaceRoot,
+    stateRoot: effectiveStateRoot,
+  });
   const sharedArtifactStore = createLazyArtifactStore(join(effectiveStateRoot, "artifacts"));
   const storeDirectory =
     providedOptions[sessionStoreDirectory] ??
@@ -3344,6 +3365,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   };
 
   const collectProjectSessionCatalog = async (input: {
+    readonly view?: SessionVisibility;
     readonly cursor?: string;
     readonly limit?: number;
   }) => {
@@ -3353,7 +3375,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
     const projectId = await canonicalProjectId(options.workspaceRoot);
-    const directoryEntries = await storeDirectory.listSessionEntries();
+    const visibility = await visibilityRepository.load();
+    const view = input.view ?? "active";
+    const directoryEntries = (await storeDirectory.listSessionEntries()).filter((entry) =>
+      sessionMatchesVisibilityView(entry.sessionId, visibility, view),
+    );
     const catalogEntries: Array<{
       readonly sessionId: string;
       readonly modifiedAtMilliseconds: number;
@@ -3435,6 +3461,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     return {
       projectId,
       items: selectedEntries,
+      visibility,
+      view,
       nextCursor:
         lastSessionId !== undefined && start + selectedIds.length < catalogEntries.length
           ? encodeProjectSessionCatalogCursor(lastSessionId)
@@ -5789,6 +5817,75 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
         },
         input.sessionId,
+      );
+    },
+    async setSessionVisibility(input) {
+      return serializeFamily(async (): Promise<SessionVisibilityResult> => {
+        if (
+          lifecycleClosing ||
+          trackedOwnerOperations.size > 0 ||
+          titleAdmissionOperations.size > 0 ||
+          pendingManagedFamily !== undefined
+        )
+          return {
+            status: "blocked",
+            message:
+              "Main work or a session transition is active. Use the current run's Stop action, or wait for settlement.",
+          };
+        let claim: ProjectExecutionRootClaim | undefined;
+        try {
+          claim = await executionDomain.claimRoot({ rootId: `visibility:${randomUUID()}` });
+          const snapshot = await inspectSession({ sessionId: input.sessionId });
+          if (snapshot.schemaVersion !== 3 || snapshot.status === "interrupted")
+            return {
+              status: "blocked",
+              message:
+                "This history has unfinished recovery work or cannot prove an idle session. Resume and settle it before archiving.",
+            };
+          const blocker = await sessionHistoryActivityBlocker({
+            workspaceRoot: options.workspaceRoot,
+            stateRoot: effectiveStateRoot,
+            sessionId: input.sessionId,
+            ...(options[sessionManagedControl] === undefined
+              ? {}
+              : { composition: options[sessionManagedControl] }),
+          });
+          if (blocker !== undefined) return { status: "blocked", message: blocker };
+          return await visibilityRepository.update(input);
+        } catch (error) {
+          if (
+            error instanceof ProjectExecutionDomainError &&
+            (error.code === "root_conflict" || error.code === "project_in_use")
+          ) {
+            const blocker = await sessionHistoryActivityBlocker({
+              workspaceRoot: options.workspaceRoot,
+              stateRoot: effectiveStateRoot,
+              sessionId: input.sessionId,
+              ...(options[sessionManagedControl] === undefined
+                ? {}
+                : { composition: options[sessionManagedControl] }),
+            }).catch(() => undefined);
+            return {
+              status: "blocked",
+              message:
+                blocker ??
+                "This project has active work in another runtime or session. Use Stop in the runtime that owns it, or wait for settlement.",
+            };
+          }
+          return {
+            status: "blocked",
+            message:
+              "Session ownership or idle state could not be verified. Stop active work or complete recovery before retrying.",
+          };
+        } finally {
+          await claim?.release();
+        }
+      }).catch(
+        (): SessionVisibilityResult => ({
+          status: "unavailable",
+          message:
+            "Archive ownership release could not be confirmed. Reload history before retrying.",
+        }),
       );
     },
     async listProjectSessions(input = {}) {

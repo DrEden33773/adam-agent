@@ -1402,6 +1402,8 @@ test("SessionLifecycle isolates one invalid session from the project catalog", a
       },
     });
     await expect(disappearing.listProjectSessions()).resolves.toEqual({
+      view: "active",
+      visibility: { status: "ready", revision: 0, archived: [] },
       projectId: valid.projectId,
       items: [],
       nextCursor: null,

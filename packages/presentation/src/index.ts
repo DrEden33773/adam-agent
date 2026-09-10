@@ -196,6 +196,10 @@ export type SessionNaming = {
 };
 
 export type SessionSummaryPage = {
+  readonly view?: "active" | "archived";
+  readonly visibility?:
+    | { readonly status: "ready"; readonly revision: number; readonly archived: readonly string[] }
+    | { readonly status: "unknown"; readonly message: string };
   readonly items: readonly SessionSummary[];
   readonly nextCursor: string | null;
   readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
@@ -1440,6 +1444,11 @@ export type CommandReceipt =
       readonly status: "admitted";
       readonly commandId: string;
       readonly resource: ArtifactChunk | null;
+      readonly sessionVisibility?: {
+        readonly sessionId: string;
+        readonly visibility: "active" | "archived";
+        readonly revision: number;
+      };
       readonly draftText?: string;
       readonly draftCleanupFailed?: true;
       readonly roleTarget?: {
@@ -1795,6 +1804,16 @@ export type PresentationCommand =
   | {
       readonly type: "load_older_transcript";
       readonly before: string;
+    }
+  | {
+      readonly type: "set_session_view";
+      readonly view: "active" | "archived";
+    }
+  | {
+      readonly type: "set_session_visibility";
+      readonly sessionId: string;
+      readonly visibility: "active" | "archived";
+      readonly expectedRevision: number;
     }
   | {
       readonly type: "load_more_sessions";

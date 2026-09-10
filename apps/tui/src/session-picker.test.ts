@@ -6,6 +6,77 @@ import { SessionPicker } from "./session-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
 
+test.each([40, 80, 120])(
+  "archive picker actions preserve search and exact revision at %i columns",
+  (width) => {
+    const session = {
+      id: "00000000-0000-4000-8000-000000000001",
+      label: "Named history",
+      targetId: "test",
+      status: "settled" as const,
+      naming: {
+        manualName: "Named history",
+        generatedTitle: null,
+        fallbackTitle: "History",
+        displayLabel: "Named history",
+        generation: { status: "not_started" as const },
+      },
+    };
+    const onArchive = vi.fn();
+    const onView = vi.fn();
+    const onUndo = vi.fn();
+    const picker = new SessionPicker({
+      sessions: [session],
+      hasMore: false,
+      view: "active",
+      visibility: { status: "ready", revision: 7, archived: [] },
+      theme: createAdamTuiTheme(true),
+      onArchive,
+      onView,
+      onUndo,
+      onNewSession: vi.fn(),
+      onLoadMore: vi.fn(),
+      onRename: vi.fn(),
+      onSelect: vi.fn(),
+      onClose: vi.fn(),
+    });
+    picker.handleInput("Named");
+    picker.handleInput("\u0001");
+    expect(onArchive).toHaveBeenLastCalledWith(session, "archived", 7);
+    picker.handleInput("\t");
+    expect(onView).toHaveBeenLastCalledWith("archived");
+    picker.setCatalog({
+      sessions: [session],
+      hasMore: false,
+      view: "archived",
+      visibility: { status: "ready", revision: 8, archived: [session.id] },
+    });
+    picker.handleInput("\u0001");
+    expect(onArchive).toHaveBeenLastCalledWith(session, "active", 8);
+    picker.handleInput("\u0015");
+    expect(onUndo).toHaveBeenCalledOnce();
+    picker.setNotice(
+      "Child work is waiting. Close this list and open Agents to inspect or stop it.",
+    );
+    const lines = picker.render(width);
+    expect(lines.join("\n")).toContain("Search: Named");
+    expect(lines.join("\n")).toContain("[Archived]");
+    expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+    expect(lines.join("\n")).not.toContain("\u001b[");
+    picker.setCatalog({
+      sessions: [session],
+      hasMore: false,
+      visibility: {
+        status: "unknown",
+        message: "Archive state is unknown; retained history is available for inspection.",
+      },
+    });
+    picker.handleInput("\u0001");
+    expect(onArchive).toHaveBeenCalledTimes(2);
+    expect(picker.render(width).join("\n")).toContain("archive state unknown");
+  },
+);
+
 test("the pinned New Session row remains a complete narrow-width selection", () => {
   const picker = new SessionPicker({
     sessions: [
