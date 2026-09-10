@@ -2,19 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { Worker, type WorkerOptions } from "node:worker_threads";
 import { notifyObserver } from "./observer-notification.js";
-import type { PlanEligibleToolProfileV1 } from "./plan-mode.js";
 import type {
-  SessionCatalogAuthorityRequest,
   SessionCatalogWorkerEvent,
   SessionCatalogWorkerRequest,
 } from "./session-catalog-protocol.js";
-import type {
-  ProjectSessionSummaryPage,
-  ReadOnlySessionMcpInputs,
-  SessionPlanAuthorityInput,
-} from "./session-lifecycle.js";
+import {
+  resolveSessionInspectionAuthority,
+  type SessionInspectionAuthority,
+} from "./session-inspection-authority.js";
+import type { ProjectSessionSummaryPage } from "./session-lifecycle.js";
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
-import { SessionStoreError } from "./session-store.js";
 
 /** One enumeration generation. Running diagnostics are partial; complete means every entry was inspected. */
 export type ProjectSessionCatalogSnapshot = ProjectSessionSummaryPage & {
@@ -46,17 +43,10 @@ export type ProjectSessionCatalogStartOptions = {
 export const sessionCatalogWorkerFactory = Symbol("adam-agent.session-catalog-worker-factory");
 export type SessionCatalogWorkerFactory = (url: URL, options: WorkerOptions) => Worker;
 
-type CatalogAuthority = {
-  readonly resolvePlanProfile: (
-    input: SessionPlanAuthorityInput,
-  ) => Promise<PlanEligibleToolProfileV1>;
-  readonly inspectMcpInputs: (sessionId: string) => Promise<ReadOnlySessionMcpInputs>;
-};
-
 /** One native read-only worker; the owning Lifecycle supplies live authority without tool execution. */
 export function startNativeSessionCatalog(
   input: ProjectSessionCatalogStartOptions &
-    CatalogAuthority & {
+    SessionInspectionAuthority & {
       readonly workspaceRoot: string;
       readonly stateRoot: string;
       readonly supported: boolean;
@@ -79,6 +69,7 @@ export function startNativeSessionCatalog(
     phase: "loading",
     health: { status: "not_started", checked: 0, total: null },
   };
+  let workerSnapshot: ProjectSessionCatalogSnapshot | undefined;
   let closePromise: Promise<void> | undefined;
   let termination: Promise<void> | undefined;
   const exited = Promise.withResolvers<void>();
@@ -119,58 +110,36 @@ export function startNativeSessionCatalog(
     // A failed scan has no further work. Its owner still observes termination again during close.
     void stopWorker().catch(() => {});
   };
-  const resolveAuthority = async (request: SessionCatalogAuthorityRequest) =>
-    request.type === "plan"
-      ? input.resolvePlanProfile(request.input)
-      : input.inspectMcpInputs(request.sessionId);
   const handleMessage = (message: SessionCatalogWorkerEvent) => {
     if (closed || failed) return;
     if (message.type === "update") {
+      workerSnapshot = message.snapshot;
       if (message.snapshot.phase === "failed") {
         latest = message.snapshot;
         fail(message.snapshot.error?.code ?? "catalog_scan_failed");
         return;
       }
-      publish(message.snapshot);
+      publish(pages.size > 0 ? { ...message.snapshot, phase: "loading" } : message.snapshot);
       return;
     }
     if (message.type === "page_settled") {
       const page = pages.get(message.id);
       pages.delete(message.id);
+      if (pages.size === 0 && workerSnapshot !== undefined) publish(workerSnapshot);
       if (message.ok) page?.resolve();
       else page?.reject(new SessionLifecycleError("session_invalid"));
       return;
     }
     // The worker sends only already-parsed profile identities, never tool calls or full histories.
-    void resolveAuthority(message.request)
-      .then(
-        (value) => {
-          if (closed || failed) return;
-          worker?.postMessage({
-            type: "authority_result",
-            id: message.id,
-            result: { ok: true, value },
-          } satisfies SessionCatalogWorkerRequest);
-        },
-        (error: unknown) => {
-          if (closed || failed) return;
-          worker?.postMessage({
-            type: "authority_result",
-            id: message.id,
-            result: {
-              ok: false,
-              code:
-                error instanceof SessionLifecycleError
-                  ? error.code
-                  : error instanceof SessionStoreError &&
-                      (error.code === "session_log_invalid" ||
-                        error.code === "session_log_too_large")
-                    ? error.code
-                    : null,
-            },
-          } satisfies SessionCatalogWorkerRequest);
-        },
-      )
+    void resolveSessionInspectionAuthority(input, message.request)
+      .then((result) => {
+        if (closed || failed) return;
+        worker?.postMessage({
+          type: "authority_result",
+          id: message.id,
+          result,
+        } satisfies SessionCatalogWorkerRequest);
+      })
       .catch(() => fail("catalog_scan_failed"));
   };
   const started = (async () => {
@@ -214,12 +183,18 @@ export function startNativeSessionCatalog(
     async loadMore(cursor) {
       await started;
       if (closed) throw new DOMException("The history catalog was closed.", "AbortError");
-      if (failed || worker === undefined || latest?.nextCursor !== cursor) {
+      if (
+        failed ||
+        worker === undefined ||
+        latest.phase !== "ready" ||
+        latest.nextCursor !== cursor
+      ) {
         throw new SessionLifecycleError("session_invalid");
       }
       const id = ++nextPageId;
       const page = Promise.withResolvers<void>();
       pages.set(id, page);
+      publish({ ...latest, phase: "loading" });
       worker.postMessage({ type: "load_more", id, cursor } satisfies SessionCatalogWorkerRequest);
       return page.promise;
     },

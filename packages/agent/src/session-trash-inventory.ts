@@ -5,7 +5,10 @@ import {
 } from "./managed-agent-folds.js";
 import { validateManagedChildGenesis } from "./managed-agent-recovery.js";
 import { isGenesisRecord, sessionNamingStateFromRecords } from "./session-history-folds.js";
-import { validateCurrentSessionHistory } from "./session-history-validation.js";
+import {
+  createSessionHistoryValidator,
+  validateCurrentSessionHistory,
+} from "./session-history-validation.js";
 import type {
   SessionGenesisRecord,
   SessionRecord,
@@ -52,6 +55,7 @@ export function validateTrashChildHistory(input: {
   readonly records: readonly SessionRecord[];
   readonly projectId: string;
   readonly workspaceRoot: string;
+  readonly validateHistory?: ReturnType<typeof createSessionHistoryValidator>;
 }): SessionGenesisRecord | undefined {
   const { admission, controls, records } = input;
   const outcome = controls.find(
@@ -93,7 +97,9 @@ export function validateTrashChildHistory(input: {
       `Child ${admission.childSessionId} has missing or unprovable historical ownership.`,
     );
   validateManagedChildGenesis(admission, genesis, records);
-  validateCurrentSessionHistory(genesis, records, input.workspaceRoot);
+  if (input.validateHistory === undefined)
+    validateCurrentSessionHistory(genesis, records, input.workspaceRoot);
+  else input.validateHistory(genesis, records);
   if (
     outcome.event.transcript.sequence !== records.at(-1)?.sequence ||
     outcome.event.transcript.digest !== managedTranscriptLink(records).digest
@@ -115,11 +121,14 @@ export async function inspectSessionTrashUnit(input: {
   readonly trash: SessionTrashCatalog;
   readonly archived: boolean;
   readonly draftThreadIds: readonly string[];
+  readonly validateHistory?: ReturnType<typeof createSessionHistoryValidator>;
 }): Promise<{
   readonly unit: SessionTrashUnit;
   readonly specs: readonly SessionTrashFileSpec[];
   readonly blockers: readonly SessionTrashBlocker[];
 }> {
+  const validateHistory =
+    input.validateHistory ?? createSessionHistoryValidator(input.workspaceRoot);
   if (input.trash.diagnostics.length > 0)
     throw new SessionTrashError(
       "unavailable",
@@ -136,7 +145,7 @@ export async function inspectSessionTrashUnit(input: {
       "conflict",
       "Select a current Main session whose ownership can be proved.",
     );
-  validateCurrentSessionHistory(genesis, records, input.workspaceRoot);
+  validateHistory(genesis, records);
   const legacy = await input.controlStore.readLegacy();
   if (
     legacy.some(
@@ -185,7 +194,8 @@ export async function inspectSessionTrashUnit(input: {
   const observedChildren = new Map<string, readonly SessionRecord[]>();
   for (const entry of await input.childDirectory.listSessionEntries()) {
     const history = await readSessionTrashRecords(input.childDirectory, entry.sessionId);
-    observedChildren.set(entry.sessionId, history);
+    // Unrelated histories contribute compact ownership edges, not retained full transcripts.
+    if (members.has(entry.sessionId)) observedChildren.set(entry.sessionId, history);
     const admission = admissions.find((record) => record.childSessionId === entry.sessionId);
     const retained = input.trash.transactions.find(
       (transaction) =>
@@ -206,6 +216,7 @@ export async function inspectSessionTrashUnit(input: {
           records: history,
           projectId: genesis.record.projectId,
           workspaceRoot: input.workspaceRoot,
+          validateHistory,
         });
       else if (
         !retained?.files.some(
@@ -257,6 +268,7 @@ export async function inspectSessionTrashUnit(input: {
       records: history,
       projectId: genesis.record.projectId,
       workspaceRoot: input.workspaceRoot,
+      validateHistory,
     });
     if (childGenesis !== undefined)
       for (const source of sources(childGenesis)) if (!members.has(source)) unitSources.add(source);
@@ -287,7 +299,7 @@ export async function inspectSessionTrashUnit(input: {
         "conflict",
         `Session ${entry.sessionId} has invalid or overlapping Main ownership.`,
       );
-    validateCurrentSessionHistory(first, history, input.workspaceRoot);
+    validateHistory(first, history);
     graph.set(entry.sessionId, sources(first));
     names.set(entry.sessionId, sessionNamingStateFromRecords(history).displayLabel);
   }

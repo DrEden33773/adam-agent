@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import {
   createPermissionPolicy,
   createPresentationSession,
@@ -12,6 +13,7 @@ import {
 import {
   createRecoverableTurnDraftRepository,
   sessionDraftMutation,
+  sessionHistoryWorkerFactory,
   sessionManagedControl,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
@@ -22,6 +24,82 @@ import {
   modelTargetsWithDriver,
   sessionLifecycleTargetIdentity as targetIdentity,
 } from "./session-lifecycle.test-support.js";
+
+test.each(["worker-exit", "dismissed-preview"] as const)(
+  "history ownership is released without moving logs after %s",
+  async (failure) => {
+    const root = await mkdtemp(join(tmpdir(), "adam-history-inspection-failure-"));
+    const workspaceRoot = join(root, "project");
+    const stateRoot = join(root, "state");
+    await mkdir(workspaceRoot);
+    const exited = Promise.withResolvers<void>();
+    let first = true;
+    const lifecycle = createSessionLifecycleForTests({
+      workspaceRoot,
+      stateRoot,
+      managedControl: await createProductionManagedControlComposition({ workspaceRoot, stateRoot }),
+      modelTargets: modelTargetsWithDriver(
+        new FakeModelDriver([
+          { type: "text_delta", text: "Retained answer." },
+          { type: "finish", reason: "stop" },
+        ]),
+      ),
+      [sessionHistoryWorkerFactory]: (url, options) => {
+        const worker = new Worker(url, options);
+        if (first && failure === "worker-exit") {
+          const post = worker.postMessage.bind(worker);
+          worker.once("exit", () => exited.resolve());
+          worker.postMessage = (...args: Parameters<Worker["postMessage"]>) => {
+            if (args[0]?.type === "start") void worker.terminate();
+            else post(...args);
+          };
+        }
+        first = false;
+        return worker;
+      },
+    });
+    try {
+      const main = await lifecycle.create({ targetIdentity });
+      await lifecycle.continue({ sessionId: main.sessionId, input: { text: "Retained history" } });
+      const path = join(
+        stateRoot,
+        "projects",
+        main.projectId.slice(7),
+        "sessions",
+        `${main.sessionId}.jsonl`,
+      );
+      const original = await readFile(path);
+      const controller = new AbortController();
+      const preview = await lifecycle.previewSessionTrash({
+        sessionId: main.sessionId,
+        signal: controller.signal,
+      });
+      if (failure === "worker-exit") {
+        await withManagedFailureGuard(exited.promise, "failed history worker exit");
+        expect(preview.previewId).toBeNull();
+        expect(preview.blockers).not.toHaveLength(0);
+      } else {
+        if (preview.previewId === null) throw new Error("Expected an authoritative preview.");
+        controller.abort();
+        expect(await lifecycle.confirmSessionTrash({ previewId: preview.previewId })).toEqual({
+          status: "stale",
+        });
+      }
+      expect((await readFile(path)).equals(original)).toBe(true);
+      expect((await lifecycle.listSessionTrash()).items).toEqual([]);
+      expect(
+        await lifecycle.setSessionVisibility({
+          sessionId: main.sessionId,
+          visibility: "archived",
+          expectedRevision: 0,
+        }),
+      ).toMatchObject({ status: "updated" });
+    } finally {
+      await lifecycle.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("Lifecycle Trash restores Todo, canonical artifacts and draft resources only after the complete unit validates", async () => {
   const root = await mkdtemp(join(tmpdir(), "adam-trash-lifecycle-"));

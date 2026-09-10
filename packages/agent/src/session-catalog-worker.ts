@@ -1,11 +1,9 @@
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 import { parentPort, workerData } from "node:worker_threads";
-import type { PlanEligibleToolProfileV1 } from "./plan-mode.js";
 import type { ProjectSessionCatalogSnapshot } from "./session-catalog-job.js";
 import type {
-  SessionCatalogAuthorityRequest,
-  SessionCatalogAuthorityResult,
   SessionCatalogWorkerData,
   SessionCatalogWorkerEvent,
   SessionCatalogWorkerRequest,
@@ -15,10 +13,10 @@ import {
   sessionNamingStateFromRecords,
   sessionRunBoundaryFromRecords,
 } from "./session-history-folds.js";
+import { createWorkerSessionInspectionAuthority } from "./session-inspection-authority.js";
 import {
   createReadOnlySessionInspector,
   type ProjectSessionSummary,
-  type ReadOnlySessionMcpInputs,
   type SessionHistoryDiagnostic,
   sessionHistoryDiagnosticFromError,
 } from "./session-lifecycle.js";
@@ -27,7 +25,6 @@ import {
   createJsonlSessionStoreDirectory,
   type SessionRecord,
   type SessionStoreDirectoryEntry,
-  SessionStoreError,
 } from "./session-store.js";
 import { createSessionTrashRepository } from "./session-trash.js";
 import { createSessionTrashAccess } from "./session-trash-guards.js";
@@ -43,37 +40,12 @@ const input = workerData as SessionCatalogWorkerData;
 const trashAccess = createSessionTrashAccess(createSessionTrashRepository(input));
 let reserved: ReadonlySet<string> = new Set();
 const directory = createJsonlSessionStoreDirectory(input);
+const visibilityRepository = createSessionVisibilityRepository(input);
 const readRecords = async (sessionId: string): Promise<readonly SessionRecord[]> =>
   (await directory.readRecords?.(sessionId)) ?? [];
 const post = (message: SessionCatalogWorkerEvent) => port.postMessage(message);
-const pendingAuthority = new Map<
-  number,
-  ReturnType<typeof Promise.withResolvers<SessionCatalogAuthorityResult>>
->();
-let nextAuthorityId = 0;
-const requestAuthority = async (request: SessionCatalogAuthorityRequest) => {
-  const id = ++nextAuthorityId;
-  const pending = Promise.withResolvers<SessionCatalogAuthorityResult>();
-  pendingAuthority.set(id, pending);
-  post({ type: "authority", id, request });
-  const result = await pending.promise;
-  if (!result.ok) {
-    if (result.code === "session_log_invalid" || result.code === "session_log_too_large") {
-      throw new SessionStoreError(result.code);
-    }
-    if (result.code !== null) throw new SessionLifecycleError(result.code);
-    throw new Error("The current session inspection authority is unavailable.");
-  }
-  return result.value;
-};
-const inspect = createReadOnlySessionInspector({
-  options: input,
-  readRecords,
-  resolvePlanProfile: async (query) =>
-    (await requestAuthority({ type: "plan", input: query })) as PlanEligibleToolProfileV1,
-  inspectMcpInputs: async (sessionId) =>
-    (await requestAuthority({ type: "mcp", sessionId })) as ReadOnlySessionMcpInputs,
-});
+const authority = createWorkerSessionInspectionAuthority(post);
+const inspect = createReadOnlySessionInspector({ options: input, readRecords, ...authority });
 let projectId = "";
 let visibility: SessionVisibilitySnapshot = { status: "ready", revision: 0, archived: [] };
 let entries: readonly SessionStoreDirectoryEntry[] = [];
@@ -108,7 +80,14 @@ function cursor(): string | null {
 }
 
 async function publish(error?: ProjectSessionCatalogSnapshot["error"]): Promise<void> {
-  if (error === undefined) await refreshReservations();
+  if (error === undefined) {
+    await refreshReservations();
+    const current = await visibilityRepository.load();
+    if (!isDeepStrictEqual(current, visibility)) {
+      visibility = current;
+      throw new Error("Archive state changed during the history scan.");
+    }
+  }
   const knownDiagnostics = [...diagnostics.values()].sort((left, right) =>
     left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
   );
@@ -247,7 +226,9 @@ async function scanHealth(): Promise<void> {
   pageWork = pageWork.then(async () => {
     if (failed) return;
     // Excluding an invalid visible row must not leave the first page artificially short.
+    phase = "loading";
     await fillPage();
+    phase = "ready";
     health = "complete";
     await publish();
   });
@@ -257,7 +238,7 @@ async function scanHealth(): Promise<void> {
 async function start(): Promise<void> {
   const canonicalRoot = await realpath(input.workspaceRoot);
   projectId = `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
-  visibility = await createSessionVisibilityRepository(input).load();
+  visibility = await visibilityRepository.load();
   const metadata = visibility;
   await refreshReservations();
   entries = [...(await directory.listSessionEntries())]
@@ -286,9 +267,7 @@ port.on("message", (message: SessionCatalogWorkerRequest) => {
     return;
   }
   if (message.type === "authority_result") {
-    const pending = pendingAuthority.get(message.id);
-    pendingAuthority.delete(message.id);
-    pending?.resolve(message.result);
+    authority.receive(message.id, message.result);
     return;
   }
   pageWork = pageWork.then(async () => {
@@ -297,8 +276,10 @@ port.on("message", (message: SessionCatalogWorkerRequest) => {
       return;
     }
     wantedItems += input.limit;
+    phase = "loading";
     try {
       await fillPage();
+      phase = "ready";
       await publish();
       post({ type: "page_settled", id: message.id, ok: true });
     } catch {

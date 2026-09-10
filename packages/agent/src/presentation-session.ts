@@ -20,6 +20,7 @@ import type {
   SessionHistoryDiagnosticsDisplay,
   SessionNaming,
   SessionSummary,
+  SessionSummaryPage,
   SkillCatalogDisplay,
   ToolArgumentsDisplay,
   ToolPreviewDisplay,
@@ -178,7 +179,7 @@ export type PresentationSessionRecordReader = (
 ) => Promise<readonly SessionRecord[]>;
 
 type PresentationSessionBaseOptions = {
-  /** Keep native catalog and path discovery off the interactive startup boundary. */
+  /** Keep native catalog discovery and refresh off the interactive boundary. */
   readonly backgroundStartup?: boolean;
   readonly draftPersistencePolicy?: "process_only" | "recoverable";
   readonly lifecycle: SessionLifecycle;
@@ -233,7 +234,7 @@ export async function createPresentationSession(
   options: CreatePresentationSessionOptions,
 ): Promise<PresentationSession> {
   const startupAbort = new AbortController();
-  let startupCatalog: ProjectSessionCatalogController | undefined;
+  let sessionCatalog: ProjectSessionCatalogController | undefined;
   let startupPaths: Promise<void> | undefined;
   let startupClosing = false;
   options.lifecycle.enableAutomaticTitles();
@@ -2980,6 +2981,19 @@ export async function createPresentationSession(
     };
 
     let visibilityMutation = false;
+    let historyOperation: SessionSummaryPage["operation"];
+    let previewController: AbortController | undefined;
+    let historyViewRevision = 0;
+    const cancelTrashPreview = () => {
+      previewController?.abort();
+      previewController = undefined;
+      pendingTrashView = undefined;
+    };
+    const publishHistoryOperation = (operation: SessionSummaryPage["operation"]) => {
+      historyOperation = operation;
+      state = { ...state, revision: state.revision + 1 };
+      publishStateChange();
+    };
     let historyAction: Promise<void> | undefined;
     let pendingTrashView:
       | {
@@ -2988,20 +3002,190 @@ export async function createPresentationSession(
           readonly managedDrafts: readonly unknown[];
         }
       | undefined;
-    const loadedCatalogDepth = new Map<"active" | "archived" | "trash", number>();
-    const refreshSessionCatalog = async (view: "active" | "archived" | "trash") => {
-      loadedCatalogDepth.set(
-        state.authoritative.sessions.view ?? "active",
-        Math.max(
-          loadedCatalogDepth.get(state.authoritative.sessions.view ?? "active") ?? 0,
-          state.authoritative.sessions.items.length,
-        ),
-      );
-      const wanted = Math.max(catalogPageSize, loadedCatalogDepth.get(view) ?? 0);
-      await startupCatalog?.close();
-      startupCatalog = undefined;
+    type CatalogView = "active" | "archived" | "trash";
+    let deferredCatalogView: CatalogView | undefined;
+    const loadedCatalogDepth = new Map<CatalogView, { summaries: number; rows: number }>();
+    const catalogViews = new Map<CatalogView, SessionSummaryPage>();
+    let catalogGeneration = 0;
+    let catalogClose = Promise.resolve();
+    const withoutCatalogError = (page: SessionSummaryPage): SessionSummaryPage => {
+      const { error: _error, ...rest } = page;
+      return rest;
+    };
+    const rememberCatalog = () => {
+      const page = state.authoritative.sessions;
+      const view = page.view ?? "active";
+      catalogViews.set(view, page);
+      const depth = loadedCatalogDepth.get(view);
+      loadedCatalogDepth.set(view, {
+        summaries: Math.max(depth?.summaries ?? 0, page.items.length),
+        rows: Math.max(depth?.rows ?? 0, page.items.length),
+      });
+    };
+    const stopSessionCatalog = () => {
+      catalogGeneration += 1;
+      const previous = sessionCatalog;
+      sessionCatalog = undefined;
+      catalogClose = Promise.all([catalogClose, previous?.close()]).then(() => undefined);
+      void catalogClose.catch(() => {});
+      return catalogClose;
+    };
+    const applyCatalog = (
+      catalog: ProjectSessionCatalogSnapshot,
+      generation: number,
+      wanted: number,
+    ): void => {
+      if (closed || startupClosing || generation !== catalogGeneration) return;
+      const view = state.authoritative.sessions.view ?? "active";
+      if (catalog.view !== undefined && catalog.view !== view) return;
+      const visibility = state.authoritative.sessions.visibility;
+      if (
+        visibility?.status === "ready" &&
+        catalog.visibility?.status === "ready" &&
+        catalog.visibility.revision < visibility.revision
+      ) {
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            sessions: {
+              ...state.authoritative.sessions,
+              loading: false,
+              visibility: {
+                status: "unknown",
+                message:
+                  "Archive state changed to an older revision. Refresh history before changing visibility.",
+              },
+              health: { ...catalog.health, status: "failed" },
+              nextCursor: null,
+              error: {
+                code: "catalog_scan_failed",
+                message: "The archive snapshot changed during refresh.",
+              },
+            },
+          },
+        };
+        publishStateChange();
+        return;
+      }
+      if (catalog.phase === "loading" && catalog.items.length === 0) return;
+      if (
+        state.authoritative.project.id.length > 0 &&
+        catalog.projectId !== state.authoritative.project.id &&
+        !(catalog.projectId === "" && catalog.phase === "failed")
+      )
+        return;
+      const invalidIds = new Set(catalog.diagnostics.items.map((item) => item.sessionId));
+      const included = new Set<string>();
+      const items = catalog.items.flatMap((item) => {
+        if (item.schemaVersion !== 3) return [];
+        observedCatalogIds.add(item.sessionId);
+        locallyCreatedCatalogIds.delete(item.sessionId);
+        if (!knownTargets.has(item.targetIdentity.targetId))
+          knownTargets.set(item.targetIdentity.targetId, item.targetIdentity);
+        included.add(item.sessionId);
+        const local = locallyUpdatedCatalog.get(item.sessionId);
+        const current = state.authoritative.active?.session;
+        return [
+          current?.id === item.sessionId
+            ? current
+            : local !== undefined && local.throughSequence > item.lastSequence
+              ? local.summary
+              : sessionSummaryFromCatalog(item),
+        ];
+      });
+      for (const [id, local] of locallyUpdatedCatalog) {
+        if (
+          sessionMatchesVisibilityView(id, catalog.visibility, catalog.view) &&
+          locallyCreatedCatalogIds.has(id) &&
+          !included.has(id) &&
+          !invalidIds.has(id)
+        )
+          items.push(local.summary);
+      }
+      const active = state.authoritative.active;
+      if (
+        active !== null &&
+        sessionMatchesVisibilityView(active.session.id, catalog.visibility, catalog.view) &&
+        !items.some((item) => item.id === active.session.id)
+      )
+        items.push(active.session);
+      const retained = state.authoritative.sessions;
+      const failed = catalog.phase === "failed";
+      const sessions: SessionSummaryPage = {
+        ...withoutCatalogError(retained),
+        items: failed
+          ? retained.items.filter((item) =>
+              sessionMatchesVisibilityView(item.id, catalog.visibility, view),
+            )
+          : items,
+        view,
+        ...(catalog.visibility === undefined ? {} : { visibility: catalog.visibility }),
+        nextCursor: failed ? null : catalog.nextCursor,
+        diagnostics: projectSessionHistoryDiagnostics(catalog.diagnostics),
+        loading:
+          catalog.phase === "loading" ||
+          (catalog.phase === "ready" &&
+            catalog.nextCursor !== null &&
+            catalog.items.length < wanted),
+        health: catalog.health,
+        ...(catalog.error === undefined ? {} : { error: catalog.error }),
+      };
+      catalogViews.set(view, sessions);
+      const depth = loadedCatalogDepth.get(view);
+      loadedCatalogDepth.set(view, {
+        summaries: Math.max(depth?.summaries ?? 0, catalog.items.length),
+        rows: Math.max(depth?.rows ?? 0, sessions.items.length),
+      });
+      state = {
+        ...state,
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          project: {
+            ...state.authoritative.project,
+            id: state.authoritative.project.id || catalog.projectId,
+          },
+          sessions,
+        },
+      };
+      publishStateChange();
+    };
+
+    const catalogLoads = new Set<Promise<void>>();
+    const loadSessionCatalog = async (view: CatalogView) => {
+      rememberCatalog();
+      void stopSessionCatalog();
+      const generation = catalogGeneration;
+      const wanted = Math.max(catalogPageSize, loadedCatalogDepth.get(view)?.summaries ?? 0);
+      const retained = catalogViews.get(view);
+      const visibility = state.authoritative.sessions.visibility;
+      if (options.backgroundStartup) {
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            sessions: {
+              ...(retained === undefined ? {} : withoutCatalogError(retained)),
+              view,
+              items:
+                retained?.items.filter((item) =>
+                  sessionMatchesVisibilityView(item.id, visibility, view),
+                ) ?? [],
+              nextCursor: null,
+              ...(visibility === undefined ? {} : { visibility }),
+              loading: true,
+              health: { status: "not_started", checked: 0, total: null },
+            },
+          },
+        };
+        publishStateChange();
+      }
       if (view === "trash") {
         const trash = await options.lifecycle.listSessionTrash();
+        if (generation !== catalogGeneration || closed || startupClosing) return;
         state = {
           ...state,
           revision: state.revision + 1,
@@ -3012,13 +3196,50 @@ export async function createPresentationSession(
               trash,
               items: [],
               nextCursor: null,
-              ...(state.authoritative.sessions.visibility === undefined
-                ? {}
-                : { visibility: state.authoritative.sessions.visibility }),
+              loading: false,
+              ...(visibility === undefined ? {} : { visibility }),
             },
           },
         };
+        catalogViews.set(view, state.authoritative.sessions);
         publishStateChange();
+        return;
+      }
+      if (visibilityMutation) {
+        deferredCatalogView = view;
+        return;
+      }
+      if (options.backgroundStartup) {
+        let filling = false;
+        let latest: ProjectSessionCatalogSnapshot | undefined;
+        const fillLoadedDepth = async () => {
+          if (filling) return;
+          filling = true;
+          try {
+            while (
+              generation === catalogGeneration &&
+              latest?.phase === "ready" &&
+              latest.items.length < wanted &&
+              latest.nextCursor !== null &&
+              sessionCatalog !== undefined
+            ) {
+              await sessionCatalog.loadMore(latest.nextCursor);
+            }
+          } catch {
+            // The controller publishes failures; replacement invalidates this generation.
+          } finally {
+            filling = false;
+          }
+        };
+        sessionCatalog = options.lifecycle.startProjectSessionCatalog({
+          view,
+          limit: catalogPageSize,
+          onUpdate(catalog) {
+            latest = catalog;
+            applyCatalog(catalog, generation, wanted);
+            void fillLoadedDepth();
+          },
+        });
         return;
       }
       let page = await options.lifecycle.listProjectSessionSummaries({
@@ -3026,7 +3247,7 @@ export async function createPresentationSession(
         limit: Math.min(100, wanted),
       });
       const summaries = [...page.items];
-      const visibility = page.visibility;
+      const pageVisibility = page.visibility;
       while (summaries.length < wanted && page.nextCursor !== null) {
         page = await options.lifecycle.listProjectSessionSummaries({
           view,
@@ -3034,14 +3255,15 @@ export async function createPresentationSession(
           limit: Math.min(100, wanted - summaries.length),
         });
         if (
-          page.visibility?.status !== visibility?.status ||
+          page.visibility?.status !== pageVisibility?.status ||
           (page.visibility?.status === "ready" &&
-            visibility?.status === "ready" &&
-            page.visibility.revision !== visibility.revision)
+            pageVisibility?.status === "ready" &&
+            page.visibility.revision !== pageVisibility.revision)
         )
           throw new Error("Archive state changed during catalog refresh.");
         summaries.push(...page.items);
       }
+      if (generation !== catalogGeneration || closed || startupClosing) return;
       state = {
         ...state,
         revision: state.revision + 1,
@@ -3058,7 +3280,93 @@ export async function createPresentationSession(
           },
         },
       };
+      catalogViews.set(view, state.authoritative.sessions);
       publishStateChange();
+    };
+    const refreshSessionCatalog = (view: CatalogView): Promise<void> => {
+      const load = loadSessionCatalog(view);
+      catalogLoads.add(load);
+      void load.finally(() => catalogLoads.delete(load)).catch(() => {});
+      return load;
+    };
+    const retainedTrashRows = new Map<string, SessionSummary>();
+    const visibilityReturn = new Map<
+      string,
+      { summary: SessionSummary; view: "active" | "archived"; index: number }
+    >();
+    const applyVisibilityReceipt = (
+      sessionId: string,
+      visibility: "active" | "archived",
+      snapshot: NonNullable<SessionSummaryPage["visibility"]>,
+    ) => {
+      rememberCatalog();
+      const previous = visibilityReturn.get(sessionId);
+      let moved = previous?.summary;
+      let source:
+        | { summary: SessionSummary; view: "active" | "archived"; index: number }
+        | undefined;
+      for (const view of ["active", "archived"] as const) {
+        const page = catalogViews.get(view);
+        const index = page?.items.findIndex((item) => item.id === sessionId) ?? -1;
+        const summary = index < 0 ? undefined : page?.items[index];
+        if (summary !== undefined) {
+          moved = summary;
+          source = { summary, view, index };
+        }
+      }
+      for (const view of ["active", "archived"] as const) {
+        const page = catalogViews.get(view) ?? { view, items: [], nextCursor: null };
+        const items = page.items.filter(
+          (item) => item.id !== sessionId && sessionMatchesVisibilityView(item.id, snapshot, view),
+        );
+        if (view === visibility && moved !== undefined) {
+          const index = previous?.view === view ? previous.index : 0;
+          items.splice(Math.min(index, items.length), 0, moved);
+        }
+        catalogViews.set(view, {
+          ...page,
+          items: items.slice(0, Math.max(1, loadedCatalogDepth.get(view)?.rows ?? catalogPageSize)),
+          visibility: snapshot,
+          nextCursor: null,
+          loading: true,
+        });
+      }
+      if (source !== undefined) visibilityReturn.set(sessionId, source);
+      const view = state.authoritative.sessions.view ?? "active";
+      state = {
+        ...state,
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          sessions: {
+            ...(catalogViews.get(view) ?? state.authoritative.sessions),
+            visibility: snapshot,
+          },
+        },
+      };
+      publishStateChange();
+    };
+    const retireCatalogSession = (sessionId: string) => {
+      rememberCatalog();
+      const summary = [...catalogViews.values()]
+        .flatMap((page) => page.items)
+        .find((item) => item.id === sessionId);
+      if (summary !== undefined) retainedTrashRows.set(sessionId, summary);
+      for (const [view, page] of catalogViews)
+        catalogViews.set(view, {
+          ...page,
+          items: page.items.filter((item) => item.id !== sessionId),
+        });
+      state = {
+        ...state,
+        authoritative: {
+          ...state.authoritative,
+          sessions: {
+            ...state.authoritative.sessions,
+            items: state.authoritative.sessions.items.filter((item) => item.id !== sessionId),
+          },
+        },
+      };
     };
     const detachHistorySession = async (sessionId: string) => {
       if (state.authoritative.active?.session.id !== sessionId) return;
@@ -3084,6 +3392,24 @@ export async function createPresentationSession(
           message: "The presentation session is closed.",
         };
       }
+      if (command.type === "cancel_session_trash_preview") {
+        cancelTrashPreview();
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "set_session_view") {
+        historyViewRevision += 1;
+        cancelTrashPreview();
+        try {
+          await refreshSessionCatalog(command.view);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The session list could not be refreshed.",
+          };
+        }
+      }
       if (visibilityMutation)
         return {
           status: "rejected",
@@ -3091,7 +3417,6 @@ export async function createPresentationSession(
           message: "Wait for the session history operation to finish.",
         };
       if (
-        command.type === "set_session_view" ||
         command.type === "set_session_visibility" ||
         command.type === "preview_session_trash" ||
         command.type === "confirm_session_trash" ||
@@ -3099,9 +3424,26 @@ export async function createPresentationSession(
         command.type === "continue_session_trash"
       ) {
         visibilityMutation = true;
+        const viewRevision = historyViewRevision;
+        publishHistoryOperation(
+          command.type === "set_session_visibility"
+            ? "archive"
+            : command.type === "preview_session_trash"
+              ? "trash_preview"
+              : command.type === "confirm_session_trash"
+                ? "trash"
+                : "restore",
+        );
         const settled = Promise.withResolvers<void>();
         historyAction = settled.promise;
+        const preview =
+          command.type === "preview_session_trash" ? new AbortController() : undefined;
+        if (preview !== undefined) {
+          cancelTrashPreview();
+          previewController = preview;
+        }
         try {
+          await stopSessionCatalog();
           if (command.type === "preview_session_trash") {
             pendingTrashView = undefined;
             if (activeRun !== undefined || !currentTurnDraftSettled())
@@ -3116,7 +3458,16 @@ export async function createPresentationSession(
             await persistSettledCurrentTurnDraft();
             await recoverableDrafts?.flush();
             await Promise.all(managedDraftWrites);
-            const preview = await options.lifecycle.previewSessionTrash(command);
+            const result = await options.lifecycle.previewSessionTrash({
+              ...command,
+              ...(preview === undefined ? {} : { signal: preview.signal }),
+            });
+            if (preview?.signal.aborted || previewController !== preview)
+              return {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The Trash preview was dismissed.",
+              };
             if (
               turnComposer.snapshot().revision !== composerRevision ||
               !isDeepStrictEqual(drafts, [...managedDrafts])
@@ -3127,12 +3478,12 @@ export async function createPresentationSession(
                 message:
                   "A draft changed while preparing the preview. Review it and preview Trash again.",
               };
-            pendingTrashView = { preview, composerRevision, managedDrafts: drafts };
+            pendingTrashView = { preview: result, composerRevision, managedDrafts: drafts };
             return {
               status: "admitted",
               commandId: randomUUID(),
               resource: null,
-              trashPreview: preview,
+              trashPreview: result,
             };
           }
           if (
@@ -3155,6 +3506,7 @@ export async function createPresentationSession(
                 message: "The preview or a draft changed. Preview Trash again before confirming.",
               };
             pendingTrashView = undefined;
+            previewController = undefined;
             const result =
               command.type === "confirm_session_trash"
                 ? await options.lifecycle.confirmSessionTrash(command)
@@ -3165,11 +3517,13 @@ export async function createPresentationSession(
               command.type === "confirm_session_trash" &&
               pending !== undefined &&
               (result.status === "completed" || result.status === "incomplete")
-            )
+            ) {
+              if (result.status === "incomplete") retireCatalogSession(pending.preview.sessionId);
               await detachHistorySession(pending.preview.sessionId);
+            }
             if (result.status !== "completed") {
               await refreshSessionCatalog(
-                result.status === "incomplete"
+                result.status === "incomplete" && historyViewRevision === viewRevision
                   ? "trash"
                   : (state.authoritative.sessions.view ?? "active"),
               );
@@ -3183,12 +3537,38 @@ export async function createPresentationSession(
               };
             }
             const manifest = result.manifest;
+            if (manifest.phase === "restored") {
+              const summary = retainedTrashRows.get(manifest.unit.mainSessionId);
+              if (summary !== undefined) {
+                const destination = manifest.unit.archived ? "archived" : "active";
+                const page = catalogViews.get(destination) ?? {
+                  view: destination,
+                  items: [],
+                  nextCursor: null,
+                };
+                catalogViews.set(destination, {
+                  ...page,
+                  items: [summary, ...page.items.filter((item) => item.id !== summary.id)],
+                });
+                if ((state.authoritative.sessions.view ?? "active") === destination)
+                  state = {
+                    ...state,
+                    authoritative: {
+                      ...state.authoritative,
+                      sessions: catalogViews.get(destination) as SessionSummaryPage,
+                    },
+                  };
+                retainedTrashRows.delete(summary.id);
+              }
+            } else retireCatalogSession(manifest.unit.mainSessionId);
             await refreshSessionCatalog(
-              manifest.phase === "restored"
-                ? manifest.unit.archived
-                  ? "archived"
-                  : "active"
-                : "trash",
+              historyViewRevision !== viewRevision
+                ? (state.authoritative.sessions.view ?? "active")
+                : manifest.phase === "restored"
+                  ? manifest.unit.archived
+                    ? "archived"
+                    : "active"
+                  : "trash",
             );
             return {
               status: "admitted",
@@ -3205,9 +3585,7 @@ export async function createPresentationSession(
               },
             };
           }
-          if (command.type === "set_session_view") {
-            await refreshSessionCatalog(command.view);
-          } else {
+          {
             if (activeRun !== undefined)
               return {
                 status: "rejected",
@@ -3237,6 +3615,8 @@ export async function createPresentationSession(
                     : result.message,
               };
             }
+            if (options.backgroundStartup)
+              applyVisibilityReceipt(command.sessionId, command.visibility, result.snapshot);
             if (command.visibility === "archived") await detachHistorySession(command.sessionId);
             await refreshSessionCatalog(state.authoritative.sessions.view ?? "active");
             return {
@@ -3250,8 +3630,13 @@ export async function createPresentationSession(
               },
             };
           }
-          return { status: "admitted", commandId: randomUUID(), resource: null };
         } catch {
+          if (preview?.signal.aborted)
+            return {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The Trash preview was dismissed.",
+            };
           return {
             status: "rejected",
             code: "persistence_failed",
@@ -3260,6 +3645,13 @@ export async function createPresentationSession(
           };
         } finally {
           visibilityMutation = false;
+          publishHistoryOperation(undefined);
+          if (!closed && !startupClosing) {
+            // Restarts only catalog display work; history mutation has already settled.
+            const view = deferredCatalogView ?? state.authoritative.sessions.view ?? "active";
+            deferredCatalogView = undefined;
+            await refreshSessionCatalog(view).catch(() => {});
+          }
           settled.resolve();
           if (historyAction === settled.promise) historyAction = undefined;
         }
@@ -6378,8 +6770,8 @@ export async function createPresentationSession(
           };
         }
         try {
-          if (startupCatalog !== undefined) {
-            await startupCatalog.loadMore(command.after);
+          if (sessionCatalog !== undefined) {
+            await sessionCatalog.loadMore(command.after);
             return { status: "admitted", commandId: randomUUID(), resource: null };
           }
           const page = await options.lifecycle.listProjectSessionSummaries({
@@ -7010,76 +7402,7 @@ export async function createPresentationSession(
     };
 
     if (options.backgroundStartup) {
-      const applyCatalog = (catalog: ProjectSessionCatalogSnapshot): void => {
-        if (closed || startupClosing) return;
-        if (
-          state.authoritative.project.id.length > 0 &&
-          catalog.projectId !== state.authoritative.project.id &&
-          !(catalog.projectId === "" && catalog.phase === "failed")
-        )
-          return;
-        const invalidIds = new Set(catalog.diagnostics.items.map((item) => item.sessionId));
-        const included = new Set<string>();
-        const items = catalog.items.flatMap((item) => {
-          if (item.schemaVersion !== 3) return [];
-          observedCatalogIds.add(item.sessionId);
-          locallyCreatedCatalogIds.delete(item.sessionId);
-          if (!knownTargets.has(item.targetIdentity.targetId))
-            knownTargets.set(item.targetIdentity.targetId, item.targetIdentity);
-          included.add(item.sessionId);
-          const local = locallyUpdatedCatalog.get(item.sessionId);
-          const current = state.authoritative.active?.session;
-          return [
-            current?.id === item.sessionId
-              ? current
-              : local !== undefined && local.throughSequence > item.lastSequence
-                ? local.summary
-                : sessionSummaryFromCatalog(item),
-          ];
-        });
-        for (const [id, local] of locallyUpdatedCatalog) {
-          if (
-            sessionMatchesVisibilityView(id, catalog.visibility, catalog.view) &&
-            locallyCreatedCatalogIds.has(id) &&
-            !included.has(id) &&
-            !invalidIds.has(id)
-          )
-            items.push(local.summary);
-        }
-        const active = state.authoritative.active;
-        if (
-          active !== null &&
-          sessionMatchesVisibilityView(active.session.id, catalog.visibility, catalog.view) &&
-          !items.some((item) => item.id === active.session.id)
-        )
-          items.push(active.session);
-        state = {
-          ...state,
-          revision: state.revision + 1,
-          authoritative: {
-            ...state.authoritative,
-            project: {
-              ...state.authoritative.project,
-              id: state.authoritative.project.id || catalog.projectId,
-            },
-            sessions: {
-              items,
-              view: catalog.view ?? "active",
-              ...(catalog.visibility === undefined ? {} : { visibility: catalog.visibility }),
-              nextCursor: catalog.nextCursor,
-              diagnostics: projectSessionHistoryDiagnostics(catalog.diagnostics),
-              loading: catalog.phase === "loading",
-              health: catalog.health,
-              ...(catalog.error === undefined ? {} : { error: catalog.error }),
-            },
-          },
-        };
-        publishStateChange();
-      };
-      startupCatalog = options.lifecycle.startProjectSessionCatalog({
-        limit: catalogPageSize,
-        onUpdate: applyCatalog,
-      });
+      await refreshSessionCatalog("active");
       startupPaths = listProjectPaths(options.workspaceRoot, startupAbort.signal)
         .then((paths) => {
           if (closed || startupClosing) return;
@@ -7165,6 +7488,10 @@ export async function createPresentationSession(
             })),
           authoritative: {
             ...state.authoritative,
+            sessions: {
+              ...state.authoritative.sessions,
+              ...(historyOperation === undefined ? {} : { operation: historyOperation }),
+            },
             active:
               visibleActive === null
                 ? null
@@ -7196,9 +7523,11 @@ export async function createPresentationSession(
           return;
         }
         startupClosing = true;
+        cancelTrashPreview();
         await historyAction;
         startupAbort.abort();
-        await startupCatalog?.close();
+        await stopSessionCatalog();
+        await Promise.allSettled(catalogLoads);
         await startupPaths;
         await persistSettledCurrentTurnDraft();
         closed = true;
@@ -7249,7 +7578,7 @@ export async function createPresentationSession(
   } catch (error) {
     startupClosing = true;
     startupAbort.abort();
-    await startupCatalog?.close();
+    await sessionCatalog?.close();
     await startupPaths;
     unsubscribeLifecycle();
     unsubscribeMetadata();

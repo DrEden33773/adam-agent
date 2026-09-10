@@ -1950,7 +1950,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       !sessionPickerDismissed
     ) {
       let handle: { hide(): void } | undefined;
+      let previewGeneration = 0;
+      let previewPending = false;
+      const cancelPreview = () => {
+        previewGeneration += 1;
+        void options.presentation.dispatch({ type: "cancel_session_trash_preview" });
+      };
       const close = (selectedSessionId?: string) => {
+        cancelPreview();
         handle?.hide();
         sessionPicker = undefined;
         sessionPickerRequested = false;
@@ -1965,36 +1972,45 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       let archiveUndo:
         | { sessionId: string; visibility: "active" | "archived"; expectedRevision: number }
         | undefined;
+      let historyActionPending = false;
       const changeArchive = async (input: {
         sessionId: string;
         visibility: "active" | "archived";
         expectedRevision: number;
       }) => {
-        await draftMutationQueue.onIdle();
-        const receipt = await options.presentation.dispatch({
-          type: "set_session_visibility",
-          ...input,
-        });
-        if (receipt.status === "admitted") {
-          picker.rememberSession(input.sessionId, input.visibility);
-          const metadata = receipt.sessionVisibility;
-          archiveUndo =
-            metadata === undefined
-              ? undefined
-              : {
-                  sessionId: input.sessionId,
-                  visibility: input.visibility === "active" ? "archived" : "active",
-                  expectedRevision: metadata.revision,
-                };
-          picker.setNotice(
-            input.visibility === "archived"
-              ? "Session archived. Ctrl+U undo."
-              : "Session unarchived. Ctrl+U undo.",
-          );
-        } else picker.setNotice(receipt.message);
-        renderState();
+        if (historyActionPending || previewPending) return;
+        historyActionPending = true;
+        try {
+          await draftMutationQueue.onIdle();
+          const receipt = await options.presentation.dispatch({
+            type: "set_session_visibility",
+            ...input,
+          });
+          if (receipt.status === "admitted") {
+            picker.rememberSession(input.sessionId, input.visibility);
+            const metadata = receipt.sessionVisibility;
+            archiveUndo =
+              metadata === undefined
+                ? undefined
+                : {
+                    sessionId: input.sessionId,
+                    visibility: input.visibility === "active" ? "archived" : "active",
+                    expectedRevision: metadata.revision,
+                  };
+            picker.setNotice(
+              input.visibility === "archived"
+                ? "Session archived. Ctrl+U undo."
+                : "Session unarchived. Ctrl+U undo.",
+            );
+          } else picker.setNotice(receipt.message);
+          renderState();
+        } catch {
+          picker.setNotice("The archive change could not be confirmed. Reload the session list.");
+          tui.requestRender();
+        } finally {
+          historyActionPending = false;
+        }
       };
-      let trashActionPending = false;
       const changeTrash = async (
         command: Extract<
           PresentationCommand,
@@ -2006,8 +2022,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           }
         >,
       ) => {
-        if (trashActionPending) return;
-        trashActionPending = true;
+        if (historyActionPending) return;
+        historyActionPending = true;
         try {
           await draftMutationQueue.onIdle();
           const receipt = await options.presentation.dispatch(command);
@@ -2030,7 +2046,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           );
           tui.requestRender();
         } finally {
-          trashActionPending = false;
+          historyActionPending = false;
         }
       };
       const picker = new SessionPicker({
@@ -2042,27 +2058,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : { diagnostics: state.authoritative.sessions.diagnostics }),
         theme,
         onClose: () => close(),
+        onCancelPreview: cancelPreview,
         onPreviewTrash(session) {
-          if (trashActionPending) return;
-          void draftMutationQueue
-            .onIdle()
-            .then(() =>
-              options.presentation.dispatch({
+          if (historyActionPending || previewPending) return;
+          previewPending = true;
+          const generation = ++previewGeneration;
+          void (async () => {
+            try {
+              await draftMutationQueue.onIdle();
+              if (generation !== previewGeneration || sessionPicker?.picker !== picker) return;
+              const receipt = await options.presentation.dispatch({
                 type: "preview_session_trash",
                 sessionId: session.id,
-              }),
-            )
-            .then((receipt) => {
-              if (sessionPicker?.picker !== picker) return;
+              });
+              if (generation !== previewGeneration || sessionPicker?.picker !== picker) return;
               if (receipt.status === "admitted" && receipt.trashPreview !== undefined)
                 picker.setTrashPreview(receipt.trashPreview);
               else if (receipt.status === "rejected") picker.setNotice(receipt.message);
               tui.requestRender();
-            })
-            .catch(() => {
-              picker.setNotice("Trash preview is unavailable.");
-              tui.requestRender();
-            });
+            } catch {
+              if (generation === previewGeneration && sessionPicker?.picker === picker) {
+                picker.setNotice("Trash preview is unavailable.");
+                tui.requestRender();
+              }
+            } finally {
+              previewPending = false;
+            }
+          })();
         },
         onConfirmTrash(previewId) {
           void changeTrash({ type: "confirm_session_trash", previewId });
@@ -2075,7 +2097,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
         },
         onView(view) {
+          cancelPreview();
+          picker.setTrashPreview(null);
           void options.presentation.dispatch({ type: "set_session_view", view }).then((receipt) => {
+            if (sessionPicker?.picker !== picker) return;
             if (receipt.status !== "admitted") picker.setNotice(receipt.message);
             renderState();
           });
