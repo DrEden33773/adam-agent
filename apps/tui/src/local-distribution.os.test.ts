@@ -127,26 +127,29 @@ test(
       ).rejects.toThrow("exact installed version");
       const projectA = join(root, "project-a");
       const projectB = join(root, "project-b");
+      const retainedHistory = new Map<string, string>();
       for (const [project, content] of [
         [projectA, "First portable project."],
         [projectB, "Second portable project."],
-      ]) {
-        await mkdir(project ?? "");
-        await writeFile(join(project ?? "", "README.md"), `${content}\n`);
-        await writeFile(join(project ?? "", ".env"), "ADAM_AGENT_TARGET=fake.local\n");
-        await run(cli, ["--trust-workspace"], project);
+      ] as const) {
+        await mkdir(project);
+        await writeFile(join(project, "README.md"), `${content}\n`);
+        await writeFile(join(project, ".env"), "ADAM_AGENT_TARGET=fake.local\n");
+        const trusted = await run(cli, ["--trust-workspace"], project);
+        const { projectId }: { projectId: string } = JSON.parse(trusted.stdout);
+        expect(projectId).toMatch(/^sha256:/);
         expect((await run(cli, ["Read this project"], project)).stdout).toBe(`${content}\n`);
+        const directory = join(state, "projects", projectId.slice("sha256:".length), "sessions");
+        const logs = (await readdir(directory)).filter((name) => name.endsWith(".jsonl"));
+        expect(logs).toHaveLength(1);
+        const log = logs[0];
+        if (log === undefined) throw new Error("Missing the project session log");
+        const path = join(directory, log);
+        retainedHistory.set(path, await readFile(path, "utf8"));
+        expect((await run(cli, ["--resume", basename(log, ".jsonl")], project)).stdout).toContain(
+          content,
+        );
       }
-      const logs = (await readdir(state, { recursive: true })).filter(
-        (name) => name.endsWith(".jsonl") && !name.includes("managed"),
-      );
-      expect(logs.length).toBeGreaterThanOrEqual(2);
-      const history = await readFile(join(state, logs[0] ?? ""), "utf8");
-      const matchingProject = history.includes(projectA) ? projectA : projectB;
-      const sessionId = basename(logs[0] ?? "", ".jsonl");
-      expect((await run(cli, ["--resume", sessionId], matchingProject)).stdout).toContain(
-        "portable project",
-      );
 
       const agent = metadata.packages.find(
         (entry: { name: string }) => entry.name === "@adam-agent/agent",
@@ -232,7 +235,8 @@ test(
       await run(process.execPath, [installer, "uninstall", prefix, nextVersion]);
       await run(process.execPath, [installer, "uninstall", prefix, metadata.version]);
       expect(await readFile(join(config, "user-data"), "utf8")).toBe("preserve configuration\n");
-      expect(await readFile(join(state, logs[0] ?? ""), "utf8")).toBe(history);
+      for (const [path, history] of retainedHistory)
+        expect(await readFile(path, "utf8")).toBe(history);
       expect(await readFile(join(projectA, ".env"), "utf8")).toBe("ADAM_AGENT_TARGET=fake.local\n");
       expect(await readdir(join(prefix, "bin"))).toEqual([]);
     } finally {
