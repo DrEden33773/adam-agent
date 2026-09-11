@@ -41,9 +41,6 @@ importers:
       '@adam-agent/agent':
         specifier: workspace:*
         version: link:../../packages/agent
-      '@adam-agent/testkit':
-        specifier: workspace:*
-        version: link:../../packages/testkit
 
   apps/tui:
     dependencies:

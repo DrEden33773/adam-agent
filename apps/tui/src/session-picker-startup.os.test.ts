@@ -137,9 +137,11 @@ test.each([
         projectLabel: "workspace",
       });
       const catalogComplete = Promise.withResolvers<void>();
+      const draftPublished = Promise.withResolvers<void>();
       const seenDrafts: string[] = [];
       const unsubscribe = presentation.subscribe(() => {
         const state = presentation.getState();
+        if (state.composer.renderedText === "Preserve my draft") draftPublished.resolve();
         if (state.draft !== null) seenDrafts.push(state.draft.targetId);
         if (state.authoritative.sessions.health?.status === "complete") catalogComplete.resolve();
       });
@@ -219,6 +221,8 @@ test.each([
           expect(terminal.lines().join("\n")).toContain("Search: Saved");
           expect(presentation.getState().authoritative.active).toBeNull();
         } else if (choice === "new") {
+          // The editor frame can precede its asynchronous authoritative draft publication.
+          await guarded(draftPublished.promise, "complete new-session draft publication");
           expect(terminal.lines().join("\n")).toContain("Preserve my draft");
           expect(presentation.getState().composer.renderedText).toBe("Preserve my draft");
           expect(presentation.getState().draft?.targetId).toBe(targetId);

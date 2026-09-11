@@ -41,6 +41,7 @@ test("production phase diagnostics distinguish durable delegation from queued ch
   await workspaceTrust.setTrusted({ projectId: trust.projectId, trusted: true });
   const diagnostics: RuntimePhaseDiagnostic[] = [];
   const release = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
   const running = Promise.withResolvers<void>();
   const allDispatched = Promise.withResolvers<void>();
   const allFollowups = Promise.withResolvers<void>();
@@ -83,7 +84,7 @@ test("production phase diagnostics distinguish durable delegation from queued ch
         childCalls += 1;
         if (childCalls === 8) running.resolve();
         if (childCalls === 9) allDispatched.resolve();
-        await release.promise;
+        await (childCalls === 1 ? releaseFirst.promise : release.promise);
         yield { type: "tool_call_start", id: "child-read", name: "read_file" };
         yield { type: "tool_call_delta", id: "child-read", json: '{"path":"evidence.txt"}' };
         yield { type: "tool_call_end", id: "child-read" };
@@ -187,8 +188,11 @@ test("production phase diagnostics distinguish durable delegation from queued ch
       );
     }
     expect(JSON.stringify(diagnostics)).not.toContain("PRIVATE TASK");
-    release.resolve();
+    // Free one actual slot before observing queued dispatch; the remaining children still
+    // hold theirs. Concurrent settlement of all eight is not this diagnostic boundary.
+    releaseFirst.resolve();
     await guard(allDispatched.promise, "queued child dispatch");
+    release.resolve();
     await guard(allFollowups.promise, "nine child tool followups");
     const childToolEvents = diagnostics.filter(
       (d) => d.stage === "tool_requested" && d.callId === "child-read",
@@ -201,6 +205,7 @@ test("production phase diagnostics distinguish durable delegation from queued ch
     expect(diagnostics.filter((d) => d.stage === "first_child_dispatch")).toHaveLength(9);
   } finally {
     unsubscribe();
+    releaseFirst.resolve();
     release.resolve();
     await runtime.close();
     await rm(root, { recursive: true, force: true });
