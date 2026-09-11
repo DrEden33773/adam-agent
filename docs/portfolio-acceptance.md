@@ -1,6 +1,6 @@
 # Portfolio acceptance and walkthrough
 
-Adam is a Linux-supported source-checkout portfolio checkpoint. The application workspace and CLI/TUI packages are private `0.0.0` packages, not an npm or standalone-binary distribution, and this document does not claim production readiness or semantic release compatibility.
+These checks cover Adam’s Linux source build, local application package, CLI and TUI. The application remains a private workspace package; its [local installer](local-installation.md) distributes prebuilt Node output and production dependencies. The public Extension API follows a separate release lifecycle.
 
 ## Evidence vocabulary
 
@@ -11,18 +11,19 @@ Adam is a Linux-supported source-checkout portfolio checkpoint. The application 
 | Live-provider observed | One bounded run against the recorded exact target and profile. | Universal reliability, comparative quality, or future provider behavior. |
 | Human walkthrough observed | One retained end-to-end workflow with independently checked repository and terminal outcomes. | Unattended autonomy, hostile-workspace safety, or statistical quality. |
 
-`Supported` means the current Linux source-checkout path is part of the required Quality contract. `Experimental` identifies an explicit path that is excluded from certification. `Not implemented` is used for absent behavior rather than implying future compatibility. Certified is an Adam code-level conformance status, not a provider endorsement.
+`Supported` means the current Linux source and local-installation paths are part of the required Quality contract. `Experimental` identifies an explicit path that is excluded from certification. `Not implemented` is used for absent behavior rather than implying future compatibility. Certified is an Adam code-level conformance status, not a provider endorsement.
 
 ## Acceptance matrix
 
 | Claim | Certifying evidence | Supplementary evidence | Failure meaning |
 | --- | --- | --- | --- |
-| Source checkout builds and tests | `pnpm quality:check` passes from an exact clean candidate commit on the required Ubuntu 24.04 hosted runner. | Focused workspace tests and locally recorded toolchain versions make diagnosis reproducible. | The portfolio checkpoint is not reproducible and cannot close. |
+| Source checkout builds and tests | `pnpm quality:check` passes from an exact clean candidate commit on the required Ubuntu 24.04 hosted runner. | Focused workspace tests and locally recorded toolchain versions make diagnosis reproducible. | The source build is not reproducible. |
+| Local installation remains usable after relocation | The local-distribution OS contract exercises packaging, two project roots, real native tools, PTY startup, history and version lifecycle through Quality. | [Screenshot provenance](screenshots.md) records a combined installed workflow with a controlled provider. | Broken dependencies, wrong cwd, lost user data or missing resources block delivery. |
 | TUI terminal lifecycle is reliable | The required real-process and PTY suite passes through Quality and `pnpm test:tui:os` on Linux. | `pnpm test:tui:behavior` isolates renderer-neutral lifecycle and presentation behavior. | A terminal, signal, transport, or restoration failure blocks the claim and merge. |
 | Headless CLI is composable | The CLI process and deterministic coding-flow tests pass through Quality with stdout, stderr, exit, and persisted-state assertions. | A disposable-repository transcript may illustrate the same contract. | Stream separation, terminal status, or coding-flow behavior is not accepted. |
 | Permissions match the documented trust boundary | Approval, built-in path-confinement, shell, MCP, extension, credential, and owner-only state tests pass through Quality. | `/help safety` and the security table make the tested boundary caller-visible. | The affected boundary must be corrected or narrowed before publication. |
 | Sessions resume without implicit continuation | Deterministic CLI and TUI tests prove cold hydration, explicit continuation, and immutable-prefix branching through Quality. | The live walkthrough repeats cold hydration and read-only continuation against one retained public session ID. | Resume semantics are not accepted if hydration invokes a model or effect, or continuation corrupts history. |
-| Live provider completes the bounded walkthrough | One retained exact-candidate run uses `deepseek-v4-flash.direct`, the public fixture, exact-call approvals, a passing focused test, cold resume, and read-only verification. | The credential-free fixture and deterministic target/profile conformance tests constrain interpretation. | The live-provider and human-walkthrough labels remain unobserved; deterministic evidence alone cannot close B9-H1. |
+| Live provider completes the bounded walkthrough | One retained exact-candidate run uses `deepseek-v4-flash.direct`, the public fixture, exact-call approvals, a passing focused test, cold resume, and read-only verification. | The credential-free fixture and deterministic target/profile conformance tests constrain interpretation. | The live-provider and human-walkthrough labels remain unobserved; deterministic evidence alone cannot establish a live-provider observation. |
 | Public claims remain bounded | The public-product contract guard and independent review pass on the exact candidate, and hosted Quality passes before merge. | Manual inspection compares README, runbook, CLI help, TUI process help, and `/help safety`. | Any unsupported distribution, platform, sandbox, parity, effects, API-stability, or model-quality claim blocks publication. |
 
 ## Reproduce the deterministic and terminal gates
@@ -74,7 +75,7 @@ Adam does not claim safe unreviewed shell execution, exactly-once external effec
 
 ## Live coding walkthrough contract
 
-The retained walkthrough uses `deepseek-v4-flash.direct` and the public [`examples/portfolio-walkthrough`](../examples/portfolio-walkthrough) fixture. The fixture has two TypeScript source files, one intentionally failing focused test, a repository `AGENTS.md`, no third-party dependency, and one permitted source file to repair. Never edit the committed fixture in place; prepare a clean disposable Git repository:
+The retained walkthrough uses `deepseek-v4-flash.direct` and the public [`examples/portfolio-walkthrough`](https://github.com/DrEden33773/adam-agent/tree/main/examples/portfolio-walkthrough) fixture. The fixture has two TypeScript source files, one intentionally failing focused test, a repository `AGENTS.md`, no third-party dependency, and one permitted source file to repair. Never edit the committed fixture in place; prepare a clean disposable Git repository:
 
 ```bash
 ADAM_CHECKOUT="$(pwd)"
@@ -112,4 +113,4 @@ The retained walkthrough ran on 2026-08-26 from executable and fixture candidate
 
 ## Closeout interpretation
 
-The observation above certifies the live-provider and human-walkthrough rows only for its exact candidate, target, fixture, prompts, decisions, and checks. B9-H1 closes only when the same publication branch also passes the deterministic and terminal gates, public claims are independently reviewed, hosted Quality passes, and the exact merged `main` commit is verified. A successful fixture or live request alone is not completion evidence.
+The observation above certifies the live-provider and human-walkthrough rows only for its exact candidate, target, fixture, prompts, decisions, and checks. A complete delivery additionally requires that the same publication branch also passes the deterministic and terminal gates, public claims are independently reviewed, hosted Quality passes, and the exact merged `main` commit is verified. A successful fixture or live request alone is not completion evidence.

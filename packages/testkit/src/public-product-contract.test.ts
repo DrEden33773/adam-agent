@@ -23,7 +23,7 @@ const forbiddenPublicClaimPatterns: readonly RegExp[] = [
   /\bAdam makes unreviewed shell (?:execution )?safe\b/iu,
   /\bAdam (?:provides|offers|has) stable public (?:app|application) APIs?\b/iu,
   /\bAdam (?:improves|increases|guarantees) (?:model|provider) quality\b/iu,
-  /\bAdam (?:ships|provides|offers) (?:an? )?installable (?:npm )?(?:CLI|application|app)\b/iu,
+  /\bAdam (?:ships|provides|offers) (?:an? )?installable npm (?:CLI|application|app)\b/iu,
 ];
 
 test("application package metadata keeps the source checkout private", async () => {
@@ -68,10 +68,13 @@ test("the public claim guard recognizes representative positive inversions", () 
     "Adam makes unreviewed shell execution safe.",
     "Adam provides stable public application APIs.",
     "Adam improves model quality.",
-    "Adam ships an installable CLI.",
+    "Adam ships an installable npm CLI.",
   ];
 
   expect(representativeOverclaims.filter((claim) => !isForbiddenPublicClaim(claim))).toEqual([]);
+  expect(
+    isForbiddenPublicClaim("Adam provides an installable CLI for Linux with Node.js 24."),
+  ).toBe(false);
 });
 
 test("agent source files do not import through their own public root facade", async () => {

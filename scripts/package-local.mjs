@@ -116,8 +116,15 @@ export async function packageLocal(output) {
     await mkdir(dirname(link), { recursive: true });
     await symlink(relative(dirname(link), target), link);
   }
-  for (const file of ["LICENSE", "THIRD_PARTY_NOTICES.md", "pnpm-lock.yaml"])
+  for (const file of [
+    "README.md",
+    "AGENTS.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "pnpm-lock.yaml",
+  ])
     await cp(join(root, file), join(bundle, file));
+  await cp(join(root, "docs"), join(bundle, "docs"), { recursive: true });
   await cp(join(root, "patches"), join(bundle, "patches"), { recursive: true });
   await cp(join(root, "scripts", "local-install.mjs"), join(bundle, "install.mjs"));
   for (const [launcher, app] of [

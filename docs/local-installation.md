@@ -15,7 +15,7 @@ node /tmp/adam-unpacked/adam-*/install.mjs install "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Choose a new output directory for each build. The packaging command refreshes all generated output, copies the installed production dependency closure, includes native tools and the Pi patch, checks that symlinks stay inside the package, and writes a gzip tar archive. `local-package.json` records the revision, working-tree status, platform and dependency/license inventory. Dependency licenses, Adam's license and third-party notices travel with the application. The application version identifies the source revision; a package built with local edits also carries `-worktree`.
+Choose a new output directory for each build. The packaging command refreshes all generated output, copies the installed production dependency closure, includes native tools and the Pi patch, checks that symlinks stay inside the package, and writes a gzip tar archive. `local-package.json` records the revision, working-tree status, platform and dependency/license inventory. The README, public guides, screenshots, dependency licenses and third-party notices travel with the application. The application version identifies the source revision; a package built with local edits also carries `-worktree`.
 
 To move the archive, copy the `.tar.gz` file, extract it at the destination, and run its `install.mjs` command there. The archive contains application files; configuration and session history are stored separately.
 
