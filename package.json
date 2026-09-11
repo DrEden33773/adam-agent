@@ -30,7 +30,8 @@
     "test:live:skills": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run packages/testkit/src/agent-skills.live.test.ts --reporter=verbose",
     "typecheck": "tsc -b --pretty false",
     "adam:run": "node apps/cli/dist/main.js",
-    "tui:run": "node apps/tui/dist/main.js"
+    "tui:run": "node apps/tui/dist/main.js",
+    "package:local": "node scripts/package-local.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",

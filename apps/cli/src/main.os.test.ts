@@ -33,7 +33,7 @@ describe("one-shot CLI process help", () => {
         },
         statePersisted: false,
       });
-      expect(result.stdout).toContain("Linux source checkout");
+      expect(result.stdout).toContain("Linux source checkouts and local application packages");
       expect(result.stdout).toContain('ADAM_AGENT_TARGET=fake.local pnpm --silent adam "<prompt>"');
       expect(result.stdout).toContain("pnpm tui");
       expect(result.stdout).toContain("--resume without --continue hydrates only");

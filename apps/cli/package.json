@@ -7,7 +7,6 @@
     "adam-agent": "./dist/main.js"
   },
   "dependencies": {
-    "@adam-agent/agent": "workspace:*",
-    "@adam-agent/testkit": "workspace:*"
+    "@adam-agent/agent": "workspace:*"
   }
 }

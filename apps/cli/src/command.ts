@@ -118,7 +118,7 @@ export function parseCliCommand(arguments_: readonly string[]): CliCommand {
 export function cliUsage(): string {
   return [
     "Adam Agent headless CLI",
-    "Status: Linux source checkout; application packages are private and not an npm or binary distribution.",
+    "Supports Linux source checkouts and local application packages with Node.js 24.",
     "",
     "Usage: adam-agent <prompt>",
     "       adam-agent [--skill <id-or-unique-short-name>]... <prompt>",
@@ -127,6 +127,10 @@ export function cliUsage(): string {
     "       adam-agent --recover-operation <operation-id>",
     "       adam-agent --workspace-trust-status | --trust-workspace | --revoke-workspace-trust",
     "       adam-agent --help | -h",
+    "",
+    "From a local installation (preserves the current project directory):",
+    '  adam-cli "<prompt>"',
+    "  adam",
     "",
     "From a source checkout (builds before launch):",
     '  ADAM_AGENT_TARGET=fake.local pnpm --silent adam "<prompt>"',

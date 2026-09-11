@@ -2,7 +2,7 @@
 
 Adam Agent is a lightweight, inspectable TypeScript coding agent for local software-engineering work.
 
-> **Status:** Adam is a Linux-supported source-checkout portfolio checkpoint. The root application and CLI/TUI packages remain private `0.0.0` workspace packages; this is not an npm package, standalone binary, or production release. The separately published `@adam-agent/extension-api` follows its own versioned release lifecycle.
+> **Status:** Adam supports Linux with Node.js 24, from a source checkout or a [locally built application package](docs/local-installation.md). The root application and CLI/TUI packages remain private `0.0.0` workspace packages. The separately published `@adam-agent/extension-api` follows its own versioned release lifecycle.
 
 ## Quick start
 
