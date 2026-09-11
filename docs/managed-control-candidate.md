@@ -2,7 +2,7 @@
 
 Ordinary TUI and CLI sessions run child threads through `ManagedAgentControl`, the existing `AgentSession` loop, and shared Lifecycle/Presentation owners. The production composition owns one durable Control store and separate child session records.
 
-The same composition provides the public `adam.managed-review@1` contract through OperationHost and the shared reserved Control lane. The Host owns immutable invocation identity, origin resolution, no-tool execution, total deadline, cancellation and settlement. Reviewers expose aggregate lane counts to ordinary Fleet inspection and remain outside Agent handles, controls and Main completion delivery. The [Extension API contract](../packages/extension-api/README.md) documents the wire bounds and failure outcomes.
+The same composition provides the public `adam.managed-review@1` contract through OperationHost and the shared reserved Control lane. The Host owns immutable invocation identity, origin resolution, no-tool execution, total deadline, cancellation and settlement. Reviewers expose aggregate lane counts to ordinary Fleet inspection and remain outside Agent handles, controls and Main completion delivery. The [Extension API contract](https://github.com/DrEden33773/adam-agent/blob/main/packages/extension-api/README.md) documents the wire bounds and failure outcomes.
 
 ## Roles and authority
 
@@ -42,7 +42,7 @@ Task only, Current request and Selected messages govern initial text sharing. Co
 
 ## Task budgets
 
-New version-2 envelopes explicitly use an unbudgeted task policy by default. They do not derive cumulative thread, batch or Session ceilings from a model context window. Choosing a task budget in delegation review creates one immutable grant shared by every member and its continuations, including compaction. The new-turn composer accepts `/budget-add <tokens> <task>` as explicit Owner authorization for an additive grant. It never rewrites the original grant or changes a historical envelope into an unbudgeted one. Current context/output capabilities and explicitly frozen role/reviewer restrictions remain distinct.
+New delegation envelopes explicitly use an unbudgeted task policy by default. They do not derive cumulative thread, batch or Session ceilings from a model context window. Choosing a task budget in delegation review creates one immutable grant shared by every member and its continuations, including compaction. The new-turn composer accepts `/budget-add <tokens> <task>` as explicit Owner authorization for an additive grant. It never rewrites the original grant or changes a historical envelope into an unbudgeted one. Current context/output capabilities and explicitly frozen role/reviewer restrictions remain distinct.
 
 Provider reservations bind exact child transcript boundaries. Missing usage retains spending uncertainty; a late receipt settles once, and a missing accounting link requires inspection rather than a refund. A still-affordable closing request has no tools and reports retained evidence and unfinished work. If no request fits, the outcome retains available evidence and explains the budget stop.
 
