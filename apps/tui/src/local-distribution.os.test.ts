@@ -222,7 +222,10 @@ test(
         await fixture.waitForScreen("History check complete");
         const beforeNewSession = fixture.output().length;
         fixture.write("\r");
-        await fixture.waitForCompleteFrameAfter("DEEPSEEK_API_KEY", beforeNewSession);
+        await fixture.waitForCompleteFrameAfter("Select an exact model target", beforeNewSession);
+        const beforeSetup = fixture.output().length;
+        fixture.write("\r");
+        await fixture.waitForCompleteFrameAfter("DEEPSEEK_API_KEY", beforeSetup);
         fixture.write("\u0011");
         const result = await fixture.closed;
         expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });

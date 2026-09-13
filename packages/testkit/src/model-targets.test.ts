@@ -2197,7 +2197,7 @@ test("the target snapshot reports exact Certified identities and safe credential
     signal: new AbortController().signal,
   });
 
-  expect(snapshot).toEqual({
+  expect({ targets: snapshot.targets.slice(1) }).toEqual({
     targets: [
       {
         identity: {
@@ -2210,10 +2210,11 @@ test("the target snapshot reports exact Certified identities and safe credential
         },
         catalog: {
           displayName: "DeepSeek V4 Flash",
-          summary: "Fast general-purpose coding model.",
+          summary: "Legacy call name, now served by DeepSeek V4.1 Flash.",
           capabilities: ["reasoning", "tool-use"],
           modalities: ["text"],
-          recommended: true,
+          recommended: false,
+          hiddenFromPicker: true,
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
@@ -2286,10 +2287,11 @@ test("the target snapshot reports exact Certified identities and safe credential
         },
         catalog: {
           displayName: "DeepSeek V4 Flash Vision",
-          summary: "Vision-capable coding model for image-aware work.",
+          summary: "Legacy Vision call name, now served by DeepSeek V4.1 Flash.",
           capabilities: ["reasoning", "tool-use"],
           modalities: ["text", "image"],
           recommended: false,
+          hiddenFromPicker: true,
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
@@ -2511,6 +2513,7 @@ test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 re
     targets.snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal }),
   ).resolves.toMatchObject({
     targets: [
+      { identity: { targetId: "deepseek-flash.direct", profileVersion: 4 } },
       {
         identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 3 },
         catalog: { displayName: "DeepSeek V4 Flash", modalities: ["text"] },
@@ -2833,7 +2836,7 @@ test("the target resolver rejects every model identity outside the exact built-i
   expect(error).toMatchObject({
     code: "target_not_found",
     message:
-      "Unknown model target. Choose deepseek-v4-flash.direct, deepseek-v4-pro.direct, deepseek-v4-flash-vision-exp.direct, or the documented Experimental Gateway target.",
+      "Unknown model target. Choose deepseek-flash.direct, deepseek-v4-pro.direct, or the documented Experimental Gateway target.",
   });
 });
 
@@ -2843,7 +2846,7 @@ test("credentials never imply a target when no explicit or legacy selector exist
       name: "ModelTargetError",
       code: "target_not_selected",
       message:
-        "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-flash.direct or ADAM_AGENT_TARGET=fake.local.",
+        "No model target selected. Set ADAM_AGENT_TARGET=deepseek-flash.direct or ADAM_AGENT_TARGET=fake.local.",
     }),
   );
 });
@@ -2881,7 +2884,7 @@ test("the legacy DeepSeek selector rejects a configured model outside the exact 
     expect.objectContaining({
       code: "invalid_selector",
       message:
-        "ADAM_AGENT_MODEL must be deepseek-v4-flash, deepseek-v4-pro, or deepseek-v4-flash-vision-exp when ADAM_AGENT_PROVIDER=deepseek.",
+        "ADAM_AGENT_MODEL must be deepseek-flash, deepseek-v4-flash, deepseek-v4-pro, or deepseek-v4-flash-vision-exp when ADAM_AGENT_PROVIDER=deepseek.",
     }),
   );
 });

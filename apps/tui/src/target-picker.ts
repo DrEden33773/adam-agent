@@ -476,6 +476,7 @@ export class TargetPicker implements Component {
 
   #items(): TargetPickerRow[] {
     return [...this.#targets.values()]
+      .filter((target) => target.hiddenFromPicker !== true)
       .sort((left, right) => this.#compare(left, right))
       .map((target) => {
         const badges = [

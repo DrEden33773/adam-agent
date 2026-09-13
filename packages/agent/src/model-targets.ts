@@ -29,6 +29,7 @@ export type ModelTargetCatalogMetadata = {
   readonly capabilities: readonly ("reasoning" | "tool-use")[];
   readonly modalities: readonly ("text" | "image")[];
   readonly recommended: boolean;
+  readonly hiddenFromPicker?: boolean;
 };
 
 export type ModelTargetSnapshot = {
@@ -101,6 +102,7 @@ export function selectModelTargetId(
   if (environment.ADAM_AGENT_PROVIDER === "deepseek") {
     const modelId = environment.ADAM_AGENT_MODEL ?? "deepseek-v4-pro";
     if (
+      modelId === "deepseek-flash" ||
       modelId === "deepseek-v4-flash" ||
       modelId === "deepseek-v4-pro" ||
       modelId === "deepseek-v4-flash-vision-exp"
@@ -109,7 +111,7 @@ export function selectModelTargetId(
     }
     throw new ModelTargetError(
       "invalid_selector",
-      "ADAM_AGENT_MODEL must be deepseek-v4-flash, deepseek-v4-pro, or deepseek-v4-flash-vision-exp when ADAM_AGENT_PROVIDER=deepseek.",
+      "ADAM_AGENT_MODEL must be deepseek-flash, deepseek-v4-flash, deepseek-v4-pro, or deepseek-v4-flash-vision-exp when ADAM_AGENT_PROVIDER=deepseek.",
     );
   }
   if (environment.ADAM_AGENT_MODEL !== undefined) {
@@ -120,7 +122,7 @@ export function selectModelTargetId(
   }
   throw new ModelTargetError(
     "target_not_selected",
-    "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-flash.direct or ADAM_AGENT_TARGET=fake.local.",
+    "No model target selected. Set ADAM_AGENT_TARGET=deepseek-flash.direct or ADAM_AGENT_TARGET=fake.local.",
   );
 }
 
@@ -224,11 +226,29 @@ const directDeepSeekVisionResponsesV2ModalityProfile: ModelModalityProfile = Obj
   explicitUserImages: "unsupported",
   imageToolResults: "supported",
 });
+const directFlashResponsesTarget: ModelTargetIdentity = Object.freeze({
+  targetId: "deepseek-flash.direct",
+  vendor: "deepseek",
+  modelId: "deepseek-flash",
+  route: "direct",
+  profileVersion: 4,
+  certification: "certified",
+});
+
+function usesDirectResponses(identity: ModelTargetIdentity): boolean {
+  return (
+    sameModelTargetIdentity(identity, directFlashResponsesTarget) ||
+    sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)
+  );
+}
+
 const currentDirectDeepSeekTargets = Object.freeze([
+  directFlashResponsesTarget,
   ...directDeepSeekV3Targets,
   directDeepSeekVisionResponsesV2Target,
 ]);
 const supportedDirectDeepSeekTargets = Object.freeze([
+  directFlashResponsesTarget,
   ...directDeepSeekV3Targets,
   ...directDeepSeekV2Targets,
   ...directDeepSeekV1Targets,
@@ -277,12 +297,20 @@ const experimentalGatewayTarget: ModelTargetIdentity = Object.freeze({
   certification: "experimental",
 });
 
+const currentFlashCatalog: ModelTargetCatalogMetadata = Object.freeze({
+  displayName: "DeepSeek V4.1 Flash",
+  summary: "Vision-capable coding model for text and image-aware work.",
+  capabilities: Object.freeze(["reasoning", "tool-use"] as const),
+  modalities: Object.freeze(["text", "image"] as const),
+  recommended: true,
+});
 const directFlashCatalog: ModelTargetCatalogMetadata = Object.freeze({
   displayName: "DeepSeek V4 Flash",
-  summary: "Fast general-purpose coding model.",
+  summary: "Legacy call name, now served by DeepSeek V4.1 Flash.",
   capabilities: Object.freeze(["reasoning", "tool-use"] as const),
   modalities: Object.freeze(["text"] as const),
-  recommended: true,
+  recommended: false,
+  hiddenFromPicker: true,
 });
 const directProCatalog: ModelTargetCatalogMetadata = Object.freeze({
   displayName: "DeepSeek V4 Pro",
@@ -293,10 +321,11 @@ const directProCatalog: ModelTargetCatalogMetadata = Object.freeze({
 });
 const directVisionCatalog: ModelTargetCatalogMetadata = Object.freeze({
   displayName: "DeepSeek V4 Flash Vision",
-  summary: "Vision-capable coding model for image-aware work.",
+  summary: "Legacy Vision call name, now served by DeepSeek V4.1 Flash.",
   capabilities: Object.freeze(["reasoning", "tool-use"] as const),
   modalities: Object.freeze(["text", "image"] as const),
   recommended: false,
+  hiddenFromPicker: true,
 });
 const experimentalGatewayCatalog: ModelTargetCatalogMetadata = Object.freeze({
   displayName: "Poolside Laguna S 2.1 Free",
@@ -411,7 +440,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       if (identity === undefined) {
         throw new ModelTargetError(
           "target_not_found",
-          "Unknown model target. Choose deepseek-v4-flash.direct, deepseek-v4-pro.direct, deepseek-v4-flash-vision-exp.direct, or the documented Experimental Gateway target.",
+          "Unknown model target. Choose deepseek-flash.direct, deepseek-v4-pro.direct, or the documented Experimental Gateway target.",
         );
       }
       if (identity.certification === "experimental" && !input.allowExperimental) {
@@ -458,13 +487,16 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
         );
       }
       const contextProfile = directDeepSeekContextProfileFor(identity);
-      if (sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)) {
+      if (usesDirectResponses(identity)) {
         return {
           identity,
           contextProfile,
           connectionTest: "supported" as const,
           modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
-          upstreamLifecycle: "experimental" as const,
+          upstreamLifecycle:
+            identity.targetId === directFlashResponsesTarget.targetId
+              ? ("stable" as const)
+              : ("experimental" as const),
           thinkingCapability: createDirectDeepSeekResponsesThinkingCapability(identity),
           driver: new DirectDeepSeekResponsesModelDriver({
             apiKey: options.environment.DEEPSEEK_API_KEY as string,
@@ -539,10 +571,13 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile: directDeepSeekContextProfileFor(identity),
             connectionTest: "supported" as const,
-            ...(sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)
+            ...(usesDirectResponses(identity)
               ? {
                   modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
-                  upstreamLifecycle: "experimental" as const,
+                  upstreamLifecycle:
+                    identity.targetId === directFlashResponsesTarget.targetId
+                      ? ("stable" as const)
+                      : ("experimental" as const),
                 }
               : identity.targetId === directDeepSeekVisionChatV1Target.targetId
                 ? {
@@ -550,10 +585,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
                     upstreamLifecycle: "experimental" as const,
                   }
                 : {}),
-            thinkingCapability: sameModelTargetIdentity(
-              identity,
-              directDeepSeekVisionResponsesV2Target,
-            )
+            thinkingCapability: usesDirectResponses(identity)
               ? createDirectDeepSeekResponsesThinkingCapability(identity)
               : createDirectDeepSeekThinkingCapability(identity),
           })),
@@ -573,6 +605,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
 }
 
 function catalogMetadataFor(identity: ModelTargetIdentity): ModelTargetCatalogMetadata {
+  if (identity.targetId === directFlashResponsesTarget.targetId) return currentFlashCatalog;
   if (identity.targetId === "deepseek-v4-flash.direct") {
     return directFlashCatalog;
   }
@@ -666,6 +699,7 @@ function hasCredential(value: string | undefined): boolean {
 
 function directDeepSeekContextProfileFor(identity: ModelTargetIdentity): ContextProfile {
   if (
+    sameModelTargetIdentity(identity, directFlashResponsesTarget) ||
     identity.targetId === directDeepSeekVisionChatV1Target.targetId ||
     identity.targetId === directDeepSeekVisionResponsesV2Target.targetId
   ) {
@@ -699,6 +733,8 @@ export function modelTargetUsesContextProfile(
   identity: ModelTargetIdentity,
   contextProfile: ContextProfile,
 ): boolean {
+  if (sameModelTargetIdentity(identity, directFlashResponsesTarget))
+    return contextProfile.version === 2;
   const expectedContextProfileVersion =
     identity.vendor === "deepseek" &&
     identity.route === "direct" &&

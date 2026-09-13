@@ -596,6 +596,9 @@ export async function createPresentationSession(
             capabilities: catalog.capabilities,
             modalities: catalog.modalities,
             recommended: catalog.recommended,
+            ...(catalog.hiddenFromPicker === undefined
+              ? {}
+              : { hiddenFromPicker: catalog.hiddenFromPicker }),
             route: target.identity.route,
             certification:
               target.identity.certification === "certified" ? "Certified" : "Experimental",

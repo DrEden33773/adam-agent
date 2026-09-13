@@ -396,9 +396,12 @@ liveTest(
   180_000,
 );
 
-liveTest(
-  "Vision Responses lazy image observes one exact quadrant order through the real resource tool",
-  async () => {
+liveTest.each([
+  { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 2 },
+  { targetId: "deepseek-flash.direct", profileVersion: 4 },
+])(
+  "Vision Responses lazy image observes one exact quadrant order through the real resource tool ($targetId)",
+  async ({ targetId, profileVersion }) => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-vision-responses-"));
     const stateRoot = join(testRoot, "state");
     const workspaceRoot = join(testRoot, "workspace");
@@ -413,8 +416,8 @@ liveTest(
     });
     const target = (
       await modelTargets.snapshot({ signal: new AbortController().signal })
-    ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash-vision-exp.direct");
-    if (target === undefined || target.identity.profileVersion !== 2) {
+    ).targets.find(({ identity }) => identity.targetId === targetId);
+    if (target === undefined || target.identity.profileVersion !== profileVersion) {
       throw new Error("Expected the current exact Vision Responses profile.");
     }
     const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
@@ -442,7 +445,7 @@ liveTest(
       expect(
         records.filter((record) => isRecordType(record, "provider_attempt_started")).at(-1),
       ).toMatchObject({
-        targetIdentity: { profileVersion: 2 },
+        targetIdentity: { targetId, profileVersion },
         projectedContent: {
           version: 1,
           imageToolResults: {
