@@ -1,8 +1,11 @@
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import {
   type ArtifactStore,
   createFileArtifactStagingStore,
   type StagedArtifactReference,
 } from "./artifact-store.js";
+import { inspectExplicitUserImageV1 } from "./image-input.js";
 import {
   ingestLocalInputResourcesV1,
   type StagedInputResourceSelectionV1,
@@ -25,6 +28,7 @@ export type TurnComposerResourceStager = {
     readonly id: string;
     readonly path: string;
     readonly signal: AbortSignal;
+    readonly imageOnly?: boolean;
   }): Promise<StagedInputResourceSelectionV1>;
   stageText?(input: {
     readonly id: string;
@@ -42,6 +46,7 @@ export type TurnComposerResourceStager = {
 
 export async function createFileTurnComposerResourceStager(options: {
   readonly artifactRoot: string;
+  readonly workspaceRoot?: string;
   readonly stageBarrier?: TurnComposerStageBarrier;
 }): Promise<TurnComposerResourceStager> {
   const staging = await createFileArtifactStagingStore({ root: options.artifactRoot });
@@ -49,8 +54,15 @@ export async function createFileTurnComposerResourceStager(options: {
   return {
     async stage(input) {
       let staged: StagedArtifactReference | undefined;
+      let imageError: TypeError | undefined;
       const stagingArtifactStore: ArtifactStore = {
         async write(writeInput) {
+          if (input.imageOnly && inspectExplicitUserImageV1(writeInput.bytes).status !== "valid") {
+            imageError = new TypeError(
+              "The selected image must be a complete PNG or JPEG within the image limits.",
+            );
+            throw imageError;
+          }
           const written = await staging.write({
             bytes: writeInput.bytes,
             mediaType: writeInput.mediaType,
@@ -71,7 +83,15 @@ export async function createFileTurnComposerResourceStager(options: {
                 afterOpened: () => options.stageBarrier?.afterOpen({ signal: input.signal }),
               }),
           runId: input.id,
-          selections: [{ type: "local_file", path: input.path }],
+          selections: [
+            {
+              type: "local_file",
+              path: resolve(
+                options.workspaceRoot ?? process.cwd(),
+                input.path.startsWith("~/") ? resolve(homedir(), input.path.slice(2)) : input.path,
+              ),
+            },
+          ],
           signal: input.signal,
         });
         if (occurrence === undefined || staged === undefined) {
@@ -90,7 +110,7 @@ export async function createFileTurnComposerResourceStager(options: {
         if (staged !== undefined) {
           await staging.discard(staged);
         }
-        throw error;
+        throw imageError ?? error;
       }
     },
     async stageText(input) {

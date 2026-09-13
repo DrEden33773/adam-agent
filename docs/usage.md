@@ -4,7 +4,9 @@ Start `adam` from the project you want to inspect. From a source checkout, build
 
 ## Input and tools
 
-Tab completes slash commands and their supported arguments. `@` completion offers project paths and agent references; accept a row to preserve its precise identity. `/skills` selects Skills for the next turn. A path reference does not attach file bytes: use `/attach <path>` to stage an immutable input resource when needed.
+Tab completes slash commands and their supported arguments. `@` completion offers project paths and agent references; accept a row to preserve its precise identity. Selecting a PNG or JPEG path automatically stages an immutable Image attachment. Typing or pasting `@image.png` also attaches it when you send. Relative paths resolve from the project; absolute and `~/` paths work too. Quote paths containing spaces, for example `@"screenshots/login page.png"` or `@'screenshots/login page.png'`. Code blocks, inline code, escaped `\@` references and email addresses remain text. Other file references remain paths; use `/attach <path>` to attach their bytes. `/skills` selects Skills for the next turn.
+
+Image references use the same image support and limits as `/attach`: PNG/JPEG, one image per turn, up to 8 MiB and 4,096 pixels on either side. A missing, invalid or oversized image keeps the draft available with an error. Remove extra images or select an image-capable target before sending. Image atoms support the existing attachment details, removal and undo actions; their staged bytes survive draft recovery and later changes to the original file.
 
 Tool cards show the prepared action and its outcome. Ctrl+O opens bounded details; Ctrl+T toggles reasoning. Scroll or page upward to inspect earlier content, then return to the bottom to follow new output. `/history` loads earlier turns, `/tree` navigates complete conversation boundaries, and `/copy` copies the assistant answer.
 

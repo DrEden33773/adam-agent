@@ -294,7 +294,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     availability: "idle",
     id: "attach",
     name: "attach",
-    summary: "Stage one exact local file as a linked input resource.",
+    summary: "Attach a local file; PNG/JPEG images also support @path.",
     usage: "/attach <path>",
   },
   {

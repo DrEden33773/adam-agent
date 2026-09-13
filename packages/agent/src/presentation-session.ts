@@ -1065,6 +1065,7 @@ export async function createPresentationSession(
       },
       stager: await createFileTurnComposerResourceStager({
         artifactRoot: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+        workspaceRoot: options.workspaceRoot,
         ...(options[turnComposerStageBarrier] === undefined
           ? {}
           : { stageBarrier: options[turnComposerStageBarrier] }),
@@ -1217,11 +1218,12 @@ export async function createPresentationSession(
         return false;
       }
     };
-    const draftImagesFitExactTarget = (): boolean => {
+    const draftImagesFitExactTarget = (selectedTargetId?: string): boolean => {
       if (!state.composer.resources.some((resource) => resource.kind === "image")) {
         return true;
       }
-      const targetId = state.authoritative.active?.session.targetId ?? state.draft?.targetId;
+      const targetId =
+        selectedTargetId ?? state.authoritative.active?.session.targetId ?? state.draft?.targetId;
       return (
         state.authoritative.targets.items
           .find((candidate) => candidate.targetId === targetId)
@@ -3385,7 +3387,50 @@ export async function createPresentationSession(
       await turnComposer.clear({ preserveRetained: true });
       state = { ...state, composer: projectTurnComposer() };
     };
-    const dispatch = async (command: PresentationCommand): Promise<CommandReceipt> => {
+    let preparingImages: AbortController | undefined;
+    let imagePreparationSettled: Promise<void> = Promise.resolve();
+    const prepareImages = async (
+      includeText: boolean,
+      update?: () => Promise<boolean>,
+    ): Promise<CommandReceipt | undefined> => {
+      if (preparingImages !== undefined)
+        return {
+          status: "rejected",
+          code: "conflict",
+          message: "Another draft preparation is in progress.",
+        };
+      const controller = new AbortController();
+      const settlement = Promise.withResolvers<void>();
+      imagePreparationSettled = settlement.promise;
+      preparingImages = controller;
+      try {
+        if ((await update?.()) === false)
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The structured draft no longer matches the current composer revision.",
+          };
+        controller.signal.throwIfAborted();
+        await turnComposer.prepareImageReferences(
+          { includeText, signal: controller.signal, available: attachmentAvailable },
+          persistCurrentTurnDraft,
+        );
+        controller.signal.throwIfAborted();
+        return undefined;
+      } catch (error) {
+        return {
+          status: "rejected",
+          code: "not_available",
+          message:
+            error instanceof Error ? error.message : "The image references could not be attached.",
+        };
+      } finally {
+        preparingImages = undefined;
+        settlement.resolve();
+        publishStateChange();
+      }
+    };
+    const dispatch = async (inputCommand: PresentationCommand): Promise<CommandReceipt> => {
       if (closed || startupClosing) {
         return {
           status: "rejected",
@@ -3393,6 +3438,42 @@ export async function createPresentationSession(
           message: "The presentation session is closed.",
         };
       }
+      if (preparingImages !== undefined) {
+        if (
+          inputCommand.type === "cancel_run" &&
+          inputCommand.sessionId === (state.authoritative.active?.session.id ?? null)
+        ) {
+          preparingImages.abort();
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        }
+        return {
+          status: "rejected",
+          code: "conflict",
+          message: "Wait for image attachments to finish, or cancel the current preparation.",
+        };
+      }
+      if (inputCommand.type === "direct_delegation" || inputCommand.type === "direct_agent_input") {
+        if (inputCommand.draftRevision !== turnComposer.snapshot().revision)
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message:
+              inputCommand.type === "direct_delegation"
+                ? "Select a current role and retry this exact draft."
+                : "The selected draft changed. Retry the current draft.",
+          };
+        if (activeRun !== undefined || state.composer.sealed)
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "Wait for the current turn before sending this draft.",
+          };
+        const rejected = await prepareImages(true);
+        if (rejected !== undefined) return rejected;
+        inputCommand = { ...inputCommand, draftRevision: turnComposer.snapshot().revision };
+      }
+      const command = inputCommand;
       if (command.type === "cancel_session_trash_preview") {
         cancelTrashPreview();
         return { status: "admitted", commandId: randomUUID(), resource: null };
@@ -3969,6 +4050,13 @@ export async function createPresentationSession(
             id: command.confirmedEnvelope?.origin.id ?? randomUUID(),
           },
         };
+        if (!draftImagesFitExactTarget(role.model))
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              "The selected role target does not support images. Choose an image-capable target or remove the Image atom.",
+          };
         const target = await roleAdministration?.inspectRoleTarget(role.qualifiedId);
         if (target?.status === "unavailable") {
           if (command.confirmedEnvelope !== undefined)
@@ -5603,13 +5691,15 @@ export async function createPresentationSession(
           };
         }
         try {
-          return (await turnComposer.replaceText(command, persistCurrentTurnDraft))
-            ? { status: "admitted", commandId: randomUUID(), resource: null }
-            : {
-                status: "rejected",
-                code: "stale_interaction",
-                message: "The structured draft no longer matches the current composer revision.",
-              };
+          return (
+            (await prepareImages(false, () =>
+              turnComposer.replaceText(command, persistCurrentTurnDraft),
+            )) ?? {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: null,
+            }
+          );
         } catch (error) {
           return {
             status: "rejected",
@@ -5864,7 +5954,10 @@ export async function createPresentationSession(
           command.sessionId !== state.authoritative.active?.session.id ||
           (command.text.trim().length === 0 &&
             state.composer.pastedTexts.length === 0 &&
-            !state.composer.elements.some((element) => element.type === "skill"))
+            !state.composer.elements.some(
+              (element) =>
+                element.type === "skill" || element.type === "resource" || element.type === "path",
+            ))
         ) {
           return {
             status: "rejected",
@@ -5918,8 +6011,19 @@ export async function createPresentationSession(
             };
           }
         }
+        let submittedText = command.text;
+        if (turnComposer.hasImageReferences(command.text)) {
+          const imageFailure = await prepareImages(true, () =>
+            turnComposer.commitText(command.text, persistCurrentTurnDraft).then(() => true),
+          );
+          if (imageFailure !== undefined) return imageFailure;
+          submittedText = turnComposer
+            .snapshot()
+            .elements.flatMap((element) => (element.type === "text" ? [element.text] : []))
+            .join("");
+        }
         const skillResolution = preflightSubmittedSkills({
-          text: command.text,
+          text: submittedText,
           explicitQualifiedIds: command.skills,
           catalog: state.authoritative.active.skills,
           elements: state.composer.elements,
@@ -5935,7 +6039,7 @@ export async function createPresentationSession(
               "The exact target does not support images. Switch targets or remove the Image atom.",
           };
         }
-        if (!expandedDraftFitsExactTarget(command.text)) {
+        if (!expandedDraftFitsExactTarget(submittedText)) {
           return {
             status: "rejected",
             code: "not_available",
@@ -5961,7 +6065,7 @@ export async function createPresentationSession(
         publishStateChange();
         let sealedDraft: Awaited<ReturnType<TurnComposer["seal"]>>;
         try {
-          turnComposer.setText(command.text);
+          turnComposer.setText(submittedText);
           sealedDraft = await turnComposer.seal(controller.signal);
           await persistCurrentTurnDraft();
         } catch (error) {
@@ -6100,7 +6204,10 @@ export async function createPresentationSession(
           draft === null ||
           (command.text.trim().length === 0 &&
             state.composer.pastedTexts.length === 0 &&
-            !state.composer.elements.some((element) => element.type === "skill"))
+            !state.composer.elements.some(
+              (element) =>
+                element.type === "skill" || element.type === "resource" || element.type === "path",
+            ))
         ) {
           return {
             status: "rejected",
@@ -6130,8 +6237,19 @@ export async function createPresentationSession(
             message: "The exact draft target is no longer available.",
           };
         }
+        let submittedText = command.text;
+        if (turnComposer.hasImageReferences(command.text)) {
+          const imageFailure = await prepareImages(true, () =>
+            turnComposer.commitText(command.text, persistCurrentTurnDraft).then(() => true),
+          );
+          if (imageFailure !== undefined) return imageFailure;
+          submittedText = turnComposer
+            .snapshot()
+            .elements.flatMap((element) => (element.type === "text" ? [element.text] : []))
+            .join("");
+        }
         const skillResolution = preflightSubmittedSkills({
-          text: command.text,
+          text: submittedText,
           explicitQualifiedIds: command.skills,
           catalog: draft.skills,
           elements: state.composer.elements,
@@ -6147,7 +6265,7 @@ export async function createPresentationSession(
               "The exact target does not support images. Switch targets or remove the Image atom.",
           };
         }
-        if (!expandedDraftFitsExactTarget(command.text)) {
+        if (!expandedDraftFitsExactTarget(submittedText)) {
           return {
             status: "rejected",
             code: "not_available",
@@ -6173,7 +6291,7 @@ export async function createPresentationSession(
         publishStateChange();
         let sealedDraft: Awaited<ReturnType<TurnComposer["seal"]>>;
         try {
-          turnComposer.setText(command.text);
+          turnComposer.setText(submittedText);
           sealedDraft = await turnComposer.seal(controller.signal);
           await persistCurrentTurnDraft();
         } catch (error) {
@@ -7459,17 +7577,21 @@ export async function createPresentationSession(
           visibleActive = lastKnown;
         }
         const phase =
-          activeRun !== undefined
-            ? activeRun.controller.signal.aborted
+          preparingImages !== undefined
+            ? preparingImages.signal.aborted
               ? ("cancelling" as const)
-              : activeRun.recovery
-                ? ("recovering" as const)
-                : ("running" as const)
-            : active?.session.status === "interrupted" ||
-                (currentFailure !== undefined &&
-                  state.authoritative.continuity.status !== "current")
-              ? ("interrupted" as const)
-              : ("ready" as const);
+              : ("running" as const)
+            : activeRun !== undefined
+              ? activeRun.controller.signal.aborted
+                ? ("cancelling" as const)
+                : activeRun.recovery
+                  ? ("recovering" as const)
+                  : ("running" as const)
+              : active?.session.status === "interrupted" ||
+                  (currentFailure !== undefined &&
+                    state.authoritative.continuity.status !== "current")
+                ? ("interrupted" as const)
+                : ("ready" as const);
         return {
           ...state,
           ...(executionFailure !== undefined && executionFailure.sessionId === active?.session.id
@@ -7524,6 +7646,8 @@ export async function createPresentationSession(
           return;
         }
         startupClosing = true;
+        preparingImages?.abort();
+        await imagePreparationSettled;
         cancelTrashPreview();
         await historyAction;
         startupAbort.abort();
