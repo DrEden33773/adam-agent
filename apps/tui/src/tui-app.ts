@@ -5462,7 +5462,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         renderState();
         return;
       }
-      const draftRevision = state.composer.draftRevision;
+      let draftRevision = state.composer.draftRevision;
       const prepareActionId = showNotice(
         "progress",
         `Preparing input for ${first.handle}…`,
@@ -5471,6 +5471,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       void options.presentation
         .dispatch({ type: "direct_agent_input", draftRevision })
         .then((receipt) => {
+          draftRevision = options.presentation.getState().composer.draftRevision;
           settleNoticeClear(prepareActionId);
           if (receipt.status === "rejected") {
             editor.disableSubmit = false;
@@ -5586,7 +5587,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     if (first?.type === "mention" && first.kind === "role") {
-      const draftRevision = state.composer.draftRevision;
+      let draftRevision = state.composer.draftRevision;
       const directTarget = targetForState(state);
       const thinkingSelection = thinkingSelectionFor(
         directTarget,
@@ -5596,6 +5597,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       void options.presentation
         .dispatch({ type: "direct_delegation", draftRevision, thinkingSelection })
         .then((receipt) => {
+          draftRevision = options.presentation.getState().composer.draftRevision;
           settleNoticeClear(prepareActionId);
           if (receipt.status === "rejected") {
             if (receipt.code === "stale_interaction") {
@@ -5991,13 +5993,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             selectedSkills.clear();
             settleNoticeClear(submitActionId);
           } else {
-            editor.setText(text);
+            if (
+              !options.presentation
+                .getState()
+                .composer.elements.some((element) => element.type !== "text")
+            )
+              editor.setText(text);
+            projectedComposerKey = null;
             settleNotice(submitActionId, "error", receipt.message, "until_edit");
             editor.disableSubmit = false;
           }
         })
         .catch(() => {
-          editor.setText(text);
+          if (
+            !options.presentation
+              .getState()
+              .composer.elements.some((element) => element.type !== "text")
+          )
+            editor.setText(text);
+          projectedComposerKey = null;
           settleNotice(
             submitActionId,
             "error",

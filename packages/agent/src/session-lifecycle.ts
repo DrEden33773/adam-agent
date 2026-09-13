@@ -2171,6 +2171,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           : configuredContext),
       ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
       model: target.driver,
+      ...(target.modalityProfile === undefined ? {} : { modalityProfile: target.modalityProfile }),
     };
   };
   const managedControls = new Map<string, Promise<ManagedAgentControl | undefined>>();
@@ -2236,6 +2237,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           workspaceRoot: options.workspaceRoot,
           targetIdentity: snapshot.targetIdentity,
           contextProfile,
+          ...(resolved.modalityProfile === undefined
+            ? {}
+            : { modalityProfile: resolved.modalityProfile }),
           policy,
           ...(capacityConfiguration === undefined
             ? {}

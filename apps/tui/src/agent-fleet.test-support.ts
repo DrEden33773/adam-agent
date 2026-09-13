@@ -24,6 +24,8 @@ import {
   sessionProjectLifecycleOwner,
   sessionRecordCommittedBarrier,
   sessionStoreDirectory,
+  type TurnComposerStageBarrier,
+  turnComposerStageBarrier,
 } from "@adam-agent/agent/internal-testing";
 import type {
   ManagedAttentionItem,
@@ -34,7 +36,7 @@ import { onTestFailed } from "vitest";
 import { type DeadlineScheduler, runTui } from "./tui-app.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
 
-const identity = {
+const defaultIdentity = {
   targetId: "deepseek-v4-flash.direct",
   vendor: "deepseek",
   modelId: "deepseek-v4-flash",
@@ -106,6 +108,8 @@ export async function startManagedTui(
     readonly childRecordBarrier?: (record: SessionRecord) => Promise<void>;
     readonly workspaceRoot?: string;
     readonly modelTargets?: ModelTargets;
+    readonly targetIdentity?: import("@adam-agent/agent").ModelTargetIdentity;
+    readonly stageBarrier?: TurnComposerStageBarrier;
     readonly contextProfile?: import("@adam-agent/agent").ContextProfile;
     readonly permissions?: NonNullable<Parameters<typeof createSessionLifecycle>[0]["permissions"]>;
     readonly webHttp?: Parameters<typeof createSessionLifecycle>[0]["webHttp"];
@@ -115,6 +119,7 @@ export async function startManagedTui(
     readonly planPolicyVersion?: "plan-policy.hybrid-delegation-v1";
   } = {},
 ): Promise<ManagedTuiFixture> {
+  const identity = viewport.targetIdentity ?? defaultIdentity;
   const stateRoot =
     viewport.restore?.stateRoot ?? (await mkdtemp(join(tmpdir(), "adam-fleet-ui-")));
   const workspaceRoot = viewport.workspaceRoot ?? process.cwd();
@@ -249,6 +254,9 @@ export async function startManagedTui(
     ...(viewport.blankDraft ? { targetIdentity: identity } : { sessionId: parent.sessionId }),
     projectLabel: "Fleet fixture",
     draftPersistencePolicy: viewport.draftPersistencePolicy ?? "process_only",
+    ...(viewport.stageBarrier === undefined
+      ? {}
+      : { [turnComposerStageBarrier]: viewport.stageBarrier }),
     ...(viewport.controlReceiptBarrier === undefined
       ? {}
       : { [presentationManagedControlReceiptBarrier]: viewport.controlReceiptBarrier }),

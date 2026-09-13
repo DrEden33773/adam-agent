@@ -12,6 +12,7 @@ import {
   InputResourceError,
   type InputResourceOccurrenceV1,
   ingestLocalInputResourcesV1,
+  inputResourceLimitsV1,
   linkInputResourcesV1,
   type StagedInputResourceSelectionV1,
 } from "./input-resources.js";
@@ -41,7 +42,7 @@ import {
   managedTaskBudgetBoundary,
   sessionRecordCommittedBarrier,
 } from "./agent-session.js";
-import type { ModelDriver, RuntimeEvent } from "./agent-session-contracts.js";
+import type { ModelDriver, ModelModalityProfile, RuntimeEvent } from "./agent-session-contracts.js";
 import type { ContextProfile } from "./context-profile.js";
 import { delegationMessages, resolveDelegationContext } from "./delegation-context.js";
 import {
@@ -436,6 +437,7 @@ export function createManagedAgentControl(options: {
   readonly targetIdentity: ModelTargetIdentity;
   readonly contextProfile: ContextProfile;
   readonly model: ModelDriver;
+  readonly modalityProfile?: ModelModalityProfile;
   readonly permissions: PermissionPolicy;
   readonly executionDomain: ProjectExecutionDomain;
   readonly store: ManagedControlStore;
@@ -467,6 +469,7 @@ export function createManagedAgentControl(options: {
     readonly contextProfile: ContextProfile;
     readonly thinkingPolicy?: ManagedControlFrozen["thinkingPolicy"];
     readonly model: ModelDriver;
+    readonly modalityProfile?: ModelModalityProfile;
   }>;
   readonly roleTargets?: () => Promise<
     import("@adam-agent/presentation").AgentTypesDisplay["targets"]
@@ -528,6 +531,9 @@ export function createManagedAgentControl(options: {
       throw new Error("The thread's frozen target and context are unavailable.");
     return {
       model: options.model,
+      ...(options.modalityProfile === undefined
+        ? {}
+        : { modalityProfile: options.modalityProfile }),
       targetIdentity: options.targetIdentity,
       contextProfile: options.contextProfile,
     };
@@ -1461,6 +1467,30 @@ export function createManagedAgentControl(options: {
             threadRecords.push(...(await prior.read()));
           }
         }
+        // Previous tool results retain their original occurrence IDs. Their canonical
+        // descriptors must remain available alongside this turn's newly linked IDs.
+        const visibleResources = new Map<string, InputResourceOccurrenceV1>();
+        for (const resource of [
+          ...threadRecords.flatMap((record) =>
+            record.schemaVersion === 3 && record.record.type === "logical_run_started"
+              ? (record.record.inputResources ?? [])
+              : [],
+          ),
+          ...(frozen?.inputResources ?? []),
+        ]) {
+          const previousResource = visibleResources.get(resource.occurrenceId);
+          if (previousResource !== undefined && !isDeepStrictEqual(previousResource, resource))
+            throw new SessionStoreError();
+          visibleResources.set(resource.occurrenceId, resource);
+        }
+        if (
+          visibleResources.size > inputResourceLimitsV1.maximumOccurrencesPerLineage ||
+          [...visibleResources.values()].reduce(
+            (total, resource) => total + resource.artifact.byteCount,
+            0,
+          ) > inputResourceLimitsV1.maximumAggregateBytesPerLineage
+        )
+          throw new SessionStoreError();
         let generation = 0;
         let executing = false;
         let timer: { cancel(): void } | undefined;
@@ -1511,6 +1541,9 @@ export function createManagedAgentControl(options: {
           );
         };
         const dependencies = {
+          ...("modalityProfile" in target && target.modalityProfile !== undefined
+            ? { modalityProfile: target.modalityProfile }
+            : {}),
           ...(options.onPhaseDiagnostic === undefined
             ? {}
             : { onPhaseDiagnostic: options.onPhaseDiagnostic }),
@@ -1925,9 +1958,9 @@ export function createManagedAgentControl(options: {
           },
           [sessionDurableContext]: {
             nextSequence: preparedStore === undefined ? 2 : restoredRecords.length + 1,
-            ...(frozen?.inputResources === undefined
+            ...(visibleResources.size === 0
               ? {}
-              : { inputResources: frozen.inputResources, newRunId: identity.turnId }),
+              : { inputResources: [...visibleResources.values()], newRunId: identity.turnId }),
             skillResourceLineageBytes: skillResourceBytesFromRecords(threadRecords),
             inputResourceLineageBytes: inputResourceBytesFromRecords(threadRecords),
             ...(resume === undefined
@@ -4532,6 +4565,17 @@ export function createManagedAgentControl(options: {
             inputResources: previousAdmission.event.frozen.inputResources,
           };
         const addedResources = dispatchOptions?.directResources ?? [];
+        if (addedResources.some((resource) => resource.support === "image")) {
+          const target = await resolveFrozenTarget(continuationFrozen);
+          if (
+            target.modalityProfile?.explicitUserImages !== "supported" &&
+            target.modalityProfile?.imageToolResults !== "supported"
+          )
+            return rejected(
+              "action_unavailable",
+              "The selected child target does not support images. Remove the Image atom or choose another recipient.",
+            );
+        }
         if (
           addedResources.length > 0 &&
           (command.origin?.kind !== "direct_request" ||

@@ -7,6 +7,8 @@ import {
   stripTerminalSequences,
 } from "@adam-agent/presentation";
 import { draftMentionElementSchema } from "./at-mention.js";
+import { imageInputLimitsV1 } from "./image-input.js";
+import { findImageMentions, type ImageMention } from "./image-mentions.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
   type InputResourceOccurrenceV1,
@@ -15,6 +17,7 @@ import {
   safeInputResourceDisplayNameV1,
 } from "./input-resources.js";
 import {
+  isLargePastedTextV1,
   normalizePastedTextV1,
   pastedTextLimitsV1,
   type StagedPastedTextSelectionV1,
@@ -167,6 +170,15 @@ export class TurnComposerError extends Error {
 }
 
 export type TurnComposer = {
+  hasImageReferences(text?: string): boolean;
+  prepareImageReferences(
+    input: {
+      readonly includeText: boolean;
+      readonly signal: AbortSignal;
+      readonly available?: boolean;
+    },
+    commit?: () => Promise<void>,
+  ): Promise<boolean>;
   refreshRoleMention(elementId: string, expectedDigest: string, definitionDigest: string): boolean;
   stage(
     path: string,
@@ -250,6 +262,8 @@ export async function createTurnComposer(options: {
   readonly stager: TurnComposerResourceStager;
 }): Promise<TurnComposer> {
   const resources = new Map<string, TurnComposerResource>();
+  let imagePreparation: AbortController | undefined;
+  let imagePreparationSettled: Promise<void> = Promise.resolve();
   const pastedTexts = new Map<string, TurnComposerPastedText>();
   let elements: TurnComposerElementSnapshot[] = [];
   let nextOrdinal = 1;
@@ -580,7 +594,40 @@ export async function createTurnComposer(options: {
     return true;
   };
 
+  const imageReferencePlan = (includeText: boolean) => {
+    let source = "";
+    const selectedPaths: ImageMention[] = [];
+    const spans = elements.map((element) => {
+      const start = source.length;
+      const path =
+        element.type === "path" || (element.type === "mention" && element.kind === "path")
+          ? element.path
+          : undefined;
+      const value =
+        element.type === "text"
+          ? element.text
+          : path !== undefined
+            ? `@${path}`
+            : element.type === "pasted_text" && includeText
+              ? (pastedTexts.get(element.pastedTextId)?.text ?? "\uFFFC")
+              : "\uFFFC";
+      source += value;
+      if (path !== undefined) selectedPaths.push({ start, end: source.length, path });
+      return { element, start, end: source.length, value };
+    });
+    const matches = findImageMentions(source, selectedPaths).filter(
+      (match) => includeText || selectedPaths.some((path) => path.start === match.start),
+    );
+    return { spans, matches };
+  };
+
   return {
+    hasImageReferences(text) {
+      return (
+        imageReferencePlan(true).matches.length > 0 ||
+        (text !== undefined && findImageMentions(text).length > 0)
+      );
+    },
     async captureDraft(scope) {
       const orderedResources = elements.flatMap((element) => {
         if (element.type !== "resource") {
@@ -772,6 +819,182 @@ export async function createTurnComposer(options: {
       );
       revision += 1;
       publish();
+      return true;
+    },
+    async prepareImageReferences(input, commit) {
+      if (closed || sealed) throw new TurnComposerError("failed", "The turn composer is busy.");
+      const { spans, matches } = imageReferencePlan(input.includeText);
+      if (matches.length === 0) return false;
+      if (input.available === false)
+        throw new TurnComposerError("unsupported", "New session required for image attachments.");
+      const activeResources = [...resources.values()].filter(
+        (resource) => resource.state !== "removed" && resource.state !== "cancelled",
+      );
+      if (
+        activeResources.filter((resource) => resource.kind === "image").length + matches.length >
+        imageInputLimitsV1.maximumImagesPerRun
+      ) {
+        throw new TurnComposerError(
+          "limit_exceeded",
+          "Only one image can be attached per turn. Remove the extra image references.",
+        );
+      }
+      const controller = new AbortController();
+      imagePreparation = controller;
+      const settlement = Promise.withResolvers<void>();
+      imagePreparationSettled = settlement.promise;
+      const abort = () => controller.abort();
+      input.signal.addEventListener("abort", abort, { once: true });
+      if (input.signal.aborted) abort();
+      const previousElements = elements;
+      const previousText = text;
+      const previousRevision = revision;
+      const previousOrdinal = nextOrdinal;
+      const previousUndo = [...undoStack];
+      const addedResources: TurnComposerResource[] = [];
+      const addedTexts: TurnComposerPastedText[] = [];
+      const removedTexts: TurnComposerPastedText[] = [];
+      sealed = true;
+      publish();
+      try {
+        const nextElements: TurnComposerElementSnapshot[] = [];
+        const appendText = async (value: string) => {
+          if (value.length === 0) return;
+          if (isLargePastedTextV1(value) && options.stager.stageText !== undefined) {
+            const id = randomUUID();
+            const selection = await options.stager.stageText({
+              id,
+              text: value,
+              signal: controller.signal,
+            });
+            const elementId = randomUUID();
+            const ordinal = nextOrdinal++;
+            addedTexts.push({
+              id,
+              elementId,
+              ordinal,
+              origin: "pasted_text",
+              state: "ready",
+              byteCount: selection.byteCount,
+              lineCount: selection.lineCount,
+              scalarCount: selection.scalarCount,
+              preview: projectPastedTextPreview(value),
+              diagnostic: null,
+              controller: new AbortController(),
+              staged: selection,
+              text: value,
+              retained: false,
+              settlement: Promise.resolve(),
+            });
+            nextElements.push({ type: "pasted_text", elementId, pastedTextId: id, ordinal });
+          } else nextElements.push({ type: "text", elementId: randomUUID(), text: value });
+        };
+        for (const span of spans) {
+          const local = matches.filter(
+            (match) => match.start >= span.start && match.end <= span.end,
+          );
+          if (local.length === 0) {
+            nextElements.push(span.element);
+            continue;
+          }
+          let offset = 0;
+          for (const match of local) {
+            await appendText(span.value.slice(offset, match.start - span.start));
+            const id = randomUUID();
+            let staged: StagedInputResourceSelectionV1;
+            try {
+              staged = await options.stager.stage({
+                id,
+                path: match.path,
+                imageOnly: true,
+                signal: controller.signal,
+              });
+            } catch (error) {
+              throw new TurnComposerError(
+                controller.signal.aborted ? "cancelled" : "failed",
+                `Could not attach ${safeInputResourceDisplayNameV1(match.path)}: ${error instanceof Error ? error.message : "Image staging failed."}`,
+              );
+            }
+            const elementId = randomUUID();
+            const ordinal = nextOrdinal++;
+            addedResources.push({
+              id,
+              elementId,
+              ordinal,
+              origin: "selected_file",
+              displayName: staged.displayName,
+              state: "ready",
+              byteCount: staged.staged.byteCount,
+              kind: "image",
+              mediaHint: staged.mediaHint,
+              support: staged.support,
+              diagnostic: null,
+              controller: new AbortController(),
+              staged,
+              retained: false,
+              settlement: Promise.resolve(),
+            });
+            nextElements.push({
+              type: "resource",
+              elementId,
+              kind: "image",
+              ordinal,
+              resourceId: id,
+            });
+            offset = match.end - span.start;
+          }
+          await appendText(span.value.slice(offset));
+          if (span.element.type === "pasted_text") {
+            const original = pastedTexts.get(span.element.pastedTextId);
+            if (original !== undefined) removedTexts.push(original);
+          }
+        }
+        controller.signal.throwIfAborted();
+        if (
+          nextElements.filter(
+            (element) => element.type === "resource" || element.type === "pasted_text",
+          ).length > inputResourceLimitsV1.maximumOccurrencesPerRun
+        )
+          throw new TurnComposerError(
+            "limit_exceeded",
+            "The input-resource count exceeds the turn limit.",
+          );
+        for (const resource of addedResources) resources.set(resource.id, resource);
+        for (const pasted of addedTexts) pastedTexts.set(pasted.id, pasted);
+        for (const pasted of removedTexts) pasted.state = "removed";
+        elements = normalizeTextElements(nextElements);
+        text = literalText();
+        revision += 1;
+        undoStack.length = 0;
+        await commit?.();
+      } catch (error) {
+        elements = previousElements;
+        text = previousText;
+        revision = previousRevision;
+        nextOrdinal = previousOrdinal;
+        undoStack.length = 0;
+        undoStack.push(...previousUndo);
+        for (const resource of addedResources) {
+          resources.delete(resource.id);
+          await discardStaging(resource);
+        }
+        for (const pasted of addedTexts) {
+          pastedTexts.delete(pasted.id);
+          await discardPastedText(pasted);
+        }
+        for (const pasted of removedTexts) pasted.state = "ready";
+        throw error;
+      } finally {
+        input.signal.removeEventListener("abort", abort);
+        imagePreparation = undefined;
+        sealed = false;
+        publish();
+        settlement.resolve();
+      }
+      for (const pasted of removedTexts) {
+        pastedTexts.delete(pasted.id);
+        await discardPastedText(pasted);
+      }
       return true;
     },
     async replaceText(input, commit) {
@@ -1765,6 +1988,8 @@ export async function createTurnComposer(options: {
         return;
       }
       closed = true;
+      imagePreparation?.abort();
+      await imagePreparationSettled;
       for (const resource of resources.values()) {
         resource.controller.abort();
       }
