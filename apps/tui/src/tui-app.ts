@@ -906,7 +906,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let targetPickerDismissed = false;
   let targetPickerIntent: "create" | "transition" = "create";
   let targetPickerRequested = false;
-  let defaultTargetAttempted = false;
+  let startupTargetConsumed = false;
   let defaultTargetRejected = false;
   let startupTargetFailure: string | null = null;
   let workspaceTrustMutationPending = false;
@@ -1917,9 +1917,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       newSessionSelected &&
       startupTargetId !== null &&
       startupTargetId !== undefined &&
-      !defaultTargetAttempted
+      !startupTargetConsumed
     ) {
-      defaultTargetAttempted = true;
+      startupTargetConsumed = true;
       void options.presentation
         .dispatch({ type: "create_session", targetId: startupTargetId })
         .then((receipt) => {
@@ -2112,6 +2112,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           if (archiveUndo !== undefined) void changeArchive(archiveUndo);
         },
         onNewSession() {
+          // An explicit picker choice supersedes startup defaults before either can create a draft.
+          startupTargetConsumed = true;
           newSessionSelected = true;
           sessionPickerRequested = false;
           sessionPicker?.hide();

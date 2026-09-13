@@ -226,6 +226,7 @@ test.each([
           expect(terminal.lines().join("\n")).toContain("Preserve my draft");
           expect(presentation.getState().composer.renderedText).toBe("Preserve my draft");
           expect(presentation.getState().draft?.targetId).toBe("deepseek-flash.direct");
+          expect(seenDrafts).not.toContain(targetId);
         }
         terminal.input("\u0011");
         await execution;
