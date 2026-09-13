@@ -99,6 +99,7 @@ export type TargetDisplay = {
   readonly capabilities: readonly ("reasoning" | "tool-use")[];
   readonly modalities: readonly ("text" | "image")[];
   readonly recommended: boolean;
+  readonly hiddenFromPicker?: boolean;
   readonly route: "direct" | "vercel-ai-gateway";
   readonly certification: "Certified" | "Experimental";
   readonly upstreamLifecycle?: "Experimental" | "Stable";

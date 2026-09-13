@@ -29,7 +29,7 @@ Set your DeepSeek credential in your shell, then start an exact model target:
 
 ```sh
 export DEEPSEEK_API_KEY="your-api-key"
-node apps/tui/dist/main.js --target deepseek-v4-flash.direct
+node apps/tui/dist/main.js --target deepseek-flash.direct
 ```
 
 Trust the project when prompted and enter a task. `deepseek-v4-pro.direct` is also available. Keep credentials in your environment or an ignored project `.env`; never put them in a prompt. The [setup guide](docs/setup-and-development.md) covers configuration, target selection and optional integrations.

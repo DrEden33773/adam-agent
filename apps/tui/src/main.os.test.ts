@@ -660,7 +660,7 @@ test("the production TUI entry exposes its usage contract", async () => {
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("Adam Agent TUI");
-    expect(result.stdout).toContain("pnpm tui --target deepseek-v4-flash.direct");
+    expect(result.stdout).toContain("pnpm tui --target deepseek-flash.direct");
     expect(result.stdout).not.toContain("pnpm tui --target fake.local");
     expect(result.stdout).toContain("pnpm tui --resume <session-id>");
     expect(result.stdout).toContain("pnpm tui --no-mouse");
