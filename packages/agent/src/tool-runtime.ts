@@ -64,6 +64,7 @@ import {
   updateTodoToolDefinitionV2,
 } from "./todo.js";
 import type { ToolError } from "./tool-error.js";
+import { parseToolInput as parseInput, toolInputFailure } from "./tool-input-feedback.js";
 
 export type ToolEffect = "read" | "write" | "execute" | "network" | "delegate" | "administrative";
 
@@ -916,7 +917,17 @@ function createMutationToolRegistryInternal(options: {
         }
         const parsedArguments = parseInput(editFileInputSchema, argumentsJson);
         if (!parsedArguments.success) {
-          return invalidToolInput();
+          return toolInputFailure(parsedArguments, {
+            operations: "supply 1 to 32 structured operations",
+            kind: "required; use create, update, delete, or move",
+            path: "required for create, update, and delete; use a nonempty project-relative path",
+            from: "required for move; use a nonempty project-relative source path",
+            to: "required for move; use a nonempty project-relative destination path",
+            content: "required for create; supply UTF-8 text without NUL, at most 1 MiB",
+            edits: "supply exact-text edits; update requires at least one",
+            oldText: "required; supply nonempty exact text without NUL, at most 1 MiB",
+            newText: "required; supply replacement text without NUL, at most 1 MiB",
+          });
         }
         const normalized = normalizePatchOperations(workspaceRoot, parsedArguments.data.operations);
         if ("status" in normalized) {
@@ -2075,25 +2086,6 @@ function patchOperationSortKey(operation: NormalizedPatchOperation): string {
   return operation.kind === "move"
     ? `${operation.kind}\0${operation.from}\0${operation.to}`
     : `${operation.kind}\0${operation.path}`;
-}
-
-function parseInput<T>(
-  schema: z.ZodType<T>,
-  argumentsJson: string,
-):
-  | { readonly success: true; readonly data: T }
-  | { readonly success: false; readonly issues?: readonly z.core.$ZodIssue[] } {
-  let untrustedInput: unknown;
-  try {
-    untrustedInput = JSON.parse(argumentsJson);
-  } catch {
-    return { success: false };
-  }
-
-  const result = schema.safeParse(untrustedInput);
-  return result.success
-    ? { success: true, data: result.data }
-    : { success: false, issues: result.error.issues };
 }
 
 function actionableInputFailure(

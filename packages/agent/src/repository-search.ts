@@ -7,6 +7,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import { rgPath } from "@vscode/ripgrep";
 import { z } from "zod";
+import { parseToolInput, toolInputFailure } from "./tool-input-feedback.js";
 
 import type { ToolAdapter } from "./tool-runtime.js";
 
@@ -560,9 +561,20 @@ export function createRepositorySearchToolAdapter(options: {
     cancellation: "abort_signal",
     maximumResult: { maximumBytes: maximumPageBytes },
     prepare(argumentsJson) {
-      const parsedArguments = searchRepositoryInputSchema.safeParse(parseJson(argumentsJson));
+      const parsedArguments = parseToolInput(searchRepositoryInputSchema, argumentsJson);
       if (!parsedArguments.success) {
-        return invalidInput();
+        return toolInputFailure(parsedArguments, {
+          kind: "required; use content or path",
+          query: "required; supply a nonempty string of at most 4096 characters",
+          mode: "use literal or regex for content; fuzzy or glob for path",
+          case: "use smart, sensitive, or insensitive",
+          include: "supply at most 16 glob strings, each 1 to 512 characters",
+          exclude: "supply at most 16 glob strings, each 1 to 512 characters",
+          context: "use an integer from 0 to 3",
+          path: "use a nonempty project-relative path of at most 4096 characters",
+          limit: "use an integer from 1 to 50",
+          cursor: "use a returned page cursor of at most 1024 characters",
+        });
       }
       const requestedPath = parsedArguments.data.path ?? ".";
       if (isAbsolute(requestedPath)) {
@@ -812,24 +824,6 @@ function outsideWorkspace() {
 
 function hasHiddenPathComponent(path: string): boolean {
   return path !== "." && path.split("/").some((component) => component.startsWith("."));
-}
-
-function parseJson(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
-  }
-}
-
-function invalidInput() {
-  return {
-    status: "failed" as const,
-    error: {
-      code: "invalid_tool_input" as const,
-      message: "The tool input did not match its schema.",
-    },
-  };
 }
 
 async function runContentSearch(options: {
