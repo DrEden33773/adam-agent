@@ -392,7 +392,8 @@ test("cold undelivered input remains private and can be explicitly inspected and
       "PRIVATE_UNDELIVERED_MESSAGE",
     );
     await cold.press("/agents\r", "Agents workspace");
-    await cold.press("\r", "Undelivered · settled");
+    await cold.press("\r", "i input receipts");
+    expect(cold.conversationText()).toContain("Undelivered · settled");
     await cold.press("i", "Input receipts");
     await cold.press("\r", "PRIVATE_UNDELIVERED_MESSAGE");
     expect(calls).toBe(1);

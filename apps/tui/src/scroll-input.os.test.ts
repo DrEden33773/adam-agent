@@ -1,10 +1,13 @@
-import { mkdir, mkdtemp } from "node:fs/promises";
+import fs from "node:fs";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { expect, test } from "vitest";
 import { removeTuiFixtureRoot as rm } from "./tui-filesystem.test-support.js";
 import { startTuiFixture } from "./tui-fixture.test-support.js";
+import { terminalObservationTimeoutMilliseconds } from "./virtual-terminal.test-support.js";
 
 test("PTY Main viewport scroll preserves drafts and resize anchors and restores terminal modes", async () => {
   const root = await mkdtemp(join(tmpdir(), "adam-main-scroll-"));
@@ -78,5 +81,85 @@ test("PTY Main viewport scroll preserves drafts and resize anchors and restores 
   } finally {
     await fixture.cleanup();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PTY resize waits for a current-geometry frame after the PID read completes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-resize-frame-"));
+  const marker = join(root, "terminal-process");
+  const program = join(root, "fixture.mjs");
+  await writeFile(
+    program,
+    `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(marker)},String(process.pid));
+function frame(text) { process.stdout.write("\\u001b[?2026h\\u001b[2J\\u001b[HMAIN_SCROLL_100\\r\\n"+text+"\\u001b[?2026l"); }
+frame("initial");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",text=>{if(text.includes("q"))process.exit(0);frame(text.includes("r") ? "resized frame" : "old-size frame");});
+process.on("SIGWINCH",()=>{});
+`,
+  );
+  const fixture = startTuiFixture({
+    external: true,
+    terminalProcessMarker: marker,
+    workspaceRoot: root,
+    stateRoot: join(root, "state"),
+    program: { entrypoint: program, arguments: [], cwd: root },
+  });
+  const originalRead = fs.promises.readFile;
+  const entered = Promise.withResolvers<void>();
+  const releaseRead = Promise.withResolvers<void>();
+  let resizing: Promise<void> | undefined;
+  let captured = false;
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await fixture.waitForScreen("MAIN_SCROLL_100");
+    // Delay only this external filesystem read; the real PTY and stty remain in use.
+    fs.promises.readFile = (async (...args: Parameters<typeof originalRead>) => {
+      const value = await originalRead(...args);
+      if (args[0] === marker && !captured) {
+        captured = true;
+        entered.resolve();
+        await releaseRead.promise;
+      }
+      return value;
+    }) as typeof originalRead;
+    syncBuiltinESMExports();
+    const offset = fixture.output().length;
+    resizing = fixture.resize(40, 24);
+    void resizing.catch(entered.reject);
+    await Promise.race([
+      entered.promise,
+      new Promise<never>((_, reject) => {
+        guard = setTimeout(
+          () => reject(new Error("Resize did not reach the PID read")),
+          terminalObservationTimeoutMilliseconds,
+        );
+      }),
+    ]);
+    if (guard !== undefined) clearTimeout(guard);
+    fixture.write("x\n");
+    await fixture.waitForCompleteFrameAfter("old-size frame", offset);
+    releaseRead.resolve();
+    await resizing;
+    await fixture.waitForRecordedOutput("old-size frame", offset);
+    const frame = fixture.waitForCompleteFrameAfter("MAIN_SCROLL_100", offset);
+    fixture.write("r\n");
+    await frame;
+    expect(fixture.screen()?.join("\n")).toContain("resized frame");
+    fixture.write("q\n");
+    await fixture.closed;
+  } finally {
+    if (guard !== undefined) clearTimeout(guard);
+    releaseRead.resolve();
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+    try {
+      await resizing?.catch(() => undefined);
+    } finally {
+      await fixture.cleanup();
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
