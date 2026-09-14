@@ -3678,9 +3678,9 @@ function snapshotWithLastPromptProjection<Snapshot extends { readonly promptCont
 }
 
 const introductionRequestDigest =
-  "sha256:64170c2ae8428ebdb374d51161b2d98252293251a0a503c795c0a4d4b0be3248" as const;
+  "sha256:62aa78ea4425ed35af87783153123ee345eb212b77e10f44d134594ff5f169be" as const;
 const permissionRequestDigest =
-  "sha256:9c1f59ec1ffd20fdfe7486b5fb9efa0d03394adfaf113c23d5e1a7bc22784b60" as const;
+  "sha256:0993d2cc6c1b5c1c1405221cdd856f8517e5231a1bb29b686910c2246f01805d" as const;
 
 test("SessionLifecycle rejects a deterministic competing owner and proceeds after release", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-memory-owner-"));

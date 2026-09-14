@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import {
   type ContextProfile,
   createExtensionHost,
@@ -25,6 +24,7 @@ import {
   createScriptedMcpTransportFactory,
   FakeModelDriver,
 } from "./index.js";
+import { sessionLifecycleAddedPromptTokens } from "./session-lifecycle.test-support.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -1160,18 +1160,18 @@ test("a legacy compacted session reuses the selected-prefix profile instead of c
   const { preferences } = configuration;
   const historicalOfficialProfile: ContextProfile = {
     version: 1,
-    contextWindowTokens: 20_000,
+    contextWindowTokens: 20_000 + sessionLifecycleAddedPromptTokens,
     maximumOutputTokens: 100,
-    compactAtTokens: 1_500,
-    postCompactTargetTokens: 1_200,
+    compactAtTokens: 1_500 + sessionLifecycleAddedPromptTokens,
+    postCompactTargetTokens: 1_200 + sessionLifecycleAddedPromptTokens,
     retainedTargetTokens: 100,
     estimatorVersion: 1,
   };
   const currentOfficialProfile: ContextProfile = {
     ...historicalOfficialProfile,
-    contextWindowTokens: 30_000,
+    contextWindowTokens: 30_000 + sessionLifecycleAddedPromptTokens,
     maximumOutputTokens: 200,
-    compactAtTokens: 2_200,
+    compactAtTokens: 2_200 + sessionLifecycleAddedPromptTokens,
   };
   const summary = JSON.stringify({
     schemaVersion: 1,
