@@ -1033,6 +1033,7 @@ export type TurnComposerDisplay = {
     readonly id: string;
     readonly elementId: string;
     readonly displayName: string;
+    readonly sourcePath?: string;
     readonly state: "queued" | "copying" | "ready" | "failed" | "cancelled" | "removed";
     readonly byteCount: number | null;
     readonly kind: "file" | "image";

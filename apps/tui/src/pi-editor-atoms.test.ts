@@ -1,4 +1,4 @@
-import { Editor } from "@earendil-works/pi-tui";
+import { Editor, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { expect, test } from "vitest";
 
 import { createAdamTuiTheme } from "./theme.js";
@@ -26,6 +26,58 @@ type AtomEditor = Editor & {
   getDocumentCursor(): DocumentPoint;
   setDocument(parts: readonly DocumentPart[], cursor?: DocumentPoint): void;
 };
+
+for (const width of [40, 80, 120]) {
+  test.each([false, true])(
+    `long image path atoms wrap and retain color and atomic movement at ${width} columns, noColor=%s`,
+    (noColor) => {
+      const editor = new Editor(
+        { requestRender() {}, terminal: { rows: 40 } } as never,
+        createAdamTuiTheme(noColor).editor,
+      ) as AtomEditor;
+      const label = `[Image #1](assets/${"nested/".repeat(20)}截图 (1).png)`;
+      const parts: readonly DocumentPart[] = [{ type: "atom", id: "image", label }];
+      const intents: EditIntent[] = [];
+      editor.onEditIntent = (intent) => intents.push(intent);
+      editor.setDocument(parts, { partId: "image", edge: "after" });
+      const lines = editor.render(width);
+      expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+      expect(editor.getText()).toBe(label);
+      expect(lines.map(stripTerminalSequences).join("").replaceAll(" ", "")).toContain(
+        label.replaceAll(" ", ""),
+      );
+      if (noColor) expect(lines.join("")).not.toContain("\u001b[38;2;137;220;235m");
+      else {
+        const colored = lines
+          .join("")
+          .split("\u001b[38;2;137;220;235m")
+          .slice(1)
+          .map((part) => part.split("\u001b[39m")[0])
+          .join("");
+        expect(colored).toBe(label);
+      }
+      editor.handleInput("\u001b[D");
+      expect(editor.getDocumentCursor()).toEqual({ partId: "image", edge: "before" });
+      editor.handleInput("\u001b[C");
+      expect(editor.getDocumentCursor()).toEqual({ partId: "image", edge: "after" });
+      editor.handleInput("\u007f");
+      expect(intents.at(-1)).toEqual({
+        type: "remove_atom",
+        atomId: "image",
+        direction: "backward",
+      });
+      expect(editor.getText()).toBe("");
+      editor.setDocument(parts, { partId: "image", edge: "before" });
+      editor.handleInput("\u001b[3~");
+      expect(intents.at(-1)).toEqual({
+        type: "remove_atom",
+        atomId: "image",
+        direction: "forward",
+      });
+      expect(editor.getText()).toBe("");
+    },
+  );
+}
 
 test("Pi Editor treats one host-owned resource label as an atomic navigable part", () => {
   const editor = new Editor(

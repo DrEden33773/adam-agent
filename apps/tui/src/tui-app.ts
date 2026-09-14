@@ -1203,10 +1203,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           style: theme.pathReference,
         };
       }
+      const sourcePath =
+        element.type === "resource" && element.kind === "image"
+          ? composer.resources.find((resource) => resource.id === element.resourceId)?.sourcePath
+          : undefined;
       return {
         type: "atom",
         id: element.elementId,
-        label: `[${element.type === "pasted_text" ? "Text" : element.kind === "image" ? "Image" : "File"} #${element.ordinal}]`,
+        label: `[${element.type === "pasted_text" ? "Text" : element.kind === "image" ? "Image" : "File"} #${element.ordinal}]${sourcePath === undefined ? "" : `(${safeTerminalText(sourcePath)})`}`,
       };
     });
     editor.setDocument(parts);
@@ -5052,6 +5056,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     renderState();
   };
   const handleAttachCommand = (path: string, sessionId?: string): void => {
+    if (
+      (path.startsWith('"') && path.endsWith('"')) ||
+      (path.startsWith("'") && path.endsWith("'"))
+    )
+      path = path.slice(1, -1);
     const composer = options.presentation.getState().composer;
     if (path.length === 0) {
       showNotice("warning", "Usage: /attach <path>", "until_edit", sessionId);

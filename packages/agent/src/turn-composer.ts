@@ -38,6 +38,7 @@ export type TurnComposerResourceSnapshot = {
   readonly id: string;
   readonly elementId: string;
   readonly displayName: string;
+  readonly sourcePath?: string;
   readonly state: "queued" | "copying" | "ready" | "failed" | "cancelled" | "removed";
   readonly byteCount: number | null;
   readonly kind: "file" | "image";
@@ -127,6 +128,7 @@ type TurnComposerResource = {
   readonly id: string;
   readonly elementId: string;
   displayName: string;
+  sourcePath?: string;
   state: TurnComposerResourceSnapshot["state"];
   byteCount: number | null;
   kind: "file" | "image";
@@ -687,6 +689,7 @@ export async function createTurnComposer(options: {
           id: resource.id,
           elementId: resource.elementId,
           displayName: resource.displayName,
+          ...(resource.sourcePath === undefined ? {} : { sourcePath: resource.sourcePath }),
           kind: resource.kind,
           origin: resource.origin,
           ordinal: resource.ordinal,
@@ -763,6 +766,7 @@ export async function createTurnComposer(options: {
           id: recovered.id,
           elementId: recovered.elementId,
           displayName: recovered.displayName,
+          ...(recovered.sourcePath === undefined ? {} : { sourcePath: recovered.sourcePath }),
           state: recovered.state,
           byteCount: recovered.byteCount,
           kind: recovered.kind,
@@ -923,6 +927,7 @@ export async function createTurnComposer(options: {
               ordinal,
               origin: "selected_file",
               displayName: staged.displayName,
+              sourcePath: match.path,
               state: "ready",
               byteCount: staged.staged.byteCount,
               kind: "image",
@@ -1436,6 +1441,8 @@ export async function createTurnComposer(options: {
         resource.mediaHint = staged.mediaHint;
         resource.support = staged.support;
         resource.kind = staged.support === "image" ? "image" : "file";
+        if (resource.kind === "image" && staged.origin !== "pasted_image")
+          resource.sourcePath = path;
         elements = elements.map((element) =>
           element.type === "resource" && element.resourceId === id
             ? { ...element, kind: resource.kind }

@@ -1,7 +1,8 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ModelDriver, ModelRequest, ModelTargets } from "@adam-agent/agent";
+import { createRecoverableTurnDraftRepository } from "@adam-agent/agent/internal-testing";
 import { expect, onTestFinished, test } from "vitest";
 import { type ManagedTuiFixture, startManagedTui } from "./agent-fleet.test-support.js";
 import { terminalObservationTimeoutMilliseconds } from "./virtual-terminal.test-support.js";
@@ -32,8 +33,15 @@ const contextProfile = {
 
 function imageModel() {
   const requests: ModelRequest[] = [];
+  const titleRequests: ModelRequest[] = [];
   const driver: ModelDriver = {
     async *stream(request) {
+      if (request.purpose === "title") {
+        titleRequests.push(request);
+        yield { type: "text_delta", text: "Image fixture" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
       requests.push(request);
       const image = request.messages.findLast(
         (message) => message.role === "tool" && message.name === "read_input_resource",
@@ -100,8 +108,136 @@ function imageModel() {
       };
     },
   };
-  return { driver, modelTargets, requests };
+  return { driver, modelTargets, requests, titleRequests };
 }
+
+test.each([40, 80, 120])(
+  "image path labels remain atomic in the real editor at %i columns",
+  async (columns) => {
+    const root = await mkdtemp(join(tmpdir(), "adam-image-path-label-"));
+    const path = "图/截图 (1).png";
+    const label = `[Image #1](${path})`;
+    await mkdir(join(root, "图"));
+    await writeFile(join(root, path), png);
+    const model = imageModel();
+    const h = await startManagedTui(model.driver, {
+      workspaceRoot: root,
+      targetIdentity: identity,
+      modelTargets: model.modelTargets,
+      columns,
+    });
+    try {
+      await h.press("@截图", ".png");
+      await h.press("\t", "[Image #1](");
+      expect(h.terminal.lines().join("").replaceAll(" ", "")).toContain(label.replaceAll(" ", ""));
+      expect(h.presentation.getState().composer.resources[0]?.sourcePath).toBe(path);
+      const lines = h.terminal.lines();
+      const inputs = lines.findIndex((line) => line.includes("Draft inputs"));
+      expect(lines[inputs + 1]).toContain("[Image #1]");
+      expect(lines[inputs + 1]).not.toContain(label);
+      await h.press("\u001b[DA", "A[Image #1](");
+      await h.press("\u001b[CB", ".png)B");
+      await h.press("\u007f\u007f", "Draft element removed.");
+      expect(h.presentation.getState().composer.renderedText).toBe("A");
+      await h.press("\u001f", "[Image #1](");
+      expect(h.presentation.getState().composer.renderedText).toBe("A[Image #1]");
+      await rm(join(root, path));
+      await h.press("\r", "Immutable image received.");
+      expect(model.requests).toHaveLength(2);
+      expect(JSON.stringify(model.requests)).not.toContain('"sourcePath"');
+      expect(JSON.stringify(model.requests)).not.toContain("图/");
+    } finally {
+      await h.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["current", "legacy", "clipboard"])(
+  "quoted /attach labels and %s draft recovery preserve image identity",
+  async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "adam-image-path-recovery-"));
+    const path = join(root, "image (1).png");
+    await writeFile(path, png);
+    const model = imageModel();
+    const options = {
+      workspaceRoot: root,
+      targetIdentity: identity,
+      modelTargets: model.modelTargets,
+      draftPersistencePolicy: "recoverable" as const,
+      columns: 120,
+    };
+    let h = await startManagedTui(model.driver, options);
+    try {
+      await h.press(`/attach "${path}"\r`, `[Image #1](${path})`);
+      expect(h.presentation.getState().composer.resources[0]?.sourcePath).toBe(path);
+      await h.presentation.dispatch({ type: "create_session", targetId: identity.targetId });
+      await expect(
+        h.presentation.dispatch({ type: "select_session", sessionId: h.parent.sessionId }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      await h.terminal.waitForScreen(`[Image #1](${path})`);
+      const repository = await createRecoverableTurnDraftRepository({
+        projectId: h.presentation.getState().authoritative.project.id as `sha256:${string}`,
+        stateRoot: h.storage.stateRoot,
+      });
+      await h.stop();
+      if (mode !== "current") {
+        const draft = await repository.load({ type: "session", sessionId: h.parent.sessionId });
+        if (draft?.schemaVersion !== 4) throw new Error("Expected the saved image draft.");
+        await repository.save({
+          ...draft,
+          resources: draft.resources.map(({ sourcePath: _sourcePath, ...resource }) =>
+            mode === "legacy"
+              ? resource
+              : {
+                  ...resource,
+                  origin: "pasted_image",
+                  ...(resource.selection === undefined
+                    ? {}
+                    : { selection: { ...resource.selection, origin: "pasted_image" } }),
+                },
+          ),
+        });
+      }
+      await rm(path);
+      h = await startManagedTui(model.driver, { ...options, restore: h.storage });
+      await h.terminal.waitForScreen(mode === "current" ? `[Image #1](${path})` : "[Image #1]");
+      if (mode !== "current") {
+        expect(h.presentation.getState().composer.resources[0]).not.toHaveProperty("sourcePath");
+        expect(h.terminal.lines().join("\n")).not.toContain("[Image #1](");
+      }
+      await h.press(" Inspect it.\r", "Immutable image received.");
+      expect(model.requests).toHaveLength(2);
+    } finally {
+      await h.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("image source paths are rendered as safe atom text", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-image-safe-label-"));
+  const path = join(root, "image\u001b]0;UNTRUSTED_TITLE\u0007.png");
+  await writeFile(path, png);
+  const model = imageModel();
+  const h = await startManagedTui(model.driver, {
+    workspaceRoot: root,
+    targetIdentity: identity,
+    modelTargets: model.modelTargets,
+    columns: 120,
+  });
+  try {
+    await expect(
+      h.presentation.dispatch({ type: "stage_input_resource", path }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await h.terminal.waitForScreen(`[Image #1](${join(root, "image.png")})`);
+    expect(h.terminal.output()).not.toContain("\u001b]0;UNTRUSTED_TITLE\u0007");
+    expect(h.presentation.getState().composer.resources[0]?.sourcePath).toBe(path);
+  } finally {
+    await h.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function observe(register: (done: () => void) => () => void, missing: string): Promise<void> {
   let unsubscribe = () => {};
@@ -396,6 +532,19 @@ test.each(["completion", "typed", "paste", "plan", "role"])(
           "Inspect @image.png",
         );
         await h.press("\r", "Immutable image received.");
+      }
+      if (mode === "typed" || mode === "paste") {
+        await observe((done) => {
+          const check = () => {
+            const status =
+              h.presentation.getState().authoritative.active?.session.naming.generation.status;
+            if (status === "completed") done();
+          };
+          const unsubscribe = h.presentation.subscribe(check);
+          queueMicrotask(check);
+          return unsubscribe;
+        }, "Automatic naming did not settle after the image response.");
+        expect(model.titleRequests).toHaveLength(1);
       }
       expect(model.requests).toHaveLength(2);
       expect(model.requests[0]?.messages.filter((message) => message.role === "user")).toHaveLength(
