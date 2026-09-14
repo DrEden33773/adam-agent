@@ -156,6 +156,49 @@ test("the real TUI process restores the terminal after staging one input resourc
   }
 });
 
+test("the real TUI process edits one complete image path label and restores the terminal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-image-label-process-"));
+  const workspaceRoot = join(root, "workspace");
+  const stateRoot = join(root, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "image (1).png"),
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
+  try {
+    const fixture = startFixture({
+      external: true,
+      noColor: false,
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForScreen("Adam · New session");
+    const beforeAttach = fixture.output().length;
+    fixture.write('/attach "image (1).png"\r');
+    await fixture.waitForCompleteFrameAfter("[Image #1](image (1).png)", beforeAttach);
+    expect(fixture.output()).toContain(
+      "\u001b[38;2;137;220;235m[Image #1](image (1).png)\u001b[39m",
+    );
+    const beforeDelete = fixture.output().length;
+    fixture.write("\u007f");
+    await fixture.waitForCompleteFrameAfter("Draft element removed.", beforeDelete);
+    expect(fixture.screen()?.join("\n")).not.toContain("[Image #1](image (1).png)");
+    const beforeUndo = fixture.output().length;
+    fixture.write("\u001f");
+    await fixture.waitForCompleteFrameAfter("[Image #1](image (1).png)", beforeUndo);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[?2004l");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function trustWorkspace(configRoot: string, workspaceRoot: string): Promise<void> {
   const workspaceTrust = createWorkspaceTrust({
     environment: { XDG_CONFIG_HOME: configRoot },

@@ -8,6 +8,8 @@ Tab completes slash commands and their supported arguments. `@` completion offer
 
 Image references use the same image support and limits as `/attach`: PNG/JPEG, one image per turn, up to 8 MiB and 4,096 pixels on either side. A missing, invalid or oversized image keeps the draft available with an error. Remove extra images or select an image-capable target before sending. Image atoms support the existing attachment details, removal and undo actions; their staged bytes survive draft recovery and later changes to the original file.
 
+Local images show their selected path in the editor, for example `[Image #1](screenshots/login page.png)`. The full colored label is one atom: arrow keys move across it and Backspace/Delete remove it whole. The original relative, absolute or `~/` path survives draft recovery, while Draft inputs keeps its short `[Image #1]` label. Older drafts and images without a source path keep the short editor label too. Paths with spaces can also be quoted in `/attach`, for example `/attach "screenshots/login page.png"`.
+
 Tool cards show the prepared action and its outcome. Ctrl+O opens bounded details; Ctrl+T toggles reasoning. Scroll or page upward to inspect earlier content, then return to the bottom to follow new output. `/history` loads earlier turns, `/tree` navigates complete conversation boundaries, and `/copy` copies the assistant answer.
 
 Review every requested write or shell command before approval. A permission decision applies to the displayed call. `/plan` supports exploration and an explicit transition to approved implementation; Todos record progress without starting new work.

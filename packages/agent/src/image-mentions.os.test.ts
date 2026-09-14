@@ -64,6 +64,17 @@ test.each(["completion", "path mention", "typed", "quoted", "home"])(
         signal: new AbortController().signal,
       });
       expect(composer.snapshot().renderedText).toBe("before [Image #1] after");
+      expect(composer.snapshot().resources).toMatchObject([
+        {
+          sourcePath:
+            mode === "home"
+              ? `~/${relative(homedir(), join(workspaceRoot, "image.png"))}`
+              : mode === "typed"
+                ? join(workspaceRoot, "image.png")
+                : "截图 image.PNG",
+          token: "[Image #1]",
+        },
+      ]);
       const sealed = await composer.seal(new AbortController().signal);
       expect(sealed.structuredContent).toEqual([
         { type: "text", text: "before " },
@@ -72,6 +83,7 @@ test.each(["completion", "path mention", "typed", "quoted", "home"])(
       ]);
       expect(sealed.selections).toHaveLength(1);
       expect(sealed.selections[0]?.support).toBe("image");
+      expect(sealed.selections[0]).not.toHaveProperty("sourcePath");
       await rm(path);
       expect(
         await readFile(
@@ -164,6 +176,7 @@ test("converted images retain remove/undo and cold draft recovery without the so
       type: "new_session",
       targetId: "deepseek-flash.direct",
     });
+    expect(draft.resources[0]?.sourcePath).toBe("image.png");
     await composer.close();
     await rm(join(root, "image.png"));
     cold = await createTurnComposer({
@@ -174,6 +187,7 @@ test("converted images retain remove/undo and cold draft recovery without the so
       }),
     });
     await cold.restoreDraft(draft);
+    expect(cold.snapshot().resources[0]?.sourcePath).toBe("image.png");
     await cold.prepareImageReferences({ includeText: true, signal: new AbortController().signal });
     const sealed = await cold.seal(new AbortController().signal);
     expect(sealed.selections).toHaveLength(1);

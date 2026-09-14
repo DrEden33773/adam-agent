@@ -42,6 +42,7 @@ export type RecoverableTurnDraftV1 = {
     readonly id: string;
     readonly elementId: string;
     readonly displayName: string;
+    readonly sourcePath?: string | undefined;
     readonly kind: "file" | "image";
     readonly origin?: "pasted_image" | "selected_file" | undefined;
     readonly ordinal: number;
@@ -270,6 +271,7 @@ const draftV1Schema = z
           id: z.string().min(1).max(256),
           elementId: z.string().min(1).max(256),
           displayName: z.string().min(1).max(255),
+          sourcePath: z.string().min(1).max(4096).optional(),
           kind: z.enum(["file", "image"]),
           origin: z.enum(["pasted_image", "selected_file"]).optional(),
           ordinal: z.number().int().positive().safe(),
