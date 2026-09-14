@@ -1266,7 +1266,7 @@ test("Widget retains elapsed and optional model while details expose current usa
     ).toMatch(/\d+s\s*$/u);
     await h.press("/agents settings\r", "Agent settings");
     await h.press("\u001b[B\u001b[B\r", "Model/thinking · shown");
-    await h.press("\u001b", "thinking default");
+    await h.press("\u001b", "thinking default", "Agent settings");
     expect(h.terminal.lines().join("\n")).not.toMatch(/\d+ used|\d+ reserved/u);
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Conversation ·");
