@@ -13,10 +13,15 @@ type Frame = {
   version: number;
   sequence: number;
   type: string;
-  value: { type?: unknown; requestId?: unknown; usage?: unknown; receipt?: unknown } & Record<
-    string,
-    unknown
-  >;
+  value: {
+    type?: unknown;
+    requestId?: unknown;
+    usage?: unknown;
+    receipt?: unknown;
+    text?: unknown;
+    id?: unknown;
+    startSequence?: unknown;
+  } & Record<string, unknown>;
 };
 
 async function fixture() {
@@ -536,6 +541,89 @@ test("job deadline aborts a held auxiliary provider request before reporting suc
       closeStatus: "closed",
       usage: { unknownCalls: 1 },
     });
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(f.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("job emits reasoning text once across streaming fragments", async () => {
+  const f = await fixture();
+  const fragments = Array.from({ length: 128 }, (_, i) => `fragment-${i}:猫🙂\n`);
+  const expected = fragments.join("");
+  let ordinaryCalls = 0;
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as { tools?: unknown[] };
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (body.tools?.length) {
+      ordinaryCalls++;
+      for (const delta of fragments)
+        response.write(sse({ type: "response.reasoning_text.delta", delta }));
+      if (ordinaryCalls === 1) {
+        response.end(
+          sse({
+            type: "response.output_item.added",
+            item: {
+              id: "read-item",
+              call_id: "read-call",
+              type: "function_call",
+              name: "read_file",
+            },
+          }) +
+            sse({
+              type: "response.function_call_arguments.delta",
+              item_id: "read-item",
+              delta: '{"path":"README.md"}',
+            }) +
+            sse({
+              type: "response.output_item.done",
+              item: { id: "read-item", type: "function_call" },
+            }) +
+            completed(),
+        );
+        return;
+      }
+    }
+    response.end(sse({ type: "response.output_text.delta", delta: "Finished" }) + completed());
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Missing address");
+    const result = await run(
+      f,
+      { target: "deepseek-flash.direct", modelRelay: `http://127.0.0.1:${address.port}` },
+      approve,
+      { ADAM_AGENT_RELAY_TOKEN: "reasoning-fixture" },
+    );
+    expect(result.code, JSON.stringify(result.final)).toBe(0);
+    const reasoningFrames = result.frames.filter(
+      (frame) =>
+        frame.type === "reasoning_delta" ||
+        (frame.type === "event" && frame.value.type === "model_reasoning_updated"),
+    );
+    const texts = reasoningFrames.map((frame) => String(frame.value.text));
+    expect(texts.reduce((sum, text) => sum + Buffer.byteLength(text), 0)).toBe(
+      2 * Buffer.byteLength(expected),
+    );
+    expect(texts.join("")).toBe(expected + expected);
+    expect(reasoningFrames.every((frame) => frame.type === "reasoning_delta")).toBe(true);
+    const starts = result.frames.filter(
+      (frame) => frame.type === "event" && frame.value.type === "model_reasoning_started",
+    );
+    expect(starts).toHaveLength(2);
+    for (const start of starts) {
+      expect(
+        reasoningFrames
+          .filter((frame) => frame.value.startSequence === start.sequence)
+          .map((frame) => frame.value.text)
+          .join(""),
+      ).toBe(expected);
+    }
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));

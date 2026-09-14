@@ -221,7 +221,29 @@ export async function runJob(path: string): Promise<void> {
         throw new Error("Workspace identity is unavailable.");
       await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: trust.projectId });
     }
+    let reasoning: { id: string; length: number; startSequence: number } | undefined;
     unsubscribe = lifecycle.subscribe((event) => {
+      if (event.type === "model_reasoning_started") {
+        reasoning = { id: event.id, length: 0, startSequence: sequence + 1 };
+      } else if (event.type === "model_reasoning_updated") {
+        if (
+          reasoning === undefined ||
+          reasoning.id !== event.id ||
+          event.text.length < reasoning.length
+        ) {
+          stop("reasoning_protocol_invalid");
+          return;
+        }
+        // Runtime snapshots are cumulative; only the machine stream uses deltas.
+        emit("reasoning_delta", {
+          id: event.id,
+          startSequence: reasoning.startSequence,
+          text: event.text.slice(reasoning.length),
+        });
+        reasoning.length = event.text.length;
+        return;
+      }
+
       if (event.type === "tool_permission_requested") pending.add(event.requestId);
       emit("event", event);
     });

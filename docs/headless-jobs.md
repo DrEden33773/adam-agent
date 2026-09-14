@@ -22,7 +22,7 @@ All fields above except `thinking` are required. `maxTokens` is an optional posi
 
 ## Controller protocol
 
-Stdout is newline-delimited JSON. Every frame has `version: 1`, a monotonically increasing `sequence`, `type`, and `value`. Keep stdin open while the job is running. Runtime events use type `event`; `admitted` contains the authoritative session/run receipt; `configured` records the target and context profile; `model_usage` includes call identity and purpose; `control_result` acknowledges a permission decision. Diagnostics are separate from the JSON stream.
+Stdout is newline-delimited JSON. Every frame has `version: 1`, a monotonically increasing `sequence`, `type`, and `value`. Keep stdin open while the job is running. Cumulative reasoning updates are emitted as `reasoning_delta` frames with `id`, `startSequence` and the newly appended `text`. Concatenate their text by `startSequence`, which points to the corresponding `model_reasoning_started` event; this distinguishes blocks even when an ID is reused across model turns. Other runtime events use type `event`; `admitted` contains the authoritative session/run receipt; `configured` records the target and context profile; `model_usage` includes call identity and purpose; `control_result` acknowledges a permission decision. Diagnostics are separate from the JSON stream.
 
 Read operations are allowed; write and execute operations request an exact decision. A controller can answer a `tool_permission_requested` runtime event using its `requestId`:
 
