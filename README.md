@@ -92,6 +92,7 @@ Explore and Research children stay within their inherited role and permission li
 - [Daily workflows and session recovery](docs/usage.md)
 - [Local installation](docs/local-installation.md)
 - [Setup, models and development commands](docs/setup-and-development.md)
+- [Headless jobs and controller protocol](docs/headless-jobs.md)
 - [Coding tools](docs/coding-tools.md) and [managed agents](docs/managed-control-candidate.md)
 - [Runtime and compatibility reference](docs/runtime-reference.md)
 - [Testing](docs/testing.md), [acceptance evidence](docs/portfolio-acceptance.md), and [screenshot provenance](docs/screenshots.md)

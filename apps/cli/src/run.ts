@@ -3,25 +3,17 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import {
-  type ArtifactStore,
-  type ContextProfile,
   createBiomeExecutionAdapter,
-  createCodingToolRegistry,
   createExtensionHost,
   createFileArtifactStore,
   createJsonlOperationStore,
-  createModelTargets,
   createPermissionPolicy,
-  createPresentationPreferences,
-  createProductionManagedControlComposition,
   createSessionLifecycle,
-  createWebSearchConfiguration,
   createWorkspaceTrust,
   ExtensionConfigurationError,
   ExtensionHostError,
   loadExtensionConfiguration,
   ModelTargetError,
-  type ModelTargetIdentity,
   type ModelTargets,
   OperationHostError,
   type PermissionDecisionCommand,
@@ -33,9 +25,10 @@ import {
 } from "@adam-agent/agent";
 
 import { type CliCommand, failConfiguration } from "./command.js";
-import { createDemoModel } from "./demo-model.js";
+import { createCliLifecycle } from "./lifecycle.js";
+import { createCliModelTargets } from "./models.js";
 
-export async function run(command: Exclude<CliCommand, { type: "help" }>): Promise<void> {
+export async function run(command: Exclude<CliCommand, { type: "help" | "job" }>): Promise<void> {
   const { XDG_CONFIG_HOME: inheritedUserConfigurationRoot } = process.env;
   const ownerConfigurationRoot =
     inheritedUserConfigurationRoot === undefined || inheritedUserConfigurationRoot.length === 0
@@ -52,24 +45,6 @@ export async function run(command: Exclude<CliCommand, { type: "help" }>): Promi
   const workspaceRoot = process.cwd();
   const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
   const stateRoot = configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
-  const fakeTargetIdentity: ModelTargetIdentity = {
-    targetId: "fake.local",
-    vendor: "adam",
-    modelId: "fake-local",
-    route: "direct",
-    profileVersion: 1,
-    certification: "certified",
-  };
-  const fakeContextProfile: ContextProfile = {
-    version: 1,
-    contextWindowTokens: 32_768,
-    maximumOutputTokens: 4_096,
-    compactAtTokens: 24_576,
-    postCompactTargetTokens: 8_192,
-    retainedTargetTokens: 4_096,
-    estimatorVersion: 1,
-  };
-  const fakeModel = createDemoModel();
   async function answerPermissionRequest(
     activeSession: PermissionDecisionTarget,
     event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>,
@@ -233,7 +208,7 @@ export async function run(command: Exclude<CliCommand, { type: "help" }>): Promi
   }
 
   async function runCliCommand(
-    activeCommand: Exclude<CliCommand, { type: "help" }>,
+    activeCommand: Exclude<CliCommand, { type: "help" | "job" }>,
   ): Promise<void> {
     try {
       if (activeCommand.type === "workspace_trust") {
@@ -305,7 +280,7 @@ export async function run(command: Exclude<CliCommand, { type: "help" }>): Promi
         writeText(1, `${JSON.stringify(recovered)}\n`);
         return;
       }
-      const modelTargets = createCliModelTargets();
+      const modelTargets = createCliModelTargets({ environment: process.env });
       const lifecycle = await createRunLifecycle(modelTargets);
       try {
         if (activeCommand.type === "resume" && !activeCommand.continue) {
@@ -371,42 +346,17 @@ export async function run(command: Exclude<CliCommand, { type: "help" }>): Promi
   }
 
   async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLifecycle> {
-    const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
-    return createSessionLifecycle({
-      managedControl: await createProductionManagedControlComposition({ workspaceRoot, stateRoot }),
-      modelTargets,
-      preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
-      workspaceTrust: createWorkspaceTrust({
-        environment: userConfigurationEnvironment,
-        workspaceRoot,
-      }),
-      stateRoot,
-      webSearchConfiguration: createWebSearchConfiguration({
-        environment: userConfigurationEnvironment,
-      }),
+    return createCliLifecycle({
       workspaceRoot,
-      tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
+      stateRoot,
+      modelTargets,
+      configurationEnvironment: userConfigurationEnvironment,
+      managed: true,
       permissions: createPermissionPolicy({
         allowedEffects: ["read"],
         askedEffects: ["write", "execute", "delegate"],
       }),
     });
-  }
-
-  function createLazyFileArtifactStore(root: string): ArtifactStore {
-    let store: Promise<ArtifactStore> | undefined;
-    const resolveStore = () => {
-      store ??= createFileArtifactStore({ root });
-      return store;
-    };
-    return {
-      async write(input) {
-        return (await resolveStore()).write(input);
-      },
-      async read(id) {
-        return (await resolveStore()).read(id);
-      },
-    };
   }
 
   async function continueAndPresent(
@@ -490,35 +440,6 @@ export async function run(command: Exclude<CliCommand, { type: "help" }>): Promi
       unsubscribe();
       unsubscribeManaged?.();
     }
-  }
-
-  function createCliModelTargets(): ModelTargets {
-    const configured = createModelTargets({ environment: process.env });
-    return {
-      async resolve(input) {
-        if (input.targetId === fakeTargetIdentity.targetId) {
-          return {
-            identity: fakeTargetIdentity,
-            driver: fakeModel,
-            contextProfile: fakeContextProfile,
-          };
-        }
-        return configured.resolve(input);
-      },
-      async snapshot(input) {
-        const snapshot = await configured.snapshot(input);
-        return {
-          targets: [
-            ...snapshot.targets,
-            {
-              identity: fakeTargetIdentity,
-              readiness: { status: "available", credentialSource: "built-in test fixture" },
-              contextProfile: fakeContextProfile,
-            },
-          ],
-        };
-      },
-    };
   }
 
   function loadProjectEnvironment(): void {
