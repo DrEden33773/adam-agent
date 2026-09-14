@@ -1703,6 +1703,12 @@ export async function createPresentationSession(
         return transient;
       return { ...transient, assistant: null, reasoning: null };
     };
+    let namingProjection:
+      | { sessionId: string; throughSequence: number; naming: SessionNaming }
+      | undefined =
+      created === undefined || naming === undefined
+        ? undefined
+        : { sessionId: created.sessionId, throughSequence: created.lastSequence, naming };
     let snapshotActivationQueue = Promise.resolve();
     let lastSnapshotActivation =
       created === undefined
@@ -1763,31 +1769,6 @@ export async function createPresentationSession(
         activatedRecords,
         options,
       );
-      const activatedNaming = projectSessionNaming(activatedRecords, snapshot.sessionId);
-      const activatedSkills = projectSkills(snapshot);
-      const activatedSummary: SessionSummary = {
-        id: snapshot.sessionId,
-        label: activatedNaming.displayLabel,
-        naming: activatedNaming,
-        targetId: snapshot.targetIdentity.targetId,
-        status: snapshot.status,
-      };
-      if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
-        knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
-      }
-      const catalogItems = state.authoritative.sessions.items.some(
-        (session) => session.id === snapshot.sessionId,
-      )
-        ? state.authoritative.sessions.items.map((session) =>
-            session.id === snapshot.sessionId ? activatedSummary : session,
-          )
-        : !sessionMatchesVisibilityView(
-              snapshot.sessionId,
-              state.authoritative.sessions.visibility,
-              state.authoritative.sessions.view,
-            )
-          ? state.authoritative.sessions.items
-          : [...state.authoritative.sessions.items, activatedSummary];
       const activeSequence = activatedRecords.reduce(
         (maximum, record) =>
           record.sessionId === snapshot.sessionId
@@ -1800,7 +1781,6 @@ export async function createPresentationSession(
       }
       operationRepairs.clear();
       resetOperationCursors(activatedOperations);
-      activeSessionThroughSequence = activeSequence;
       if (snapshot.status === "settled" || snapshot.status === "interrupted") {
         settledRuntimeBoundary = {
           sessionId: snapshot.sessionId,
@@ -1841,15 +1821,56 @@ export async function createPresentationSession(
       const activatedControlSnapshot = await activatedControl?.inspect({
         parentSessionId: snapshot.sessionId,
       });
+      const activatedRoles =
+        activatedControlSnapshot === undefined
+          ? undefined
+          : ((await activatedControl?.inspectRoles({ reload: !sameSession }))?.roles ?? []);
+      // Naming refreshes and snapshot hydration have separate asynchronous reads.
+      // Keep an already-published newer naming projection when this read is older.
+      const newerNaming =
+        namingProjection?.sessionId === snapshot.sessionId &&
+        namingProjection.throughSequence > activeSequence
+          ? namingProjection
+          : undefined;
+      const activatedNaming =
+        newerNaming?.naming ?? projectSessionNaming(activatedRecords, snapshot.sessionId);
+      namingProjection = {
+        sessionId: snapshot.sessionId,
+        throughSequence: newerNaming?.throughSequence ?? activeSequence,
+        naming: activatedNaming,
+      };
+      const activatedSkills = projectSkills(snapshot);
+      const activatedSummary: SessionSummary = {
+        id: snapshot.sessionId,
+        label: activatedNaming.displayLabel,
+        naming: activatedNaming,
+        targetId: snapshot.targetIdentity.targetId,
+        status: snapshot.status,
+      };
+      if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
+        knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+      }
+      const catalogItems = state.authoritative.sessions.items.some(
+        (session) => session.id === snapshot.sessionId,
+      )
+        ? state.authoritative.sessions.items.map((session) =>
+            session.id === snapshot.sessionId ? activatedSummary : session,
+          )
+        : !sessionMatchesVisibilityView(
+              snapshot.sessionId,
+              state.authoritative.sessions.visibility,
+              state.authoritative.sessions.view,
+            )
+          ? state.authoritative.sessions.items
+          : [...state.authoritative.sessions.items, activatedSummary];
+      activeSessionThroughSequence =
+        state.authoritative.active?.session.id === snapshot.sessionId
+          ? Math.max(activeSessionThroughSequence, activeSequence, namingProjection.throughSequence)
+          : Math.max(activeSequence, namingProjection.throughSequence);
       const { managedControl: _previousControl, ...previousAuthority } = state.authoritative;
       state = {
         revision: state.revision + 1,
-        ...(activatedControlSnapshot === undefined
-          ? {}
-          : {
-              agentRoles:
-                (await activatedControl?.inspectRoles({ reload: !sameSession }))?.roles ?? [],
-            }),
+        ...(activatedRoles === undefined ? {} : { agentRoles: activatedRoles }),
         authoritative: {
           ...previousAuthority,
           ...(activatedControlSnapshot === undefined
@@ -1865,7 +1886,7 @@ export async function createPresentationSession(
               }
             : {
                 status: "current",
-                sessionThroughSequence: activeSequence,
+                sessionThroughSequence: activeSessionThroughSequence,
                 operationThrough: operationCursorSnapshot(),
               },
           sessions: {
@@ -1974,7 +1995,18 @@ export async function createPresentationSession(
       if (closed || current === null || current.session.id !== sessionId) {
         return;
       }
+      const namingThrough = refreshedRecords.reduce(
+        (maximum, record) =>
+          record.sessionId === sessionId ? Math.max(maximum, record.entry.sequence) : maximum,
+        throughSequence,
+      );
+      if (
+        namingProjection?.sessionId === sessionId &&
+        namingProjection.throughSequence > namingThrough
+      )
+        return;
       const refreshedNaming = projectSessionNaming(refreshedRecords, sessionId);
+      namingProjection = { sessionId, throughSequence: namingThrough, naming: refreshedNaming };
       const refreshedSummary: SessionSummary = {
         ...current.session,
         label: refreshedNaming.displayLabel,

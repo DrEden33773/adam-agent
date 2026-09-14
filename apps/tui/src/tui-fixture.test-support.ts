@@ -200,7 +200,12 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   const viewport = new AppliedViewportTerminal({ columns: 80, rows: 24 });
   let viewportPending = "";
   let viewportPendingOffset = 0;
-  const viewportFrames: Array<{ readonly endOffset: number; readonly text: string }> = [];
+  let viewportEpoch = 0;
+  const viewportFrames: Array<{
+    readonly endOffset: number;
+    readonly text: string;
+    readonly epoch: number;
+  }> = [];
   const frameWaiters = new Set<{
     readonly offset: number;
     readonly text: string;
@@ -239,7 +244,11 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       viewport.write(viewportPending.slice(0, consumedLength));
       viewportPending = viewportPending.slice(consumedLength);
       viewportPendingOffset += consumedLength;
-      const frame = { endOffset: viewportPendingOffset, text: viewport.lines().join("\n") };
+      const frame = {
+        endOffset: viewportPendingOffset,
+        text: viewport.lines().join("\n"),
+        epoch: viewportEpoch,
+      };
       viewportFrames.push(frame);
       for (const waiter of outputWaiters) {
         if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
@@ -400,6 +409,7 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     if (
       viewportFrames.some(
         (frame) =>
+          frame.epoch === viewportEpoch &&
           frame.endOffset > offset &&
           frame.text.includes(text) &&
           (absentText === undefined || !frame.text.includes(absentText)),
@@ -449,6 +459,8 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
         throw new Error("The external TUI fixture recorded an invalid terminal process identity.");
       }
       viewport.resize(columns, rows);
+      // A frame captured before this geometry reset cannot certify the new viewport.
+      viewportEpoch += 1;
       await resizeTerminalProcess(processId, columns, rows);
     },
     async terminate(signal) {
@@ -471,7 +483,8 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
         throw new Error(
           `The TUI process is closed; no current screen can display ${JSON.stringify(text)}.`,
         );
-      if (viewportFrames.at(-1)?.text.includes(text)) return;
+      const latest = viewportFrames.at(-1);
+      if (latest?.epoch === viewportEpoch && latest.text.includes(text)) return;
       await waitForCompleteFrameAfter(text, stdout.length);
     },
     waitForRecordedOutput,

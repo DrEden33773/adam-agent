@@ -2,6 +2,7 @@ import { writeSync } from "node:fs";
 
 export type CliCommand =
   | { readonly type: "help" }
+  | { readonly type: "job"; readonly path: string }
   | {
       readonly type: "workspace_trust";
       readonly action: "status" | "grant" | "revoke";
@@ -17,6 +18,11 @@ export type CliCommand =
     };
 
 export function parseCliCommand(arguments_: readonly string[]): CliCommand {
+  if (arguments_[0] === "--job") {
+    if (arguments_.length !== 2 || !arguments_[1])
+      return failConfiguration("Usage: adam-agent --job <config.json>");
+    return { type: "job", path: arguments_[1] };
+  }
   if (arguments_.length === 1 && (arguments_[0] === "--help" || arguments_[0] === "-h")) {
     return { type: "help" };
   }
@@ -121,6 +127,7 @@ export function cliUsage(): string {
     "Supports Linux source checkouts and local application packages with Node.js 24.",
     "",
     "Usage: adam-agent <prompt>",
+    "       adam-agent --job <config.json>",
     "       adam-agent [--skill <id-or-unique-short-name>]... <prompt>",
     "       adam-agent --resume <session-id> [--continue]",
     "       adam-agent --branch <parent-session-id> --at <event-position> [--target <target-id>]",
