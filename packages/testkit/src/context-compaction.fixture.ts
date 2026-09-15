@@ -13,6 +13,7 @@ import {
   sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
 import { createFrozenPrefixReadRegistry } from "./frozen-read-registry.test-support.js";
+import { sessionLifecycleAddedPromptTokens } from "./session-lifecycle.test-support.js";
 
 const workspaceRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_WORKSPACE_ROOT");
 const stateRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_STATE_ROOT");
@@ -29,10 +30,10 @@ const targetIdentity: ModelTargetIdentity = {
 };
 const contextProfile: ContextProfile = {
   version: 1,
-  contextWindowTokens: 20_000,
+  contextWindowTokens: 20_000 + sessionLifecycleAddedPromptTokens,
   maximumOutputTokens: 100,
-  compactAtTokens: 4_000,
-  postCompactTargetTokens: 3_000,
+  compactAtTokens: 4_000 + sessionLifecycleAddedPromptTokens,
+  postCompactTargetTokens: 3_000 + sessionLifecycleAddedPromptTokens,
   retainedTargetTokens: 100,
   estimatorVersion: 1,
 };

@@ -36,6 +36,7 @@ import {
 import { expect, expectTypeOf, test } from "vitest";
 import { createFrozenPrefixReadRegistry } from "./frozen-read-registry.test-support.js";
 import { createSessionLifecycleForTesting as createSessionLifecycle } from "./index.js";
+import { sessionLifecycleAddedPromptTokens } from "./session-lifecycle.test-support.js";
 
 const { ADAM_AGENT_LARGE_OUTPUT_TESTS: largeOutputTests } = process.env;
 const largeOutputTest = test.skipIf(largeOutputTests !== "1");
@@ -3905,8 +3906,8 @@ test("SessionLifecycle retains canonical input-resource identity for reread afte
   await writeFile(selectedPath, content, "utf8");
   const compactionProfile: ContextProfile = {
     ...contextProfile,
-    compactAtTokens: 900,
-    postCompactTargetTokens: 800,
+    compactAtTokens: 900 + sessionLifecycleAddedPromptTokens,
+    postCompactTargetTokens: 800 + sessionLifecycleAddedPromptTokens,
     retainedTargetTokens: 0,
   };
   let compactionCalls = 0;
@@ -4498,8 +4499,8 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
   await writeFile(join(workspaceRoot, "context.txt"), "lifecycle context ".repeat(600), "utf8");
   const lifecycleContextProfile: ContextProfile = {
     ...contextProfile,
-    compactAtTokens: 1_500,
-    postCompactTargetTokens: 1_200,
+    compactAtTokens: 1_500 + sessionLifecycleAddedPromptTokens,
+    postCompactTargetTokens: 1_200 + sessionLifecycleAddedPromptTokens,
   };
 
   let ordinaryCall = 0;
@@ -4784,8 +4785,8 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
   let compactionCall = 0;
   const danglingContextProfile = {
     ...contextProfile,
-    compactAtTokens: 1_500,
-    postCompactTargetTokens: 1_200,
+    compactAtTokens: 1_500 + sessionLifecycleAddedPromptTokens,
+    postCompactTargetTokens: 1_200 + sessionLifecycleAddedPromptTokens,
   };
   const model: ModelDriver = {
     async *stream(request) {
