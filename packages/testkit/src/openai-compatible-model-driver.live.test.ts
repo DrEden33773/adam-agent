@@ -413,10 +413,89 @@ liveTest(
   180_000,
 );
 
-liveTest.each([
-  { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 2 },
-  { targetId: "deepseek-flash.direct", profileVersion: 4 },
-])(
+liveTest(
+  "stable Flash attaches one image directly and observes one exact quadrant order",
+  async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-flash-image-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    const imagePath = join(testRoot, "quadrants.png");
+    const imageBytes = createQuadrantPng(128, 128);
+    const imageDigest = `sha256:${createHash("sha256").update(imageBytes).digest("hex")}`;
+    await mkdir(workspaceRoot);
+    await writeFile(imagePath, imageBytes);
+    const modelTargets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: liveApiKey },
+      connectionDeadlineMs: 15_000,
+      deadlineMs: 90_000,
+    });
+    const target = (
+      await modelTargets.snapshot({ signal: new AbortController().signal })
+    ).targets.find(({ identity }) => identity.targetId === "deepseek-flash.direct");
+    if (target === undefined || target.identity.profileVersion !== 4) {
+      throw new Error("Expected the current exact stable Flash profile.");
+    }
+    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+    try {
+      const created = await lifecycle.create({ targetIdentity: target.identity });
+      const continued = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: {
+          text: "The attached image has four equal color quadrants. Reply with only the top-left, top-right, bottom-left, and bottom-right colors in that order.",
+        },
+        resourceSelections: [{ type: "local_file", path: imagePath }],
+      });
+      expect(continued.result).toMatchObject({ status: "completed" });
+      if (continued.result.status !== "completed") {
+        throw new Error("Expected the stable Flash image turn to complete.");
+      }
+      expect(continued.result.answer).toMatch(/red.*green.*blue.*white/isu);
+      const records = await readJsonlRecords(stateRoot);
+      expect(
+        records.find(
+          (record) =>
+            isRecordType(record, "logical_run_started") && Array.isArray(record.inputResources),
+        ),
+      ).toMatchObject({
+        inputResources: [
+          {
+            artifact: { id: imageDigest, byteCount: imageBytes.byteLength },
+            support: "image",
+            mode: "link",
+          },
+        ],
+      });
+      expect(
+        records.find((record) => isRecordType(record, "provider_attempt_started")),
+      ).toMatchObject({
+        targetIdentity: { targetId: "deepseek-flash.direct", profileVersion: 4 },
+        projectedContent: {
+          version: 1,
+          explicitUserImages: {
+            count: 1,
+            byteCount: imageBytes.byteLength,
+            pixelCount: 128 * 128,
+            maximumWidth: 128,
+            maximumHeight: 128,
+          },
+        },
+      });
+      // The stable target projects the bytes directly, so the image tool read never runs.
+      expect(
+        records.some((record) => isRecordType(record, "input_resource_image_read_committed")),
+      ).toBe(false);
+    } finally {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+  180_000,
+);
+
+// The stable Flash target projects selected images directly, so the descriptor-only resource-tool
+// path belongs to the historical Vision Responses profile whose modality profile still requires it.
+liveTest.each([{ targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 2 }])(
   "Vision Responses lazy image observes one exact quadrant order through the real resource tool ($targetId)",
   async ({ targetId, profileVersion }) => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-vision-responses-"));
