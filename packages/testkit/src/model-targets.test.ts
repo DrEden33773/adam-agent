@@ -212,6 +212,78 @@ test.each([
   },
 );
 
+test("the stable Flash target projects explicit user images through Direct Responses", async () => {
+  const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (input, init) => {
+      requests.push({
+        url: input instanceof Request ? input.url : String(input),
+        body: JSON.parse(String(init?.body)),
+      });
+      return new Response(
+        'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        { headers: { "content-type": "text/event-stream" }, status: 200 },
+      );
+    },
+  });
+  const resolved = await targets.resolve({
+    targetId: "deepseek-flash.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  expect(resolved.modalityProfile).toEqual({
+    profileVersion: 1,
+    explicitUserImages: "supported",
+    imageToolResults: "supported",
+  });
+  const imageBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47]);
+
+  await collect(
+    resolved.driver.stream({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this image." },
+            {
+              type: "file",
+              artifactId: `sha256:${"a".repeat(64)}`,
+              mediaType: "image/png",
+              bytes: imageBytes,
+            },
+          ],
+        },
+      ],
+      tools: [],
+      maximumOutputTokens: resolved.contextProfile.maximumOutputTokens,
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(requests).toEqual([
+    {
+      url: "https://api.deepseek.com/responses",
+      body: expect.objectContaining({
+        model: "deepseek-flash",
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "Describe this image." },
+              {
+                type: "input_image",
+                detail: "auto",
+                image_url: `data:image/png;base64,${Buffer.from(imageBytes).toString("base64")}`,
+              },
+            ],
+          },
+        ],
+      }),
+    },
+  ]);
+});
+
 test("the exact Vision Chat target projects immutable PNG bytes through Direct Chat", async () => {
   const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
   const targets = createModelTargets({

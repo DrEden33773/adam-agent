@@ -115,7 +115,7 @@ test("the real target catalog hides legacy picker rows while saved and explicit 
   }
 });
 
-test("Flash reads an image through Responses tools and cold-resumes its exact profile and image history", async () => {
+test("Flash attaches an image directly through Responses and cold-resumes its exact profile and image history", async () => {
   const root = await mkdtemp(join(tmpdir(), "adam-flash-image-"));
   const workspaceRoot = join(root, "project");
   const stateRoot = join(root, "state");
@@ -133,33 +133,13 @@ test("Flash reads an image through Responses tools and cold-resumes its exact pr
       const body = JSON.parse(String(init?.body));
       expect(body.model).toBe("deepseek-flash");
       ordinaryCalls += 1;
-      if (ordinaryCalls === 1) {
-        expect(JSON.stringify(body.input)).not.toContain("data:image/png;base64,");
-        return sse([
-          {
-            type: "response.output_item.added",
-            item: {
-              type: "function_call",
-              id: "image-item",
-              call_id: "image-call",
-              name: "read_input_resource",
-            },
-          },
-          {
-            type: "response.function_call_arguments.delta",
-            item_id: "image-item",
-            delta: JSON.stringify({ occurrenceId: `${runId}:input:1` }),
-          },
-          { type: "response.output_item.done", item: { type: "function_call", id: "image-item" } },
-          { type: "response.completed", response: { status: "completed" } },
-        ]);
-      }
+      // The stable Flash target projects the selected image bytes directly, so the first request
+      // already carries the image and no image-bearing tool result is involved.
       expect(body.input).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            type: "function_call_output",
-            call_id: "image-call",
-            output: expect.arrayContaining([
+            role: "user",
+            content: expect.arrayContaining([
               expect.objectContaining({
                 type: "input_image",
                 image_url: `data:image/png;base64,${imageBase64}`,
@@ -167,6 +147,9 @@ test("Flash reads an image through Responses tools and cold-resumes its exact pr
             ]),
           }),
         ]),
+      );
+      expect(body.input).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "function_call_output" })]),
       );
       return sse([
         { type: "response.output_text.delta", delta: "Image inspected." },
@@ -193,7 +176,7 @@ test("Flash reads an image through Responses tools and cold-resumes its exact pr
         resourceSelections: [{ type: "local_file", path: imagePath }],
       }),
     ).resolves.toMatchObject({ result: { status: "completed", answer: "Image inspected." } });
-    expect(ordinaryCalls).toBe(2);
+    expect(ordinaryCalls).toBe(1);
     await warm.close();
     await rm(imagePath);
     cold = createSessionLifecycle(options);
@@ -201,14 +184,14 @@ test("Flash reads an image through Responses tools and cold-resumes its exact pr
       status: "ready",
       snapshot: { targetIdentity: flashIdentity },
     });
-    expect(ordinaryCalls).toBe(2);
+    expect(ordinaryCalls).toBe(1);
     await expect(
       cold.continue({
         sessionId: created.sessionId,
         input: { text: "Use the same image history." },
       }),
     ).resolves.toMatchObject({ result: { status: "completed", answer: "Image inspected." } });
-    expect(ordinaryCalls).toBe(3);
+    expect(ordinaryCalls).toBe(2);
   } finally {
     await cold?.close();
     await warm.close();

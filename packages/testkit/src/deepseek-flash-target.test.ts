@@ -28,7 +28,7 @@ test("Flash advertises the recommended stable image target and retains hidden le
     },
     upstreamLifecycle: "stable",
     readiness: { status: "missing", credentialSource: "DEEPSEEK_API_KEY" },
-    modalityProfile: { explicitUserImages: "unsupported", imageToolResults: "supported" },
+    modalityProfile: { explicitUserImages: "supported", imageToolResults: "supported" },
     contextProfile: { version: 2, contextWindowTokens: 1_000_000, maximumOutputTokens: 384_000 },
     thinkingCapability: {
       defaultLevelId: "high",

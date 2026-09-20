@@ -226,6 +226,12 @@ const directDeepSeekVisionResponsesV2ModalityProfile: ModelModalityProfile = Obj
   explicitUserImages: "unsupported",
   imageToolResults: "supported",
 });
+/** The stable multimodal target: images travel directly and through image tool results. */
+const directDeepSeekMultimodalResponsesV1ModalityProfile: ModelModalityProfile = Object.freeze({
+  profileVersion: 1,
+  explicitUserImages: "supported",
+  imageToolResults: "supported",
+});
 const directFlashResponsesTarget: ModelTargetIdentity = Object.freeze({
   targetId: "deepseek-flash.direct",
   vendor: "deepseek",
@@ -240,6 +246,24 @@ function usesDirectResponses(identity: ModelTargetIdentity): boolean {
     sameModelTargetIdentity(identity, directFlashResponsesTarget) ||
     sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)
   );
+}
+
+/**
+ * The stable Flash target carries the multimodal capability; the experimental Vision targets keep
+ * their original profiles so historical sessions replay exactly.
+ */
+function directDeepSeekModalityProfileFor(
+  identity: ModelTargetIdentity,
+): ModelModalityProfile | undefined {
+  if (sameModelTargetIdentity(identity, directFlashResponsesTarget)) {
+    return directDeepSeekMultimodalResponsesV1ModalityProfile;
+  }
+  if (sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)) {
+    return directDeepSeekVisionResponsesV2ModalityProfile;
+  }
+  return identity.targetId === directDeepSeekVisionChatV1Target.targetId
+    ? directDeepSeekVisionChatV1ModalityProfile
+    : undefined;
 }
 
 const currentDirectDeepSeekTargets = Object.freeze([
@@ -488,11 +512,12 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       }
       const contextProfile = directDeepSeekContextProfileFor(identity);
       if (usesDirectResponses(identity)) {
+        const modalityProfile = directDeepSeekModalityProfileFor(identity);
         return {
           identity,
           contextProfile,
           connectionTest: "supported" as const,
-          modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
+          ...(modalityProfile === undefined ? {} : { modalityProfile }),
           upstreamLifecycle:
             identity.targetId === directFlashResponsesTarget.targetId
               ? ("stable" as const)
@@ -565,30 +590,30 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           ...(input.includeHistoricalProfiles
             ? supportedDirectDeepSeekTargets
             : currentDirectDeepSeekTargets
-          ).map((identity) => ({
-            identity,
-            catalog: catalogMetadataFor(identity),
-            readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
-            contextProfile: directDeepSeekContextProfileFor(identity),
-            connectionTest: "supported" as const,
-            ...(usesDirectResponses(identity)
-              ? {
-                  modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
-                  upstreamLifecycle:
-                    identity.targetId === directFlashResponsesTarget.targetId
-                      ? ("stable" as const)
-                      : ("experimental" as const),
-                }
-              : identity.targetId === directDeepSeekVisionChatV1Target.targetId
+          ).map((identity) => {
+            const modalityProfile = directDeepSeekModalityProfileFor(identity);
+            return {
+              identity,
+              catalog: catalogMetadataFor(identity),
+              readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
+              contextProfile: directDeepSeekContextProfileFor(identity),
+              connectionTest: "supported" as const,
+              ...(modalityProfile === undefined ? {} : { modalityProfile }),
+              ...(usesDirectResponses(identity)
                 ? {
-                    modalityProfile: directDeepSeekVisionChatV1ModalityProfile,
-                    upstreamLifecycle: "experimental" as const,
+                    upstreamLifecycle:
+                      identity.targetId === directFlashResponsesTarget.targetId
+                        ? ("stable" as const)
+                        : ("experimental" as const),
                   }
-                : {}),
-            thinkingCapability: usesDirectResponses(identity)
-              ? createDirectDeepSeekResponsesThinkingCapability(identity)
-              : createDirectDeepSeekThinkingCapability(identity),
-          })),
+                : identity.targetId === directDeepSeekVisionChatV1Target.targetId
+                  ? { upstreamLifecycle: "experimental" as const }
+                  : {}),
+              thinkingCapability: usesDirectResponses(identity)
+                ? createDirectDeepSeekResponsesThinkingCapability(identity)
+                : createDirectDeepSeekThinkingCapability(identity),
+            };
+          }),
           {
             identity: experimentalGatewayTarget,
             catalog: experimentalGatewayCatalog,
