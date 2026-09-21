@@ -577,8 +577,8 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
     profileVersion: 3,
     assemblyVersion: 3,
     base: {
-      version: 2,
-      digest: "sha256:37576bdf4246ee9bddd0948422590243315f8d386717eeb9313582d4d805e36f",
+      version: 3,
+      digest: "sha256:954ee54e2a15d891b3556ce1e063e95ebca6e3dda90858d0d5528b9b947c7f27",
     },
     toolProfile: {
       version: 1,
@@ -1609,11 +1609,11 @@ test("a v3 provider attempt persists only the safe exact request projection dige
     expect({ continuedPromptContext, inspectedPromptContext }).toMatchObject({
       continuedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:8d11d51729324b8e9accd78cd5d15c5df0c6ec6d8efec8f04b1d227e0cc33e50",
+          "sha256:03b324ed733168b5d583e113a2912a18540db10be698d1eb93ff2b96cc8d2348",
       },
       inspectedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:8d11d51729324b8e9accd78cd5d15c5df0c6ec6d8efec8f04b1d227e0cc33e50",
+          "sha256:03b324ed733168b5d583e113a2912a18540db10be698d1eb93ff2b96cc8d2348",
       },
     });
     expect(JSON.stringify({ continued, inspected })).not.toContain("Inspect the project.");

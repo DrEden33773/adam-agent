@@ -16,9 +16,12 @@ const adamBasePromptV1 =
 
 const adamBasePromptV2 = `${adamBasePromptV1}\n\nFor requested coding implementation work, identify the concrete problem and acceptance evidence first. Inspect relevant instructions and entry points, then investigate a bounded hypothesis; further searches or reproductions should answer a specific unresolved question. Revise an unproductive hypothesis rather than repeating the same investigation. Make the smallest changes that address the cause, run targeted verification, and add related regression checks only when an unresolved concern justifies them. After verification, inspect the final diff once and report the actual changes and results. Avoid repeating passing checks, polishing unrelated details, or expanding the task without a remaining reason. If the evidence cannot justify a repair, explain what remains unresolved and what was checked; do not claim a fix or successful verification. Respect requested planning and read-only boundaries and all existing permission decisions.`;
 
+const adamBasePromptV3 = `${adamBasePromptV2}\n\nWhen the request does not determine one behavior, resolve the ambiguity before you finalize instead of after a test refuses your choice: enumerate at least two candidate readings of the disputed behavior, then choose among them with evidence from the repository itself, weighted by how directly it constrains this code path — the conventions of the nearest sibling APIs, existing tests and fixtures, documentation or changelog entries, and type declarations. A conclusion that rests only on an equivalent you constructed yourself, such as a stub, a hand-built reproduction or an expectation you wrote, is an unverified hypothesis: label it as one rather than reporting it as verification. When the repository evidence is genuinely balanced, take the reading that agrees with the nearest sibling API, and state the abandoned alternative and why it lost. Record the chosen semantics and the deciding evidence with the reported result.`;
+
 function basePromptContent(profileVersion: number, baseVersion: number): string | undefined {
   if (baseVersion === 1) return adamBasePromptV1;
   if (profileVersion === 3 && baseVersion === 2) return adamBasePromptV2;
+  if (profileVersion === 3 && baseVersion === 3) return adamBasePromptV3;
   return undefined;
 }
 
@@ -128,7 +131,9 @@ export type PromptContextRecordV3 = Omit<
   readonly recordVersion: 3;
   readonly profileVersion: 3;
   readonly assemblyVersion: 3;
-  readonly base: Omit<PromptContextRecordV1["base"], "version"> & { readonly version: 1 | 2 };
+  readonly base: Omit<PromptContextRecordV1["base"], "version"> & {
+    readonly version: 1 | 2 | 3;
+  };
   readonly mcp?:
     | {
         readonly version: 1;
@@ -155,7 +160,7 @@ export type PromptContextSnapshot = {
   readonly profileVersion: 1 | 2 | 3;
   readonly assemblyVersion: 1 | 2 | 3;
   readonly base: {
-    readonly version: 1 | 2;
+    readonly version: 1 | 2 | 3;
     readonly digest: Sha256Digest;
   };
   readonly toolProfile: {
@@ -298,7 +303,7 @@ export const promptContextRecordV3Schema: z.ZodType<PromptContextRecordV3> = z.s
   profileVersion: z.literal(3),
   assemblyVersion: z.literal(3),
   base: z.strictObject({
-    version: z.union([z.literal(1), z.literal(2)]),
+    version: z.union([z.literal(1), z.literal(2), z.literal(3)]),
     content: z
       .string()
       .min(1)
@@ -532,9 +537,9 @@ export function createPromptContextV3(
 ): PromptContextRecordV3 {
   const v2 = createPromptContextV2(tools, repository, skillContext);
   const base: PromptContextRecordV3["base"] = {
-    version: 2,
-    content: adamBasePromptV2,
-    digest: digestText(adamBasePromptV2),
+    version: 3,
+    content: adamBasePromptV3,
+    digest: digestText(adamBasePromptV3),
   };
   return {
     ...v2,
