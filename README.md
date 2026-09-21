@@ -96,6 +96,7 @@ Explore and Research children stay within their inherited role and permission li
 - [Coding tools](docs/coding-tools.md) and [managed agents](docs/managed-control-candidate.md)
 - [Runtime and compatibility reference](docs/runtime-reference.md)
 - [Testing](docs/testing.md), [acceptance evidence](docs/portfolio-acceptance.md), and [screenshot provenance](docs/screenshots.md)
+- [Agent evaluation: method and results](docs/agent-evaluation-evidence.md) against mini-swe-agent on the same model and budget
 - [Extension API](https://github.com/DrEden33773/adam-agent/blob/main/packages/extension-api/README.md) · [engineering instructions](AGENTS.md)
 
 The public Extension API has its own versioned package lifecycle. Installing it alone does not install the Adam application.
